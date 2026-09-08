@@ -1,0 +1,5665 @@
+"""
+Graph nodes for the Startary LangGraph — Milestone 2.5.
+
+Nodes:
+  1.  initialize_state                  (Deterministic: set defaults & initialize founder messages)
+  2.  verify_state                      (Deterministic: validate required fields)
+  3.  diagnose_startup                  (LLM: extract & summarize state from founder source messages)
+  4.  merge_diagnosis                   (Deterministic: populate StartupState & Diagnosis)
+  5.  assess_context_sufficiency        (LLM: determine if grounded info is sufficient to proceed)
+  6.  select_clarifying_question        (LLM: select 1 highest-value question without inventing mechanisms)
+  7.  ask_and_wait_for_founder          (Interrupt: pause and wait for founder clarification answer)
+  8.  merge_founder_answer              (Deterministic: append answer, increment turns, loop back)
+  9.  handle_insufficient_context_stop  (Deterministic: graceful stop on reaching max turns)
+  10. assess_startup_areas              (LLM: batch risk assessment across 4 dimensions)
+  11. select_weak_link                  (Deterministic: compute Decision Risk & apply tie-breakers)
+  12. reality_check                     (LLM: examine claims vs evidence for weak area)
+  13. generate_critical_assumption      (LLM: formulate single testable hypothesis)
+  14. save_critical_assumption          (Deterministic: validate & store first-class Assumption)
+"""
+
+from __future__ import annotations
+
+import json
+import json as _json
+import logging
+import uuid
+import re
+import time
+import uuid
+from typing import Any
+
+from langgraph.types import interrupt
+from pydantic import ValidationError
+
+from startary.config import get_settings
+from startary.domain.area_knowledge import AreaKnowledge, AreaStatus
+from startary.domain.assessment import (
+    RiskFactorLevel,
+    StartupAreaAssessment,
+    risk_factor_to_int,
+)
+from startary.domain.assumption import Assumption, CriticalAssumptionGroundingError
+from startary.domain.clarification import ClarifyingQuestion
+from startary.domain.diagnosis import Diagnosis
+from startary.domain.enums import (
+    AssumptionStatus,
+    CriticDimensionResult,
+    CriticVerdict,
+    EvidenceAnalysisConclusion,
+    EvidenceProvenance,
+    EvidenceResult,
+    EvidenceSourceType,
+    EvidenceStrength,
+    EvidenceSubmissionSufficiency,
+    EvidenceType,
+    ExecutionQuality,
+    ExecutionReadiness,
+    ExperimentDesignStatus,
+    ExperimentStatus,
+    ExperimentType,
+    ParameterProvenance,
+    WorkflowPhase,
+    ConversationalResponseMode,
+)
+from startary.domain.evidence import (
+    Evidence,
+    EvidenceAnalysis,
+    LearningDelta,
+    EvidenceTurnDisposition,
+    EvidenceTurnAssessment,
+    get_evidence_turn_disposition,
+    is_actual_evidence_turn,
+    has_valid_completed_evidence_cycle,
+)
+from startary.domain.customer_access import (
+    CustomerAccessAssessment,
+    CustomerAccessStatus,
+    CustomerAccessStrength,
+)
+from startary.domain.execution_context import ExecutionContext, TeamMember
+from startary.domain.experiment import (
+    CanExecuteAssessment,
+    Experiment,
+    ExperimentCriticReport,
+    ExperimentParameter,
+    ExecutionHandoff,
+    FallbackLearningAction,
+    FounderExperimentSummary,
+    compose_current_positive_signals,
+    compose_fallback_learning_action,
+    compose_founder_experiment_summary,
+    render_execution_handoff_text,
+    render_fallback_learning_action_text,
+)
+from startary.domain.gap_plan import (
+    GapPriority,
+    GapTargetDomain,
+    InformationGapPlan,
+    UncertaintyResolutionMode,
+    can_formulate_testable_uncertainty,
+)
+from startary.domain.provenance import (
+    FactConfidence,
+    FactProvenance,
+    KnowledgeField,
+    unknown_field,
+    validate_state_grounding,
+)
+from startary.domain.reality_check import EvidenceConclusion, RealityCheck
+from startary.domain.startup_progress import DevelopmentStage, ProductStatus, StartupProgress
+from startary.domain.state import StartupState
+from startary.domain.sufficiency import ContextSufficiencyAssessment
+from startary.domain.taxonomy import StartupArea
+from startary.domain.trace import AITrace
+from startary.graph.graph_state import StartaryGraphState
+from startary.llm.prompts import (
+    ASSESS_CONTEXT_SUFFICIENCY_SYSTEM_PROMPT,
+    ASSESS_STARTUP_AREAS_PROMPT_VERSION,
+    ASSESS_STARTUP_AREAS_SYSTEM_PROMPT,
+    CLARIFYING_QUESTION_PROMPT_VERSION,
+    CONTEXT_SUFFICIENCY_PROMPT_VERSION,
+    CRITICAL_ASSUMPTION_PROMPT_VERSION,
+    CRITICAL_ASSUMPTION_SYSTEM_PROMPT,
+    DIAGNOSE_STARTUP_PROMPT_VERSION,
+    DIAGNOSE_STARTUP_SYSTEM_PROMPT,
+    EXTRACT_STARTUP_STATE_SYSTEM_PROMPT,
+    INFORMATION_GAP_PLANNER_PROMPT_VERSION,
+    INFORMATION_GAP_PLANNER_SYSTEM_PROMPT,
+    REALITY_CHECK_PROMPT_VERSION,
+    REALITY_CHECK_SYSTEM_PROMPT,
+    SELECT_CLARIFYING_QUESTION_SYSTEM_PROMPT,
+    STARTUP_STATE_EXTRACTOR_PROMPT_VERSION,
+    build_area_assessment_user_message,
+    build_clarifying_question_user_message,
+    build_context_sufficiency_user_message,
+    build_critical_assumption_user_message,
+    build_diagnosis_user_message,
+    build_extract_startup_state_user_message,
+    build_information_gap_planner_user_message,
+    build_reality_check_user_message,
+    BASELINE_STATE_SUFFICIENCY_PROMPT_VERSION,
+    BASELINE_QUESTION_PLANNER_PROMPT_VERSION,
+    WEAK_LINK_DISCRIMINATION_PROMPT_VERSION,
+    WEAK_LINK_CLARIFICATION_PROMPT_VERSION,
+    BASELINE_STATE_SUFFICIENCY_SYSTEM_PROMPT,
+    build_baseline_sufficiency_user_message,
+    BASELINE_QUESTION_PLANNER_SYSTEM_PROMPT,
+    build_baseline_question_planner_user_message,
+    WEAK_LINK_DISCRIMINATION_SYSTEM_PROMPT,
+    build_weak_link_discrimination_user_message,
+    WEAK_LINK_CLARIFYING_QUESTION_SYSTEM_PROMPT,
+    build_weak_link_clarifying_question_user_message,
+    EXPERIMENT_GENERATOR_PROMPT_VERSION,
+    EXPERIMENT_GENERATOR_SYSTEM_PROMPT,
+    build_experiment_generator_user_message,
+    EXPERIMENT_CRITIC_PROMPT_VERSION,
+    EXPERIMENT_CRITIC_SYSTEM_PROMPT,
+    build_experiment_critic_user_message,
+    STARTUP_DIAGNOSIS_COMPOSER_PROMPT_VERSION,
+    STARTUP_DIAGNOSIS_COMPOSER_SYSTEM_PROMPT,
+    build_startup_diagnosis_composer_user_message,
+    FOUNDER_TURN_INTERPRETER_PROMPT_VERSION,
+    FOUNDER_TURN_INTERPRETER_SYSTEM_PROMPT,
+    build_founder_turn_interpreter_user_message,
+    ADVISOR_RESPONSE_COMPOSER_PROMPT_VERSION,
+    ADVISOR_RESPONSE_COMPOSER_SYSTEM_PROMPT,
+    build_advisor_response_composer_user_message,
+    EVIDENCE_EXTRACTOR_PROMPT_VERSION,
+    EVIDENCE_EXTRACTOR_SYSTEM_PROMPT,
+    build_evidence_extractor_user_message,
+    EVIDENCE_ANALYZER_PROMPT_VERSION,
+    EVIDENCE_ANALYZER_SYSTEM_PROMPT,
+    build_evidence_analyzer_user_message,
+    EVIDENCE_ADMISSION_GATE_SYSTEM_PROMPT,
+    build_evidence_admission_gate_user_message,
+    WAITING_FOR_EVIDENCE_ADVISOR_SYSTEM_PROMPT,
+    build_waiting_for_evidence_advisor_user_message,
+)
+from startary.domain.diagnosis_snapshot import StartupDiagnosisSnapshot
+from startary.domain.founder_intent import (
+    AdvisorResponse,
+    FounderIntentType,
+    FounderResponsePriority,
+    FounderTurnInterpretation,
+)
+from startary.domain.turn_control import (
+    FactConflict,
+    FounderGoal,
+    FounderGoalType,
+    NextTurnDecision,
+    QuestionHistoryItem,
+    should_surface_diagnosis_delta,
+    determine_conversational_response_mode,
+)
+from startary.domain.baseline import (
+    BaselineDimension,
+    BaselineDimensionStatus,
+    BaselineQuestionPlan,
+    BaselineStartupStateSufficiency,
+)
+from startary.domain.discrimination import (
+    SelectionConfidence,
+    WeakLinkClarifyingQuestion,
+    WeakLinkDiscrimination,
+)
+from startary.llm.provider import get_llm_client
+from startary.llm.schemas import (
+    AdvisorResponseLLMOutput,
+    BaselineQuestionPlanLLMOutput,
+    BaselineSufficiencyLLMOutput,
+    ClarifyingQuestionLLMOutput,
+    ContextSufficiencyLLMOutput,
+    CriticalAssumptionLLMOutput,
+    DiagnosisLLMOutput,
+    EvidenceAnalysisLLMOutput,
+    EvidenceTurnAssessmentLLMOutput,
+    ExperimentCriticLLMOutput,
+    ExperimentGeneratorLLMOutput,
+    ExperimentParameterLLM,
+    ExtractedEvidenceLLMOutput,
+    FounderTurnInterpretationLLMOutput,
+    InformationGapPlanLLMOutput,
+    RealityCheckLLMOutput,
+    StartupAreaAssessmentBatchLLMOutput,
+    StartupDiagnosisSnapshotLLMOutput,
+    StartupStateDeltaLLMOutput,
+    WaitingForEvidenceAdvisorLLMOutput,
+    WeakLinkClarifyingQuestionLLMOutput,
+    WeakLinkDiscriminationLLMOutput,
+)
+
+logger = logging.getLogger(__name__)
+
+MAX_BASELINE_QUESTION_TURNS = 5
+MAX_STRATEGIC_CLARIFICATION_TURNS = 5
+MAX_WEAK_LINK_CLARIFICATION_TURNS = 3
+MAX_CLARIFICATION_TURNS = 5  # Backward compat alias for strategic
+
+
+# ---------------------------------------------------------------------------
+# 1. initialize_state (Deterministic)
+# ---------------------------------------------------------------------------
+
+def initialize_state(state: StartaryGraphState) -> dict:
+    """Ensure required fields have sane defaults and initialize message history."""
+    updates: dict = {}
+
+    if not state.get("phase"):
+        updates["phase"] = WorkflowPhase.UNDERSTAND
+
+    if not state.get("iteration"):
+        updates["iteration"] = 1
+
+    if "startup_state" not in state:
+        updates["startup_state"] = StartupState().model_dump()
+
+    if "founder_evidence" not in state:
+        updates["founder_evidence"] = []
+    if "external_evidence" not in state:
+        updates["external_evidence"] = []
+    if "traces" not in state:
+        updates["traces"] = []
+
+    # Milestone 2.5 initialization
+    raw_ctx = state.get("raw_context") or ""
+    if "founder_messages" not in state:
+        messages = []
+        if raw_ctx.strip():
+            messages.append({"role": "founder", "content": raw_ctx.strip()})
+        updates["founder_messages"] = messages
+
+    if "clarification_turn_count" not in state:
+        updates["clarification_turn_count"] = 0
+
+    if "clarification_history" not in state:
+        updates["clarification_history"] = []
+
+    # Milestone 2.6 initialization
+    if "execution_context" not in state:
+        updates["execution_context"] = ExecutionContext().model_dump()
+
+    if "startup_progress" not in state:
+        updates["startup_progress"] = StartupProgress().model_dump()
+
+    if "startup_state_delta" not in state:
+        updates["startup_state_delta"] = {}
+
+    # Milestone 2.6.1 initialization (dedicated counters & histories)
+    if "baseline_question_turns" not in state:
+        updates["baseline_question_turns"] = 0
+    if "strategic_clarification_turns" not in state:
+        updates["strategic_clarification_turns"] = 0
+    if "weak_link_clarification_turns" not in state:
+        updates["weak_link_clarification_turns"] = 0
+    if "baseline_history" not in state:
+        updates["baseline_history"] = []
+    if "weak_link_clarification_history" not in state:
+        updates["weak_link_clarification_history"] = []
+    if "competing_weak_areas" not in state:
+        updates["competing_weak_areas"] = []
+    if "active_interrupt_type" not in state:
+        updates["active_interrupt_type"] = None
+    if "selection_confidence" not in state:
+        updates["selection_confidence"] = None
+
+    # Milestone 3.2 & 3.2.1 initialization
+    if "latest_founder_turn_interpretation" not in state:
+        updates["latest_founder_turn_interpretation"] = None
+    if "latest_advisor_response" not in state:
+        updates["latest_advisor_response"] = None
+    if "pending_question" not in state:
+        updates["pending_question"] = None
+    if "founder_current_concern" not in state:
+        updates["founder_current_concern"] = None
+    if "cannot_act_now_context" not in state:
+        updates["cannot_act_now_context"] = False
+    if "recent_corrections" not in state:
+        updates["recent_corrections"] = []
+    if "active_next_turn_decision" not in state:
+        updates["active_next_turn_decision"] = None
+    if "question_history" not in state:
+        updates["question_history"] = []
+    if "founder_current_goal" not in state:
+        updates["founder_current_goal"] = None
+    if "fact_conflicts" not in state:
+        updates["fact_conflicts"] = []
+    if "intro_summary_shown" not in state:
+        updates["intro_summary_shown"] = False
+
+    # Milestone 4 initialization
+    if "founder_evidence" not in state:
+        updates["founder_evidence"] = []
+    if "external_evidence" not in state:
+        updates["external_evidence"] = []
+    if "active_evidence" not in state:
+        updates["active_evidence"] = None
+    if "extracted_evidence" not in state:
+        updates["extracted_evidence"] = None
+    if "evidence_clarification_turns" not in state:
+        updates["evidence_clarification_turns"] = 0
+    if "evidence_analysis" not in state:
+        updates["evidence_analysis"] = None
+    if "learning_delta" not in state:
+        updates["learning_delta"] = None
+    if "previous_diagnosis_snapshot" not in state:
+        updates["previous_diagnosis_snapshot"] = None
+    if "previous_assumptions" not in state:
+        updates["previous_assumptions"] = []
+
+    # Milestone 4.0.1: Protect against stale M4 state on fresh Iteration-1 runs
+    current_iter = updates.get("iteration", state.get("iteration", 1))
+    if current_iter == 1:
+        updates["learning_delta"] = None
+        updates["previous_assumptions"] = []
+        updates["previous_diagnosis_snapshot"] = None
+        updates["previous_weak_area"] = None
+        updates["evidence_analysis"] = None
+        updates["active_evidence"] = None
+        updates["extracted_evidence"] = None
+        updates["evidence_clarification_turns"] = 0
+
+    project_id = state.get("project_id", "<unknown>")
+    phase = updates.get("phase", state.get("phase"))
+    iteration = updates.get("iteration", state.get("iteration"))
+
+    logger.info("initialize_state | project_id=%s phase=%s iteration=%s", project_id, phase, iteration)
+    return updates
+
+
+# ---------------------------------------------------------------------------
+# 2. verify_state (Deterministic)
+# ---------------------------------------------------------------------------
+
+def verify_state(state: StartaryGraphState) -> dict:
+    """Validate internal state consistency."""
+    errors: list[str] = []
+
+    if not state.get("project_id"):
+        errors.append("project_id is missing or empty")
+
+    phase = state.get("phase")
+    if phase is None:
+        errors.append("phase is missing")
+    elif phase not in WorkflowPhase.__members__.values():
+        errors.append(f"phase '{phase}' is not a valid WorkflowPhase")
+
+    iteration = state.get("iteration")
+    if iteration is None:
+        errors.append("iteration is missing")
+    elif not isinstance(iteration, int) or iteration < 1:
+        errors.append(f"iteration must be a positive integer, got: {iteration!r}")
+
+    startup_state = state.get("startup_state")
+    if startup_state is None:
+        errors.append("startup_state is missing")
+    elif not isinstance(startup_state, dict):
+        errors.append("startup_state must be a dict")
+
+    if errors:
+        raise ValueError(f"State verification failed: {'; '.join(errors)}")
+
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# 3. diagnose_startup (LLM)
+# ---------------------------------------------------------------------------
+
+def diagnose_startup(state: StartaryGraphState) -> dict:
+    """Extract structured startup state from raw context & message history using LLM."""
+    project_id = state.get("project_id", "<unknown>")
+    raw_context = state.get("raw_context") or ""
+    founder_messages = state.get("founder_messages") or []
+
+    # If messages exist, build combined source text
+    if not raw_context.strip() and not founder_messages:
+        empty_output = DiagnosisLLMOutput(
+            area_assessments=[],
+            diagnosis_summary="No founder context was provided.",
+        )
+        return {
+            "diagnosis_output": empty_output.model_dump(),
+            "phase": WorkflowPhase.DIAGNOSE,
+        }
+
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(DiagnosisLLMOutput)
+
+    user_message = build_diagnosis_user_message(
+        raw_context=raw_context,
+        founder_messages=founder_messages,
+    )
+    messages = [
+        {"role": "system", "content": DIAGNOSE_STARTUP_SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+
+    attempt = 0
+    last_error: Exception | None = None
+
+    while attempt < 2:
+        attempt += 1
+        t_start = time.monotonic()
+        try:
+            result: DiagnosisLLMOutput = structured_llm.invoke(messages)
+            latency_ms = (time.monotonic() - t_start) * 1000
+
+            if not isinstance(result, DiagnosisLLMOutput):
+                raise ValidationError(f"Expected DiagnosisLLMOutput, got {type(result)}")
+
+            trace = AITrace(
+                module_name="diagnose_startup",
+                prompt_version=DIAGNOSE_STARTUP_PROMPT_VERSION,
+                input_data={"messages_count": len(founder_messages), "raw_context_len": len(raw_context)},
+                output_data=result.model_dump(),
+                latency_ms=latency_ms,
+                project_id=project_id,
+            )
+
+            existing_traces = list(state.get("traces") or [])
+            existing_traces.append(trace.model_dump(mode="json"))
+
+            return {
+                "diagnosis_output": result.model_dump(),
+                "last_trace": trace.model_dump(mode="json"),
+                "traces": existing_traces,
+                "phase": WorkflowPhase.DIAGNOSE,
+            }
+        except Exception as exc:
+            last_error = exc
+            logger.warning("diagnose_startup failed attempt %d: %s", attempt, exc)
+
+    raise RuntimeError(f"diagnose_startup failed after 2 attempts. Error: {last_error}")
+
+
+# ---------------------------------------------------------------------------
+# 4. merge_diagnosis (Deterministic)
+# ---------------------------------------------------------------------------
+
+def merge_diagnosis(state: StartaryGraphState) -> dict:
+    """Merge validated diagnosis output into StartupState & Diagnosis models."""
+    project_id = state.get("project_id", "<unknown>")
+    iteration = state.get("iteration", 1)
+    raw_context = state.get("raw_context")
+
+    diagnosis_output_dict = state.get("diagnosis_output")
+    if not diagnosis_output_dict:
+        raise ValueError(f"merge_diagnosis | project_id={project_id}: diagnosis_output is missing from state.")
+
+    llm_output = DiagnosisLLMOutput(**diagnosis_output_dict)
+
+    areas: dict[StartupArea, AreaKnowledge] = {}
+    for area_diag in llm_output.area_assessments:
+        try:
+            areas[area_diag.area] = AreaKnowledge(
+                status=area_diag.status,
+                understanding=area_diag.understanding,
+                founder_claims=area_diag.founder_claims,
+                evidence_provided=area_diag.evidence_provided,
+                missing_information=area_diag.missing_information,
+            )
+        except Exception:
+            areas[area_diag.area] = AreaKnowledge(status=AreaStatus.UNKNOWN)
+
+    for area in StartupArea:
+        if area not in areas:
+            areas[area] = AreaKnowledge(status=AreaStatus.UNKNOWN)
+
+    new_startup_state = StartupState(raw_context=raw_context, areas=areas)
+
+    assessments = [
+        StartupAreaAssessment(
+            area=area,
+            status=areas[area].status,
+            summary=areas[area].understanding,
+            evidence_gap_details=areas[area].missing_information,
+        )
+        for area in StartupArea
+    ]
+
+    missing_areas = [a for a, k in areas.items() if k.status == AreaStatus.UNKNOWN]
+
+    diagnosis = Diagnosis(
+        project_id=project_id,
+        iteration=iteration,
+        raw_context=raw_context,
+        assessments=assessments,
+        clear_areas=llm_output.clear_areas,
+        unclear_areas=llm_output.unclear_areas,
+        weak_areas=[],
+        missing_areas=missing_areas,
+        unsupported_claims=llm_output.unsupported_claims,
+        summary=llm_output.diagnosis_summary,
+        startup_stage=llm_output.startup_stage,
+    )
+
+    return {
+        "startup_state": new_startup_state.model_dump(),
+        "diagnosis": diagnosis.model_dump(mode="json"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 5. assess_context_sufficiency (LLM — Milestone 2.5)
+# ---------------------------------------------------------------------------
+
+def assess_context_sufficiency(state: StartaryGraphState) -> dict:
+    """
+    LLM Node: Evaluate whether the founder context is grounded enough to proceed
+    to weak-link decision risk assessment without inventing facts.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    startup_state_dict = state.get("startup_state", {})
+    diagnosis_dict = state.get("diagnosis", {})
+    founder_messages = state.get("founder_messages") or []
+
+    history_lines = []
+    for msg in founder_messages:
+        history_lines.append(f"{msg.get('role', 'founder').upper()}: {msg.get('content')}")
+    history_text = "\n".join(history_lines) if history_lines else (state.get("raw_context") or "")
+
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(ContextSufficiencyLLMOutput)
+
+    user_message = build_context_sufficiency_user_message(
+        startup_state_json=json.dumps(startup_state_dict, indent=2),
+        diagnosis_summary=diagnosis_dict.get("summary", ""),
+        conversation_history_text=history_text,
+    )
+
+    messages = [
+        {"role": "system", "content": ASSESS_CONTEXT_SUFFICIENCY_SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+
+    attempt = 0
+    last_error: Exception | None = None
+
+    while attempt < 2:
+        attempt += 1
+        t_start = time.monotonic()
+        try:
+            result: ContextSufficiencyLLMOutput = structured_llm.invoke(messages)
+            latency_ms = (time.monotonic() - t_start) * 1000
+
+            if not isinstance(result, ContextSufficiencyLLMOutput):
+                raise ValidationError(f"Expected ContextSufficiencyLLMOutput, got {type(result)}")
+
+            cs_domain = ContextSufficiencyAssessment(
+                sufficient=result.sufficient,
+                confidence=result.confidence,
+                grounding_quality=result.grounding_quality,
+                would_one_more_answer_materially_change_direction=result.would_one_more_answer_materially_change_direction,
+                reason=result.reason,
+                blocking_unknowns=result.blocking_unknowns,
+                usable_grounding=result.usable_grounding,
+                prohibited_inferences=result.prohibited_inferences,
+                recommended_question_area=result.recommended_question_area,
+                information_goal=result.information_goal,
+            )
+
+            trace = AITrace(
+                module_name="assess_context_sufficiency",
+                prompt_version=CONTEXT_SUFFICIENCY_PROMPT_VERSION,
+                input_data={"turn": state.get("clarification_turn_count", 0)},
+                output_data=result.model_dump(),
+                latency_ms=latency_ms,
+                project_id=project_id,
+            )
+
+            existing_traces = list(state.get("traces") or [])
+            existing_traces.append(trace.model_dump(mode="json"))
+
+            logger.info(
+                "assess_context_sufficiency | project_id=%s sufficient=%s reason=%s",
+                project_id,
+                result.sufficient,
+                result.reason[:100],
+            )
+
+            return {
+                "context_sufficiency_output": result.model_dump(),
+                "context_sufficiency": cs_domain.model_dump(mode="json"),
+                "is_sufficient": result.sufficient,
+                "last_trace": trace.model_dump(mode="json"),
+                "traces": existing_traces,
+            }
+        except Exception as exc:
+            last_error = exc
+            logger.warning("assess_context_sufficiency failed attempt %d: %s", attempt, exc)
+
+    raise RuntimeError(f"assess_context_sufficiency failed after 2 attempts. Error: {last_error}")
+
+
+# ---------------------------------------------------------------------------
+# 6. select_clarifying_question (LLM — Milestone 2.5)
+# ---------------------------------------------------------------------------
+
+def select_clarifying_question(state: StartaryGraphState) -> dict:
+    """
+    LLM Node: Select exactly ONE highest-information-value clarifying question to ask the founder.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    cs_dict = state.get("context_sufficiency") or {}
+    founder_messages = state.get("founder_messages") or []
+    clarification_history = state.get("clarification_history") or []
+
+    history_lines = []
+    for msg in founder_messages:
+        history_lines.append(f"{msg.get('role', 'founder').upper()}: {msg.get('content')}")
+    history_text = "\n".join(history_lines) if history_lines else (state.get("raw_context") or "")
+
+    prev_q_lines = []
+    for item in clarification_history:
+        prev_q_lines.append(f"- Q: {item.get('question')} (Target: {item.get('target_area')}, Goal: {item.get('information_goal')})")
+    prev_q_text = "\n".join(prev_q_lines)
+
+    target_area_str = cs_dict.get("recommended_question_area") or str(StartupArea.PROBLEM)
+    try:
+        target_area_enum = StartupArea(target_area_str)
+    except Exception:
+        target_area_enum = StartupArea.PROBLEM
+
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(ClarifyingQuestionLLMOutput)
+
+    user_message = build_clarifying_question_user_message(
+        information_goal=cs_dict.get("information_goal", "Clarify core problem and user context."),
+        target_area=str(target_area_enum),
+        blocking_unknowns=cs_dict.get("blocking_unknowns", []),
+        usable_grounding=cs_dict.get("usable_grounding", []),
+        prohibited_inferences=cs_dict.get("prohibited_inferences", []),
+        previous_questions_text=prev_q_text,
+        conversation_history_text=history_text,
+    )
+
+    messages = [
+        {"role": "system", "content": SELECT_CLARIFYING_QUESTION_SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+
+    attempt = 0
+    last_error: Exception | None = None
+
+    while attempt < 2:
+        attempt += 1
+        t_start = time.monotonic()
+        try:
+            result: ClarifyingQuestionLLMOutput = structured_llm.invoke(messages)
+            latency_ms = (time.monotonic() - t_start) * 1000
+
+            if not isinstance(result, ClarifyingQuestionLLMOutput):
+                raise ValidationError(f"Expected ClarifyingQuestionLLMOutput, got {type(result)}")
+
+            cq_domain = ClarifyingQuestion(
+                question=result.question.strip(),
+                target_area=result.target_area,
+                information_goal=result.information_goal,
+                why_this_question_now=result.why_this_question_now,
+            )
+
+            trace = AITrace(
+                module_name="select_clarifying_question",
+                prompt_version=CLARIFYING_QUESTION_PROMPT_VERSION,
+                input_data={"target_area": str(result.target_area), "turn": state.get("clarification_turn_count", 0)},
+                output_data=result.model_dump(),
+                latency_ms=latency_ms,
+                project_id=project_id,
+            )
+
+            existing_traces = list(state.get("traces") or [])
+            existing_traces.append(trace.model_dump(mode="json"))
+
+            logger.info(
+                "select_clarifying_question | project_id=%s area=%s question=%s",
+                project_id,
+                result.target_area,
+                result.question[:80],
+            )
+
+            return {
+                "current_clarifying_question": cq_domain.model_dump(mode="json"),
+                "phase": WorkflowPhase.CLARIFYING_CONTEXT,
+                "last_trace": trace.model_dump(mode="json"),
+                "traces": existing_traces,
+            }
+        except Exception as exc:
+            last_error = exc
+            logger.warning("select_clarifying_question failed attempt %d: %s", attempt, exc)
+
+    raise RuntimeError(f"select_clarifying_question failed after 2 attempts. Error: {last_error}")
+
+
+# ---------------------------------------------------------------------------
+# 7. ask_and_wait_for_founder (Interrupt Node — Milestone 2.5)
+# ---------------------------------------------------------------------------
+
+def ask_and_wait_for_founder(state: StartaryGraphState) -> dict:
+    """
+    Interrupt Node: Exposes the conversational advisor response (bound to active NextTurnDecision)
+    and pauses execution until resumed with the founder's response.
+    """
+    active_type = state.get("active_interrupt_type") or "strategic"
+    active_decision = state.get("active_next_turn_decision") or {}
+
+    if active_type == "baseline" and state.get("current_baseline_question"):
+        q_dict = state["current_baseline_question"]
+    elif active_type == "weak_link" and state.get("current_weak_link_question"):
+        q_dict = state["current_weak_link_question"]
+    else:
+        q_dict = state.get("current_clarifying_question") or {}
+
+    raw_question_text = active_decision.get("canonical_question") or q_dict.get("question", "Could you provide more context about your startup?")
+    target_area = active_decision.get("information_target") or q_dict.get("target_area") or q_dict.get("target_group") or "Context"
+    question_id = active_decision.get("question_id") or f"q_legacy_{int(time.time())}"
+
+    # Milestone 3.2.1: ensure advisor response is composed and bound to current decision
+    advisor_resp = state.get("latest_advisor_response")
+    advisor_updates: dict[str, Any] = {}
+    if not advisor_resp or advisor_resp.get("question_id") != question_id:
+        try:
+            advisor_updates = compose_advisor_response(state)
+            advisor_resp = advisor_updates.get("latest_advisor_response")
+        except Exception as exc:
+            logger.warning("Failed to compose advisor response in ask_and_wait: %s", exc)
+
+    display_question = (advisor_resp or {}).get("response_text") or raw_question_text
+
+    turn_number = (
+        state.get("baseline_question_turns", 0) + 1 if active_type == "baseline"
+        else (state.get("weak_link_clarification_turns", 0) + 1 if active_type == "weak_link"
+              else state.get("strategic_clarification_turns", state.get("clarification_turn_count", 0)) + 1)
+    )
+
+    # LangGraph interrupt: suspends graph execution and awaits resume value from CLI / caller
+    founder_answer = interrupt({
+        "question": display_question,
+        "raw_planner_question": raw_question_text,
+        "target_area": str(target_area),
+        "question_id": question_id,
+        "information_goal": q_dict.get("information_goal", ""),
+        "turn": turn_number,
+        "interrupt_type": active_type,
+    })
+
+    logger.info("ask_and_wait_for_founder resumed (%s, qid=%s) with answer: %s", active_type, question_id, str(founder_answer)[:60])
+    res: dict[str, Any] = {
+        "founder_response": str(founder_answer),
+    }
+    if advisor_updates:
+        res.update(advisor_updates)
+    return res
+
+
+# ---------------------------------------------------------------------------
+# 8. merge_founder_answer (Deterministic — Milestone 2.6.1 & 3.2.1)
+# ---------------------------------------------------------------------------
+
+def merge_founder_answer(state: StartaryGraphState) -> dict:
+    """
+    Deterministic Node:
+    - Merges founder's response into conversation history
+    - Updates dedicated turn counter based on active_interrupt_type
+    - Records answered question into question_history
+    - INVALIDATES active_next_turn_decision and latest_advisor_response to prevent stale reuse
+    - Prepares state for re-extraction / re-evaluation
+    """
+    founder_answer = (state.get("founder_response") or "").strip()
+    active_type = state.get("active_interrupt_type") or "strategic"
+    active_decision = state.get("active_next_turn_decision") or {}
+
+    if active_type == "baseline" and state.get("current_baseline_question"):
+        q_dict = state["current_baseline_question"]
+    elif active_type == "weak_link" and state.get("current_weak_link_question"):
+        q_dict = state["current_weak_link_question"]
+    else:
+        q_dict = state.get("current_clarifying_question") or {}
+
+    advisor_resp = state.get("latest_advisor_response") or {}
+    question_text = advisor_resp.get("response_text") or active_decision.get("canonical_question") or q_dict.get("question", "")
+
+    founder_messages = list(state.get("founder_messages") or [])
+    if question_text:
+        founder_messages.append({"role": "startary", "content": question_text})
+    if founder_answer:
+        founder_messages.append({"role": "founder", "content": founder_answer})
+
+    # Track in QuestionHistory (Milestone 3.2.1)
+    q_history = list(state.get("question_history") or [])
+    qid = active_decision.get("question_id") or f"q_{len(q_history)+1}"
+    q_history.append({
+        "question_id": qid,
+        "information_target": active_decision.get("information_target") or q_dict.get("target_group") or q_dict.get("target_area") or "UNKNOWN",
+        "canonical_question": active_decision.get("canonical_question") or q_dict.get("question", ""),
+        "turn": len(q_history) + 1,
+        "answered": True,
+        "founder_answer_summary": founder_answer[:120],
+    })
+
+    updates: dict = {
+        "founder_messages": founder_messages,
+        "pending_question": question_text,
+        "question_history": q_history,
+        "answered_question_id": qid,
+        "active_next_turn_decision": None,  # CONSUMED: stale question cannot survive
+        "latest_advisor_response": None,   # CLEARED: forces fresh advisor composition on next turn
+        "current_clarifying_question": None,
+        "current_baseline_question": None,
+        "current_weak_link_question": None,
+        "founder_response": None,
+        "active_interrupt_type": None,
+        "phase": WorkflowPhase.UNDERSTAND,
+    }
+
+    # Dispatch to dedicated history and counter
+    if active_type == "baseline":
+        b_history = list(state.get("baseline_history") or [])
+        b_turn = state.get("baseline_question_turns", 0) + 1
+        if question_text:
+            b_history.append({
+                "question": question_text,
+                "target_group": active_decision.get("information_target") or q_dict.get("target_group"),
+                "founder_answer": founder_answer,
+                "turn": b_turn,
+                "question_id": qid,
+            })
+        updates["baseline_history"] = b_history
+        updates["baseline_question_turns"] = b_turn
+        logger.info("merge_founder_answer [BASELINE] | turn=%d total_messages=%d qid=%s", b_turn, len(founder_messages), qid)
+
+    elif active_type == "weak_link":
+        wl_history = list(state.get("weak_link_clarification_history") or [])
+        wl_turn = state.get("weak_link_clarification_turns", 0) + 1
+        if question_text:
+            wl_history.append({
+                "question": question_text,
+                "competing_areas": q_dict.get("competing_areas"),
+                "information_goal": q_dict.get("information_goal"),
+                "founder_answer": founder_answer,
+                "turn": wl_turn,
+            })
+        updates["weak_link_clarification_history"] = wl_history
+        updates["weak_link_clarification_turns"] = wl_turn
+        updates["is_strategic_sufficient"] = True
+        updates["is_baseline_sufficient"] = True
+        logger.info("merge_founder_answer [WEAK_LINK] | turn=%d total_messages=%d", wl_turn, len(founder_messages))
+
+    else:
+        c_history = list(state.get("clarification_history") or [])
+        s_turn = state.get("strategic_clarification_turns", 0) + 1
+        legacy_turn = state.get("clarification_turn_count", 0) + 1
+        if question_text:
+            c_history.append({
+                "question": question_text,
+                "target_area": q_dict.get("target_area"),
+                "information_goal": q_dict.get("information_goal"),
+                "founder_answer": founder_answer,
+                "turn": s_turn,
+            })
+        updates["clarification_history"] = c_history
+        updates["strategic_clarification_turns"] = s_turn
+        updates["clarification_turn_count"] = legacy_turn
+        logger.info("merge_founder_answer [STRATEGIC] | turn=%d total_messages=%d", s_turn, len(founder_messages))
+
+    # Accumulate source text for raw_context
+    raw_context = state.get("raw_context") or ""
+    if founder_answer:
+        raw_context += f"\n\n[Founder Response ({active_type})]:\n{founder_answer}"
+    updates["raw_context"] = raw_context
+
+    return updates
+
+
+# ---------------------------------------------------------------------------
+# 9. handle_insufficient_context_stop (Deterministic — Milestone 2.5)
+# ---------------------------------------------------------------------------
+
+def handle_insufficient_context_stop(state: StartaryGraphState) -> dict:
+    """
+    Deterministic Node:
+    Safely terminates the UNDERSTAND loop when maximum clarification turns (5) are reached
+    without manufacturing an ungrounded critical assumption.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    cs_dict = state.get("context_sufficiency") or {}
+    blocking = cs_dict.get("blocking_unknowns") or []
+
+    blocking_str = "; ".join(blocking) if blocking else "Core problem and customer specifics."
+    msg = (
+        f"Startary reached the maximum clarification limit ({MAX_CLARIFICATION_TURNS} turns) "
+        f"and still does not have enough grounded information to formulate a sound critical assumption. "
+        f"The most important missing information is: {blocking_str}"
+    )
+
+    logger.warning("handle_insufficient_context_stop | project_id=%s msg=%s", project_id, msg)
+
+    return {
+        "status_message": msg,
+        "phase": WorkflowPhase.UNDERSTAND,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Milestone 2.6 — Helper: merge KnowledgeField with provenance rules
+# ---------------------------------------------------------------------------
+
+def _merge_knowledge_field(
+    existing: dict,
+    incoming: dict,
+    source_turn: int,
+) -> dict:
+    """
+    Deterministic merge of two serialized KnowledgeField dicts following provenance rules:
+
+    1. EXPLICIT always wins over INFERRED for same field.
+    2. Newer EXPLICIT overwrites older EXPLICIT (higher source_turn wins).
+    3. INFERRED never silently overwrites EXPLICIT.
+    4. UNKNOWN never overwrites any known value.
+    5. CONFLICTING: set when two EXPLICIT values directly contradict.
+    """
+    existing_prov = existing.get("provenance", "UNKNOWN")
+    incoming_prov = incoming.get("provenance", "UNKNOWN")
+    incoming_val = incoming.get("value")
+
+    if incoming_prov == "UNKNOWN" or incoming_val is None:
+        return existing  # UNKNOWN never overwrites
+
+    if existing_prov == "UNKNOWN":
+        return {**incoming, "source_turn": source_turn}
+
+    if existing_prov == "INFERRED" and incoming_prov == "EXPLICIT":
+        return {**incoming, "source_turn": source_turn}
+
+    if existing_prov == "INFERRED" and incoming_prov == "INFERRED":
+        # Take newer inferred value (higher turn wins or same)
+        existing_turn = existing.get("source_turn") or -1
+        if source_turn >= existing_turn:
+            return {**incoming, "source_turn": source_turn}
+        return existing
+
+    if existing_prov == "EXPLICIT" and incoming_prov == "EXPLICIT":
+        existing_val = existing.get("value")
+        existing_turn = existing.get("source_turn") or -1
+
+        if source_turn == existing_turn and incoming_val != existing_val:
+            # Same turn, different values → CONFLICTING
+            return {
+                "value": None,
+                "provenance": "CONFLICTING",
+                "confidence": "LOW",
+                "source_turn": source_turn,
+                "notes": f"Conflict: '{existing_val}' vs '{incoming_val}'",
+            }
+
+        if source_turn > existing_turn:
+            return {**incoming, "source_turn": source_turn}
+        return existing  # older explicit is kept
+
+    if existing_prov == "EXPLICIT" and incoming_prov == "INFERRED":
+        return existing  # INFERRED never overwrites EXPLICIT
+
+    if existing_prov == "CONFLICTING" and incoming_prov == "EXPLICIT":
+        return {**incoming, "source_turn": source_turn}  # EXPLICIT resolves conflict
+
+    return existing
+
+
+def _safe_field(llm_field, source_turn: int) -> dict | None:
+    """Convert an ExtractedKnowledgeFieldLLMOutput to a plain dict. Returns None if empty."""
+    if llm_field is None:
+        return None
+    val = llm_field.get("value") if isinstance(llm_field, dict) else getattr(llm_field, "value", None)
+    if val is None:
+        return None
+    prov = llm_field.get("provenance") if isinstance(llm_field, dict) else getattr(llm_field, "provenance", "UNKNOWN")
+    conf = llm_field.get("confidence") if isinstance(llm_field, dict) else getattr(llm_field, "confidence", "LOW")
+    notes = llm_field.get("notes") if isinstance(llm_field, dict) else getattr(llm_field, "notes", None)
+    return {"value": val, "provenance": prov, "confidence": conf, "source_turn": source_turn, "notes": notes}
+
+
+def _unknown_field_dict() -> dict:
+    return {"value": None, "provenance": "UNKNOWN", "confidence": "LOW", "source_turn": None, "notes": None}
+
+
+# ---------------------------------------------------------------------------
+# M2.6 Node 1: extract_startup_state (LLM)
+# ---------------------------------------------------------------------------
+
+def extract_startup_state(state: StartaryGraphState) -> dict:
+    """
+    LLM Node: Extract execution context and startup progress facts from founder messages.
+
+    Produces a delta dict that is passed to merge_execution_state for deterministic merge.
+    Only extracts from founder-authored messages (role='founder').
+    """
+    import json as _json
+
+    project_id = state.get("project_id", "<unknown>")
+    founder_messages = state.get("founder_messages") or []
+    current_exec_ctx = state.get("execution_context") or {}
+    current_progress = state.get("startup_progress") or {}
+
+    # Build founder-only source text
+    source_lines = [
+        f"[Turn {i+1}] {msg['content']}"
+        for i, msg in enumerate(founder_messages)
+        if msg.get("role") == "founder"
+    ]
+
+    if not source_lines:
+        logger.info("extract_startup_state | no founder messages to extract from")
+        return {"startup_state_delta": {}}
+
+    founder_text = "\n\n".join(source_lines)
+    source_turn = state.get("clarification_turn_count", 0)
+    pending_question = state.get("pending_question")
+
+    # Detect short answer (e.g. 'yes', 'no', 'not yet')
+    latest_founder_text = ""
+    for msg in reversed(founder_messages):
+        if msg.get("role") == "founder":
+            latest_founder_text = (msg.get("content") or "").strip()
+            break
+    norm_short = latest_founder_text.lower().rstrip(".!?,")
+    is_short_answer = (len(norm_short.split()) <= 3) and (norm_short in {
+        "yes", "no", "maybe", "not yet", "none", "i dont know", "i don't know", "dont know", "not sure", "not now"
+    })
+
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(StartupStateDeltaLLMOutput)
+
+    user_message = build_extract_startup_state_user_message(
+        founder_messages_text=founder_text,
+        current_execution_context_json=_json.dumps(current_exec_ctx, indent=2, default=str),
+        current_progress_json=_json.dumps(current_progress, indent=2, default=str),
+        source_turn=source_turn,
+        pending_question=pending_question,
+    )
+
+    messages = [
+        {"role": "system", "content": EXTRACT_STARTUP_STATE_SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+
+    attempt = 0
+    last_error: Exception | None = None
+
+    while attempt < 2:
+        attempt += 1
+        t_start = time.monotonic()
+        try:
+            result: StartupStateDeltaLLMOutput = structured_llm.invoke(messages)
+            latency_ms = (time.monotonic() - t_start) * 1000
+
+            delta_dict = result.model_dump()
+            delta_dict["_source_turn"] = source_turn
+
+            # Short-answer guardrail (Section 15/16): prevent unrelated speculative INFERRED fields
+            if is_short_answer and pending_question:
+                pq_lower = pending_question.lower()
+                field_keywords = {
+                    "founder_count": ["founder", "co-founder", "team", "alone", "solo"],
+                    "active_team_size": ["team", "people", "members", "size"],
+                    "has_technical_capability": ["technical", "developer", "engineer", "code"],
+                    "has_design_capability": ["design", "ui", "ux"],
+                    "has_marketing_capability": ["marketing", "sales", "growth"],
+                    "weekly_hours_per_member": ["hour", "time", "weekly", "capacity"],
+                    "total_weekly_capacity_hours": ["hour", "time", "weekly", "capacity"],
+                    "available_budget_amount": ["budget", "money", "fund", "cash", "spend", "dollar", "azn", "eur"],
+                    "funding_status": ["funding", "funded", "investor", "bootstrap"],
+                    "customer_access": ["access", "network", "contact", "customer", "user", "owner", "manager"],
+                    "prototype_exists": ["prototype", "wireframe", "mockup"],
+                    "mvp_exists": ["mvp", "product", "software", "app", "tool"],
+                    "launched": ["launch", "live", "market"],
+                    "active_users": ["user", "active", "pilot"],
+                    "paying_customers": ["customer", "paying", "client"],
+                    "revenue": ["revenue", "money", "sales", "income", "pricing", "pay"],
+                }
+                for k, v in list(delta_dict.items()):
+                    if isinstance(v, dict) and v.get("provenance") == "INFERRED":
+                        keywords = field_keywords.get(k, [])
+                        if keywords and not any(kw in pq_lower for kw in keywords):
+                            logger.info("extract_startup_state | dropping speculative inference '%s' on short answer '%s'", k, latest_founder_text)
+                            delta_dict[k] = None
+
+            # Milestone 4.0.4: Factual state grounding validation
+            delta_dict = validate_state_grounding(state, delta_dict, latest_founder_text)
+
+            trace = AITrace(
+                module_name="extract_startup_state",
+                prompt_version=STARTUP_STATE_EXTRACTOR_PROMPT_VERSION,
+                input_data={"founder_messages_count": len(source_lines), "source_turn": source_turn},
+                output_data={"delta_keys": [k for k, v in delta_dict.items() if v is not None and k != "_source_turn"]},
+                latency_ms=latency_ms,
+                project_id=project_id,
+            )
+
+            existing_traces = list(state.get("traces") or [])
+            existing_traces.append(trace.model_dump(mode="json"))
+
+            logger.info("extract_startup_state | project_id=%s latency_ms=%.0f", project_id, latency_ms)
+
+            return {
+                "startup_state_delta": delta_dict,
+                "last_trace": trace.model_dump(mode="json"),
+                "traces": existing_traces,
+            }
+        except Exception as exc:
+            last_error = exc
+            logger.warning("extract_startup_state failed attempt %d: %s", attempt, exc)
+
+    logger.error("extract_startup_state failed after 2 attempts: %s", last_error)
+    return {"startup_state_delta": {}}  # Graceful degradation — never block the graph
+
+
+def _is_sharp_contradiction(field_name: str, existing_val: Any, incoming_val: Any) -> bool:
+    """
+    Detect explicit contradictions that require founder clarification (Milestone 3.2.1 Section 14).
+    Example: Earlier founder says 'We are 3 people', later says 'I am alone'.
+    """
+    if incoming_val is None or existing_val is None:
+        return False
+    if str(existing_val).strip() == str(incoming_val).strip():
+        return False
+    if field_name in ("founder_count", "active_team_size"):
+        try:
+            e_num = int(existing_val)
+            i_num = int(incoming_val)
+            if e_num > 1 and i_num <= 1:
+                return True
+        except (ValueError, TypeError):
+            if str(incoming_val).lower() in ("alone", "solo", "just me", "only me"):
+                return True
+    return False
+
+
+def merge_execution_state(state: StartaryGraphState) -> dict:
+    """
+    Deterministic Node: Apply provenance-aware delta merge to ExecutionContext and StartupProgress.
+
+    Rules:
+    - EXPLICIT always wins over INFERRED.
+    - UNKNOWN never overwrites any known value.
+    - INFERRED never overwrites EXPLICIT.
+    - CONFLICTING is set when two EXPLICIT values at same turn differ.
+    - Contradictory explicit facts (e.g. 3 founders -> 1 founder) generate a FactConflict.
+    """
+    import json as _json
+
+    delta = state.get("startup_state_delta") or {}
+    source_turn = delta.get("_source_turn", state.get("clarification_turn_count", 0))
+
+    # Milestone 4.0.4: Validate state grounding before merging
+    founder_messages = state.get("founder_messages") or []
+    delta = validate_state_grounding(state, delta, founder_messages)
+
+    # Load current serialized dicts (or default empty objects)
+    current_exec_dict = state.get("execution_context") or {}
+    current_prog_dict = state.get("startup_progress") or {}
+
+    def merge_field(current_dict: dict, key: str, incoming_field) -> dict:
+        """Merge one field into the current dict with explicit conflict protection."""
+        if incoming_field is None:
+            return current_dict
+        incoming = _safe_field(incoming_field, source_turn)
+        if incoming is None:
+            return current_dict
+        existing = current_dict.get(key) or _unknown_field_dict()
+        if not isinstance(existing, dict):
+            existing = _unknown_field_dict()
+
+        # Milestone 3.2.1 Section 14/15: Conflicting facts require clarification
+        existing_prov = existing.get("provenance", "UNKNOWN")
+        existing_conf = existing.get("confidence", "NORMAL")
+        existing_val = existing.get("value")
+        incoming_prov = incoming.get("provenance", "UNKNOWN")
+        incoming_val = incoming.get("value")
+
+        if (
+            existing_prov == "EXPLICIT"
+            and incoming_prov == "EXPLICIT"
+            and existing_conf == "HIGH"
+            and _is_sharp_contradiction(key, existing_val, incoming_val)
+        ):
+            logger.info("merge_execution_state: detected FactConflict on '%s': '%s' vs '%s'", key, existing_val, incoming_val)
+            existing_with_conflict = {
+                **existing,
+                "_detected_conflict": {
+                    "existing_val": existing_val,
+                    "conflicting_val": incoming_val,
+                    "source_turn": source_turn,
+                },
+            }
+            return {**current_dict, key: existing_with_conflict}
+
+        merged = _merge_knowledge_field(existing, incoming, source_turn)
+        return {**current_dict, key: merged}
+
+    # --- Execution Context merges ---
+    exec_dict = dict(current_exec_dict)
+
+    for field_name in [
+        "founder_count", "active_team_size", "technical_capability", "product_capability",
+        "design_capability", "marketing_capability", "sales_capability", "domain_expertise",
+        "approximate_weekly_hours_per_member", "total_weekly_capacity_hours",
+        "available_budget_amount", "budget_currency", "budget_period",
+        "funding_status", "funding_amount_raised", "customer_access",
+        "existing_audience_or_community", "geographic_market",
+    ]:
+        delta_key_map = {
+            "technical_capability": "has_technical_capability",
+            "design_capability": "has_design_capability",
+            "marketing_capability": "has_marketing_capability",
+            "domain_expertise": "domain_expertise_description",
+            "approximate_weekly_hours_per_member": "weekly_hours_per_member",
+        }
+        delta_key = delta_key_map.get(field_name, field_name)
+        incoming_field = delta.get(delta_key)
+        exec_dict = merge_field(exec_dict, field_name, incoming_field)
+
+    # Merge existing_assets list (additive)
+    delta_assets = delta.get("existing_assets") or []
+    if delta_assets:
+        existing_assets = list(exec_dict.get("existing_assets") or [])
+        for asset in delta_assets:
+            if asset not in existing_assets:
+                existing_assets.append(asset)
+        exec_dict["existing_assets"] = existing_assets
+
+    # Merge team_members list (additive, dedup by role)
+    delta_members = delta.get("team_members") or []
+    if delta_members:
+        existing_members = list(exec_dict.get("team_members") or [])
+        existing_roles = {m.get("role") for m in existing_members if m.get("role")}
+        for member in delta_members:
+            role = member.get("role") if isinstance(member, dict) else getattr(member, "role", None)
+            if role and role in existing_roles:
+                continue  # Don't duplicate
+            if isinstance(member, dict):
+                existing_members.append(member)
+            else:
+                existing_members.append(member.model_dump())
+        exec_dict["team_members"] = existing_members
+
+    # --- Startup Progress merges ---
+    prog_dict = dict(current_prog_dict)
+
+    for field_name in [
+        "development_stage", "product_status", "prototype_exists", "mvp_exists",
+        "launched", "validation_activity", "interviews_completed",
+        "active_users", "paying_customers", "revenue",
+    ]:
+        incoming_field = delta.get(field_name)
+        prog_dict = merge_field(prog_dict, field_name, incoming_field)
+
+    # Merge major_milestones list (additive)
+    delta_milestones = delta.get("major_milestones") or []
+    if delta_milestones:
+        existing_milestones = list(prog_dict.get("major_milestones") or [])
+        for ms in delta_milestones:
+            if ms not in existing_milestones:
+                existing_milestones.append(ms)
+        prog_dict["major_milestones"] = existing_milestones
+
+    # Extract any detected conflicts and preserve state integrity
+    fact_conflicts = list(state.get("fact_conflicts") or [])
+    for container in (exec_dict, prog_dict):
+        for k, v in list(container.items()):
+            if isinstance(v, dict) and "_detected_conflict" in v:
+                c_info = v.pop("_detected_conflict")
+                fact_conflicts.append({
+                    "field_name": k,
+                    "existing_value": c_info["existing_val"],
+                    "conflicting_value": c_info["conflicting_val"],
+                    "clarification_question": f"Earlier you noted {k} was '{c_info['existing_val']}', but now mentioned '{c_info['conflicting_val']}'. Did the situation change, or did you mean something specific?",
+                    "resolved": False,
+                    "detected_turn": c_info.get("source_turn", source_turn),
+                })
+
+    logger.info(
+        "merge_execution_state | source_turn=%d exec_fields_known=%d prog_fields_known=%d conflicts=%d",
+        source_turn,
+        sum(1 for v in exec_dict.values() if isinstance(v, dict) and v.get("provenance") != "UNKNOWN"),
+        sum(1 for v in prog_dict.values() if isinstance(v, dict) and v.get("provenance") != "UNKNOWN"),
+        len(fact_conflicts),
+    )
+
+    return {
+        "execution_context": exec_dict,
+        "startup_progress": prog_dict,
+        "fact_conflicts": fact_conflicts,
+    }
+
+
+# ---------------------------------------------------------------------------
+# M2.6 Node 3: plan_information_gap (LLM — replaces assess_context_sufficiency routing)
+# ---------------------------------------------------------------------------
+
+def plan_information_gap(state: StartaryGraphState) -> dict:
+    """
+    LLM Node: Unified Adaptive Information Gap Planner.
+
+    Replaces assess_context_sufficiency as the routing decision node.
+    Evaluates both strategic sufficiency and profile gaps in one call.
+    Produces one decision: ask ONE question or proceed.
+
+    Also populates context_sufficiency for backward compatibility with existing tests.
+    """
+    import json as _json
+
+    project_id = state.get("project_id", "<unknown>")
+    startup_state_dict = state.get("startup_state", {})
+    diagnosis_dict = state.get("diagnosis", {})
+    founder_messages = state.get("founder_messages") or []
+    exec_ctx = state.get("execution_context") or {}
+    progress = state.get("startup_progress") or {}
+    clarification_history = state.get("clarification_history") or []
+    turn_count = state.get("clarification_turn_count", 0)
+
+    # Build conversation history (founder-authored messages only for display)
+    history_lines = []
+    for msg in founder_messages:
+        history_lines.append(f"{msg.get('role', 'founder').upper()}: {msg.get('content')}")
+    history_text = "\n".join(history_lines) if history_lines else (state.get("raw_context") or "")
+
+    # Build previous questions list from history
+    previous_questions = [
+        item.get("question", "")
+        for item in clarification_history
+        if item.get("question")
+    ]
+
+    strategic_summary = diagnosis_dict.get("summary", "") or startup_state_dict.get("raw_context", "")
+
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(InformationGapPlanLLMOutput)
+
+    user_message = build_information_gap_planner_user_message(
+        strategic_state_summary=strategic_summary,
+        execution_context_json=_json.dumps(exec_ctx, indent=2, default=str),
+        progress_json=_json.dumps(progress, indent=2, default=str),
+        conversation_history_text=history_text,
+        previous_questions=previous_questions,
+        clarification_turn_count=turn_count,
+        max_turns=MAX_CLARIFICATION_TURNS,
+        workflow_phase=str(state.get("phase", "UNDERSTAND")),
+    )
+
+    messages = [
+        {"role": "system", "content": INFORMATION_GAP_PLANNER_SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+
+    attempt = 0
+    last_error: Exception | None = None
+
+    while attempt < 2:
+        attempt += 1
+        t_start = time.monotonic()
+        try:
+            result: InformationGapPlanLLMOutput = structured_llm.invoke(messages)
+            latency_ms = (time.monotonic() - t_start) * 1000
+
+            # Build domain model for gap plan — use safe enum conversion for mock/test safety
+            try:
+                target_domain_enum = GapTargetDomain(result.target_domain) if result.target_domain and isinstance(result.target_domain, str) else None
+            except (ValueError, TypeError):
+                target_domain_enum = None
+
+            try:
+                priority_enum = GapPriority(result.priority) if result.priority and isinstance(result.priority, str) else GapPriority.USEFUL_LATER
+            except (ValueError, TypeError):
+                priority_enum = GapPriority.USEFUL_LATER
+
+            should_ask = bool(result.should_ask) if not isinstance(result.should_ask, bool) else result.should_ask
+            strategic_sufficient = bool(result.strategic_sufficient) if not isinstance(result.strategic_sufficient, bool) else result.strategic_sufficient
+
+            try:
+                res_mode_str = getattr(result, "resolution_mode", "FOUNDER_KNOWLEDGE") or "FOUNDER_KNOWLEDGE"
+                res_mode_enum = UncertaintyResolutionMode(res_mode_str)
+            except (ValueError, TypeError):
+                res_mode_enum = UncertaintyResolutionMode.FOUNDER_KNOWLEDGE
+
+            can_test = bool(getattr(result, "can_formulate_testable_uncertainty", False)) or can_formulate_testable_uncertainty(state, result.model_dump())
+            why_this_matters = getattr(result, "why_this_matters", "") or ""
+            missing_info = getattr(result, "missing_information", "") or result.information_goal or ""
+            recommended_area = getattr(result, "recommended_area", None) or result.target_field_or_area
+
+            # If resolution_mode is EXTERNAL_EVIDENCE, UNDERSTAND stops asking!
+            if res_mode_enum == UncertaintyResolutionMode.EXTERNAL_EVIDENCE:
+                should_ask = False
+
+            gap_plan = InformationGapPlan(
+                should_ask=should_ask,
+                strategic_sufficient=strategic_sufficient,
+                resolution_mode=res_mode_enum,
+                can_formulate_testable_uncertainty=can_test,
+                why_this_matters=why_this_matters,
+                missing_information=missing_info,
+                recommended_area=recommended_area,
+                target_domain=target_domain_enum,
+                target_field_or_area=result.target_field_or_area if isinstance(result.target_field_or_area, (str, type(None))) else None,
+                priority=priority_enum,
+                information_goal=result.information_goal if isinstance(result.information_goal, str) else "",
+                reason=result.reason if isinstance(result.reason, str) else "",
+                question=result.question if isinstance(result.question, (str, type(None))) else None,
+            )
+
+            is_handoff = (res_mode_enum == UncertaintyResolutionMode.EXTERNAL_EVIDENCE and can_test)
+            is_sufficient = (not should_ask and strategic_sufficient) or is_handoff
+
+            if is_handoff:
+                logger.info(
+                    "uncertainty_handoff_to_test | source_phase=UNDERSTAND target_area=%s resolution_mode=EXTERNAL_EVIDENCE reason=%s",
+                    recommended_area or "Problem", result.reason[:80]
+                )
+
+            # For backward compat: populate context_sufficiency from gap plan
+            from startary.domain.sufficiency import GroundingQuality
+            compat_cs = {
+                "sufficient": is_sufficient,
+                "confidence": "HIGH" if strategic_sufficient else "LOW",
+                "grounding_quality": "MODERATE" if strategic_sufficient else "WEAK",
+                "would_one_more_answer_materially_change_direction": should_ask,
+                "reason": result.reason,
+                "blocking_unknowns": [missing_info] if missing_info else [],
+                "usable_grounding": [],
+                "prohibited_inferences": [],
+                "recommended_question_area": recommended_area,
+                "information_goal": result.information_goal or "",
+            }
+
+            # Build current_clarifying_question and active_next_turn_decision (Milestone 3.2.1)
+            cq_dict = None
+            active_decision_dict = None
+            if should_ask and result.question:
+                target_str = str(result.target_field_or_area or "Problem")
+                cq_dict = {
+                    "question": result.question.strip(),
+                    "target_area": target_str,
+                    "information_goal": result.information_goal or "",
+                    "why_this_question_now": result.reason,
+                }
+                gap_qid = f"q_gap_{turn_count + 1}_{uuid.uuid4().hex[:6]}"
+                gap_decision = NextTurnDecision(
+                    question_id=gap_qid,
+                    source_phase=WorkflowPhase.UNDERSTAND,
+                    information_target=target_str,
+                    canonical_question=result.question.strip(),
+                    should_ask_question=True,
+                    clarification_reason=result.reason or "",
+                    planner_version=INFORMATION_GAP_PLANNER_PROMPT_VERSION,
+                )
+                active_decision_dict = gap_decision.model_dump()
+
+            trace = AITrace(
+                module_name="plan_information_gap",
+                prompt_version=INFORMATION_GAP_PLANNER_PROMPT_VERSION,
+                input_data={"turn": turn_count, "should_ask": should_ask, "strategic_sufficient": strategic_sufficient, "resolution_mode": res_mode_enum.value},
+                output_data=result.model_dump(),
+                latency_ms=latency_ms,
+                project_id=project_id,
+            )
+
+            existing_traces = list(state.get("traces") or [])
+            existing_traces.append(trace.model_dump(mode="json"))
+
+            logger.info(
+                "plan_information_gap | project_id=%s should_ask=%s strategic_sufficient=%s resolution_mode=%s turn=%d",
+                project_id, should_ask, strategic_sufficient, res_mode_enum.value, turn_count,
+            )
+
+            return {
+                "gap_plan": gap_plan.model_dump(mode="json"),
+                "context_sufficiency": compat_cs,
+                "context_sufficiency_output": compat_cs,
+                "is_sufficient": is_sufficient,
+                "current_clarifying_question": cq_dict,
+                "active_next_turn_decision": active_decision_dict,
+                "active_interrupt_type": "strategic" if should_ask else None,
+                "last_trace": trace.model_dump(mode="json"),
+                "traces": existing_traces,
+            }
+        except Exception as exc:
+            last_error = exc
+            logger.warning("plan_information_gap failed attempt %d: %s", attempt, exc)
+
+    raise RuntimeError(f"plan_information_gap failed after 2 attempts. Error: {last_error}")
+
+
+# ---------------------------------------------------------------------------
+# 10. assess_startup_areas (LLM — Milestone 2)
+# ---------------------------------------------------------------------------
+
+def assess_startup_areas(state: StartaryGraphState) -> dict:
+    """
+    LLM Node: Evaluate all 10 canonical startup areas across 4 qualitative risk dimensions.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    startup_state_dict = state.get("startup_state", {})
+    diagnosis_dict = state.get("diagnosis", {})
+
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(StartupAreaAssessmentBatchLLMOutput)
+
+    user_message = build_area_assessment_user_message(
+        startup_state_summary=json.dumps(startup_state_dict, indent=2),
+        diagnosis_summary=diagnosis_dict.get("summary", ""),
+        startup_stage=diagnosis_dict.get("startup_stage"),
+    )
+
+    messages = [
+        {"role": "system", "content": ASSESS_STARTUP_AREAS_SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+
+    attempt = 0
+    last_error: Exception | None = None
+
+    while attempt < 2:
+        attempt += 1
+        t_start = time.monotonic()
+        try:
+            result: StartupAreaAssessmentBatchLLMOutput = structured_llm.invoke(messages)
+            latency_ms = (time.monotonic() - t_start) * 1000
+
+            if not isinstance(result, StartupAreaAssessmentBatchLLMOutput):
+                raise ValidationError(f"Expected StartupAreaAssessmentBatchLLMOutput, got {type(result)}")
+
+            trace = AITrace(
+                module_name="assess_startup_areas",
+                prompt_version=ASSESS_STARTUP_AREAS_PROMPT_VERSION,
+                input_data={"diagnosis_summary": diagnosis_dict.get("summary", "")[:300]},
+                output_data=result.model_dump(),
+                latency_ms=latency_ms,
+                project_id=project_id,
+            )
+
+            existing_traces = list(state.get("traces") or [])
+            existing_traces.append(trace.model_dump(mode="json"))
+
+            return {
+                "area_assessments_output": result.model_dump(),
+                "last_trace": trace.model_dump(mode="json"),
+                "traces": existing_traces,
+            }
+        except Exception as exc:
+            last_error = exc
+            logger.warning("assess_startup_areas failed attempt %d: %s", attempt, exc)
+
+    raise RuntimeError(f"assess_startup_areas failed after 2 attempts. Error: {last_error}")
+
+
+# ---------------------------------------------------------------------------
+# 11. select_weak_link (Deterministic Python — Milestone 2)
+# ---------------------------------------------------------------------------
+
+def select_weak_link(state: StartaryGraphState) -> dict:
+    """
+    Deterministic Node:
+    - Calculates Decision Risk = Importance × Uncertainty × Evidence Gap × Consequence
+    - Applies explicit tie-breaking hierarchy
+    - Selects exactly one weak-link area
+    - Updates diagnosis & graph state
+    """
+    project_id = state.get("project_id", "<unknown>")
+    batch_output = state.get("area_assessments_output")
+    startup_state_dict = state.get("startup_state", {})
+    diagnosis_dict = state.get("diagnosis", {})
+
+    if not batch_output or "assessments" not in batch_output:
+        raise ValueError(f"select_weak_link | project_id={project_id}: area_assessments_output is missing from state.")
+
+    # Canonical taxonomy index for tie-breaking
+    taxonomy_order = {area: idx for idx, area in enumerate(StartupArea)}
+
+    assessments_dict: dict[StartupArea, StartupAreaAssessment] = {}
+
+    for item in batch_output["assessments"]:
+        try:
+            area_enum = StartupArea(item["area"])
+            status_val = startup_state_dict.get("areas", {}).get(str(area_enum), {}).get("status")
+            understanding_val = startup_state_dict.get("areas", {}).get(str(area_enum), {}).get("understanding")
+
+            assessment = StartupAreaAssessment(
+                area=area_enum,
+                status=AreaStatus(status_val) if status_val else None,
+                summary=understanding_val,
+                importance=RiskFactorLevel(item["importance"]),
+                uncertainty=RiskFactorLevel(item["uncertainty"]),
+                evidence_gap=RiskFactorLevel(item["evidence_gap"]),
+                consequence_if_wrong=RiskFactorLevel(item["consequence_of_being_wrong"]),
+                rationale=item.get("rationale"),
+            )
+            assessment.calculate_risk()
+            assessments_dict[area_enum] = assessment
+        except Exception as exc:
+            logger.warning("Error parsing assessment for %s: %s", item.get("area"), exc)
+
+    # Fill in missing areas if any were omitted
+    for area in StartupArea:
+        if area not in assessments_dict:
+            assessment = StartupAreaAssessment(
+                area=area,
+                importance=RiskFactorLevel.LOW,
+                uncertainty=RiskFactorLevel.HIGH,
+                evidence_gap=RiskFactorLevel.LOW,
+                consequence_if_wrong=RiskFactorLevel.LOW,
+                rationale="Default assessment for omitted area.",
+            )
+            assessment.calculate_risk()
+            assessments_dict[area] = assessment
+
+    all_assessments = list(assessments_dict.values())
+
+    # Deterministic Tie-Breaking Hierarchy:
+    # 1. Higher calculated_decision_risk (descending)
+    # 2. Higher consequence_if_wrong (descending)
+    # 3. Higher uncertainty (descending)
+    # 4. Higher evidence_gap (descending)
+    # 5. Higher importance (descending)
+    # 6. Canonical taxonomy index (ascending)
+    def sort_key(a: StartupAreaAssessment):
+        return (
+            -(a.calculated_decision_risk or 0),
+            -risk_factor_to_int(a.consequence_if_wrong),
+            -risk_factor_to_int(a.uncertainty),
+            -risk_factor_to_int(a.evidence_gap),
+            -risk_factor_to_int(a.importance),
+            taxonomy_order.get(a.area, 999),
+        )
+
+    sorted_assessments = sorted(all_assessments, key=sort_key)
+    winning_assessment = sorted_assessments[0]
+    selected_area = winning_assessment.area
+
+    # ---------------------------------------------------------------------------
+    # Technical Note: Multiplicative Risk Model Saturation Telemetry
+    # Current V1 multiplicative risk model intentionally retained.
+    # Known limitation: score saturation / high-cardinality ties (e.g. 6+ areas at 81/81).
+    # See docs/architecture_backlog.md — WL-001.
+    # ---------------------------------------------------------------------------
+    max_score = winning_assessment.calculated_decision_risk or 0
+    max_score_tie_count = sum(
+        1 for a in sorted_assessments if (a.calculated_decision_risk or 0) == max_score
+    )
+    saturated_area_count = sum(
+        1 for a in sorted_assessments if (a.calculated_decision_risk or 0) == 81
+    )
+    tie_breaker_used = max_score_tie_count > 1
+
+    saturation_telemetry = {
+        "max_score": max_score,
+        "max_score_tie_count": max_score_tie_count,
+        "saturated_area_count": saturated_area_count,
+        "tie_breaker_used": tie_breaker_used,
+    }
+
+    # Update Diagnosis domain model
+    if diagnosis_dict:
+        diagnosis_dict["weak_areas"] = [str(selected_area)]
+        diagnosis_dict["selected_weak_link"] = str(selected_area)
+        diagnosis_dict["assessments"] = [a.model_dump() for a in all_assessments]
+
+    logger.info(
+        "select_weak_link | project_id=%s selected=%s risk_score=%d ties=%d saturated_81s=%d tie_broken=%s",
+        project_id,
+        selected_area,
+        max_score,
+        max_score_tie_count,
+        saturated_area_count,
+        tie_breaker_used,
+    )
+
+    return {
+        "weak_area": str(selected_area),
+        "weak_link_details": {
+            "area": str(selected_area),
+            "score": winning_assessment.calculated_decision_risk,
+            "importance": str(winning_assessment.importance),
+            "uncertainty": str(winning_assessment.uncertainty),
+            "evidence_gap": str(winning_assessment.evidence_gap),
+            "consequence_of_being_wrong": str(winning_assessment.consequence_if_wrong),
+            "rationale": winning_assessment.rationale,
+            "saturation_telemetry": saturation_telemetry,
+        },
+        "area_assessments": [a.model_dump() for a in sorted_assessments],
+        "diagnosis": diagnosis_dict,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 12. reality_check (LLM — Milestone 2)
+# ---------------------------------------------------------------------------
+
+def reality_check(state: StartaryGraphState) -> dict:
+    """
+    LLM Node: Scrutinize founder claims vs founder evidence specifically for the weak area.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    weak_area_str = state.get("weak_area")
+    startup_state_dict = state.get("startup_state", {})
+    diagnosis_dict = state.get("diagnosis", {})
+
+    if not weak_area_str:
+        raise ValueError(f"reality_check | project_id={project_id}: weak_area is missing from state.")
+
+    area_knowledge_dict = startup_state_dict.get("areas", {}).get(weak_area_str, {})
+
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(RealityCheckLLMOutput)
+
+    user_message = build_reality_check_user_message(
+        weak_area=weak_area_str,
+        area_knowledge_json=json.dumps(area_knowledge_dict, indent=2),
+        overall_summary=diagnosis_dict.get("summary", ""),
+    )
+
+    messages = [
+        {"role": "system", "content": REALITY_CHECK_SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+
+    attempt = 0
+    last_error: Exception | None = None
+
+    while attempt < 2:
+        attempt += 1
+        t_start = time.monotonic()
+        try:
+            result: RealityCheckLLMOutput = structured_llm.invoke(messages)
+            latency_ms = (time.monotonic() - t_start) * 1000
+
+            if not isinstance(result, RealityCheckLLMOutput):
+                raise ValidationError(f"Expected RealityCheckLLMOutput, got {type(result)}")
+
+            # Re-construct domain model
+            rc_domain = RealityCheck(
+                weak_link_area=result.weak_link_area,
+                relevant_founder_claims=result.relevant_founder_claims,
+                available_founder_evidence=result.available_founder_evidence,
+                what_evidence_supports=result.what_evidence_supports,
+                what_evidence_does_not_support=result.what_evidence_does_not_support,
+                conclusion=result.conclusion,
+                unresolved_uncertainty=result.unresolved_uncertainty,
+                summary=result.reality_check_summary,
+            )
+
+            trace = AITrace(
+                module_name="reality_check",
+                prompt_version=REALITY_CHECK_PROMPT_VERSION,
+                input_data={"weak_area": weak_area_str},
+                output_data=result.model_dump(),
+                latency_ms=latency_ms,
+                project_id=project_id,
+            )
+
+            existing_traces = list(state.get("traces") or [])
+            existing_traces.append(trace.model_dump(mode="json"))
+
+            return {
+                "reality_check_output": result.model_dump(),
+                "reality_check": rc_domain.model_dump(mode="json"),
+                "last_trace": trace.model_dump(mode="json"),
+                "traces": existing_traces,
+            }
+        except Exception as exc:
+            last_error = exc
+            logger.warning("reality_check failed attempt %d: %s", attempt, exc)
+
+    raise RuntimeError(f"reality_check failed after 2 attempts. Error: {last_error}")
+
+
+# ---------------------------------------------------------------------------
+# 13. generate_critical_assumption (LLM — Milestone 2)
+# ---------------------------------------------------------------------------
+
+def validate_critical_assumption_grounding(
+    ca_output: CriticalAssumptionLLMOutput,
+    rc_dict: dict[str, Any],
+    founder_source_text: str,
+    weak_area_str: str,
+) -> tuple[bool, str]:
+    """
+    Deterministic Grounding Validator for Critical Assumptions (Milestone 2.6.2):
+    - Area matches target weak area.
+    - Statement is non-empty.
+    - Rejects ungrounded test parameters in introduced_test_parameters.
+    - Rejects invented percentages (e.g., 30%, 50%) not in founder context.
+    - Rejects invented order volumes / quantities (e.g., 20 orders) not in founder context.
+    - Rejects invented frequencies (e.g., weekly, daily, at least weekly) not in founder context.
+    - Rejects invented ranking claims (e.g., top three, top 3) not in founder context.
+    - Enforces Reality Check negative constraints (what_evidence_does_not_support).
+    """
+    statement = (ca_output.statement or "").strip()
+    if not statement:
+        return False, "Critical assumption statement cannot be empty."
+
+    if str(ca_output.area) != weak_area_str:
+        return False, f"Assumption area '{ca_output.area}' does not match target weak area '{weak_area_str}'."
+
+    statement_lower = statement.lower()
+    founder_lower = (founder_source_text or "").lower()
+
+    # 1. Reject ungrounded introduced_test_parameters
+    for param in ca_output.introduced_test_parameters:
+        if param and param.lower() not in founder_lower:
+            return False, f"Unsupported test parameter introduced: '{param}' was not stated by the founder."
+
+    # 2. Percentage checks
+    percent_matches = re.findall(r"\b\d+(?:\.\d+)?%", statement)
+    for p in percent_matches:
+        if p.lower() not in founder_lower:
+            return False, f"Unsupported percentage threshold introduced: '{p}' was not stated by the founder."
+
+    # 3. Numeric quantity / order volume checks (e.g. "20 orders", "5 users", "100 AZN")
+    quantity_matches = re.findall(
+        r"\b(\d+)\s*(?:orders|customers|users|clients|sellers|times|dollars|azn|usd|hours|interviews|per\s+week|per\s+day|per\s+month)\b",
+        statement_lower,
+    )
+    for q_num in quantity_matches:
+        if q_num not in founder_lower:
+            return False, f"Unsupported numeric quantity/threshold introduced: '{q_num}' was not found in founder context."
+
+    # 4. Standalone arbitrary order volume numbers (e.g. "at least 20 orders")
+    order_matches = re.findall(r"\b(?:at least|more than|over)?\s*(\d+)\s*orders?\b", statement_lower)
+    for o_num in order_matches:
+        if o_num not in founder_lower:
+            return False, f"Unsupported order threshold introduced: '{o_num} orders' was not found in founder context."
+
+    # 5. Frequency checks (e.g. "weekly", "at least weekly", "daily")
+    freq_keywords = ["at least weekly", "weekly", "at least daily", "daily", "monthly", "per week", "per day", "per month"]
+    for freq in freq_keywords:
+        if freq in statement_lower and freq not in founder_lower:
+            return False, f"Unsupported frequency claim introduced: '{freq}' was not stated by the founder."
+
+    # 6. Ranking claims (e.g. "top three", "top 3")
+    ranking_matches = re.findall(r"\btop\s+(?:three|3|five|5|ten|10)\b", statement_lower)
+    for rank in ranking_matches:
+        if rank not in founder_lower:
+            return False, f"Unsupported ranking claim introduced: '{rank}' was not stated by the founder."
+
+    # 7. Reality Check negative constraint: what_evidence_does_not_support
+    unsupported = rc_dict.get("what_evidence_does_not_support") or []
+    for item in unsupported:
+        item_lower = item.lower()
+        if "missed" in item_lower and "missed" in statement_lower and "missed" not in founder_lower:
+            return False, "Assumption asserts 'missed deliveries' which Reality Check explicitly confirmed is unsupported by evidence."
+        if "delayed" in item_lower and "delayed" in statement_lower and "delayed" not in founder_lower:
+            return False, "Assumption asserts 'delayed deliveries' which Reality Check explicitly confirmed is unsupported by evidence."
+        if "incorrect" in item_lower and "incorrect" in statement_lower and "incorrect" not in founder_lower:
+            return False, "Assumption asserts 'incorrect deliveries' which Reality Check explicitly confirmed is unsupported by evidence."
+
+    return True, ""
+
+
+def extract_blocked_grounding_concepts(
+    val_reason: str,
+    statement: str,
+    rc_dict: dict[str, Any],
+) -> list[str]:
+    """
+    Extract explicit blocked concepts/phrases from a grounding validation failure (Milestone 4.0.7.1.2).
+    Captures quoted phrases from the validation reason and unsupported items from Reality Check.
+    """
+    blocked: list[str] = []
+
+    # 1. Capture quoted phrases from val_reason (e.g., 'delayed deliveries', 'weekly', '30%')
+    quoted = re.findall(r"'([^']+)'", val_reason)
+    blocked.extend(quoted)
+
+    # 2. Check Reality Check negative constraints
+    unsupported = rc_dict.get("what_evidence_does_not_support") or []
+    statement_lower = (statement or "").lower()
+    for item in unsupported:
+        item_str = str(item).strip()
+        item_lower = item_str.lower()
+        if item_lower in statement_lower:
+            blocked.append(item_str)
+        else:
+            for phrase in ["delayed deliveries", "missed deliveries", "incorrect deliveries", "delayed", "missed", "incorrect"]:
+                if phrase in item_lower and phrase in statement_lower:
+                    blocked.append(phrase)
+
+    # Deduplicate preserving order
+    return list(dict.fromkeys(b.strip() for b in blocked if b.strip()))
+
+
+_CANONICAL_AREA_FALLBACKS: dict[str, str] = {
+    StartupArea.PROBLEM: (
+        "Target users experience recurring disruption and avoidable friction in their current workflow "
+        "that is severe enough to justify adopting a dedicated solution."
+    ),
+    StartupArea.TARGET_USER: (
+        "A well-defined segment of target users has an identifiable operational profile "
+        "and experiences the core problem directly."
+    ),
+    StartupArea.PAIN_URGENCY: (
+        "The operational pain caused by this problem is sufficiently urgent "
+        "that target users prioritize addressing it over competing operational demands."
+    ),
+    StartupArea.EXISTING_ALTERNATIVES: (
+        "Existing manual workarounds and alternative tools leave critical operational gaps "
+        "that create significant ongoing frustration for users."
+    ),
+    StartupArea.VALUE_PROPOSITION: (
+        "The proposed value proposition delivers a clear and measurable operational improvement "
+        "compared to how users currently manage the workflow."
+    ),
+    StartupArea.DEMAND_SIGNAL: (
+        "Target users demonstrate authentic interest and willingness to evaluate a dedicated solution "
+        "when presented with a concrete workflow alternative."
+    ),
+    StartupArea.ACQUISITION: (
+        "Target customers can be identified and directly engaged through targeted outreach channels "
+        "without requiring established brand awareness."
+    ),
+    StartupArea.BUSINESS_MODEL: (
+        "Target customers derive sufficient economic or operational value from resolving this problem "
+        "that they are willing to allocate budget for a solution."
+    ),
+    StartupArea.SOLUTION_MVP: (
+        "A focused minimum viable solution addressing the core workflow bottleneck "
+        "can be deployed and validated with target users."
+    ),
+    StartupArea.FOUNDER_CONSTRAINTS: (
+        "The founding team possesses the necessary domain access and operational capacity "
+        "to execute initial validation and early customer testing."
+    ),
+}
+
+
+def build_grounded_critical_assumption_fallback(
+    weak_area_str: str,
+    rc_dict: dict[str, Any],
+    founder_source_text: str,
+    state: StartaryGraphState,
+) -> CriticalAssumptionLLMOutput | None:
+    """
+    Deterministic Fallback Builder for Critical Assumptions (Milestone 4.0.7.1.2).
+    Constructs a safe, grounded critical assumption using ONLY already-grounded facts
+    from the Reality Check and founder context when LLM retries fail validation.
+    """
+    target_area = StartupArea(weak_area_str)
+    unresolved_uncertainty = rc_dict.get("unresolved_uncertainty", "").strip()
+    evidence_supports = list(rc_dict.get("what_evidence_supports") or [])
+    founder_lower = (founder_source_text or "").lower()
+
+    candidates: list[str] = []
+
+    # Candidate 1: Formulate directly from Reality Check unresolved uncertainty
+    if unresolved_uncertainty and len(unresolved_uncertainty) >= 15:
+        statement = re.sub(
+            r"^(?:whether\s+or\s+not|whether|if|can|does|do|is|are|how|what)\s+",
+            "",
+            unresolved_uncertainty,
+            flags=re.IGNORECASE,
+        ).strip()
+        if statement:
+            statement = statement[0].upper() + statement[1:]
+            if not statement.endswith("."):
+                statement += "."
+            candidates.append(statement)
+
+    # Candidate 2: Domain-specific grounded formulation if refrigeration context (FridgeGuard)
+    if "refrigerat" in founder_lower or "fridge" in founder_lower:
+        candidates.append(
+            "Commercial kitchens and food businesses experience refrigeration failures occurring "
+            "between manual inspection logs that cause significant avoidable food loss or operational disruption."
+        )
+
+    # Candidate 3: Canonical area fallback
+    canonical_fallback = _CANONICAL_AREA_FALLBACKS.get(target_area)
+    if canonical_fallback:
+        candidates.append(canonical_fallback)
+
+    # Fallback candidate 4: General fallback
+    candidates.append(
+        f"The core operational uncertainty in {weak_area_str} creates a material business risk "
+        f"that directly affects the strategic viability of the startup."
+    )
+
+    for cand_statement in candidates:
+        output = CriticalAssumptionLLMOutput(
+            area=target_area,
+            statement=cand_statement,
+            rationale=(
+                f"Deterministic fallback critical assumption formulated directly from grounded facts "
+                f"for weak area '{weak_area_str}' after LLM validation retries were exhausted."
+            ),
+            what_falsifies_it=(
+                f"Evidence showing that target customers do not experience material operational disruption "
+                f"or risk in the '{weak_area_str}' area."
+            ),
+            grounding_points=evidence_supports[:3],
+            unresolved_uncertainty_addressed=unresolved_uncertainty,
+            introduced_test_parameters=[],
+        )
+        is_valid, _ = validate_critical_assumption_grounding(
+            output, rc_dict, founder_source_text, weak_area_str
+        )
+        if is_valid:
+            return output
+
+    return None
+
+
+def generate_critical_assumption(state: StartaryGraphState) -> dict:
+    """
+    LLM Node: Formulate ONE specific, testable critical assumption for the weak area (Milestone 2.6.2 / 4.0.7.1.2).
+    Enforces strict grounding discipline with structured retry feedback and deterministic fallback recovery.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    weak_area_str = state.get("weak_area")
+    rc_dict = state.get("reality_check", {})
+    startup_state_dict = state.get("startup_state", {})
+
+    if not weak_area_str or not rc_dict:
+        raise ValueError(f"generate_critical_assumption | project_id={project_id}: weak_area or reality_check missing.")
+
+    area_knowledge_dict = startup_state_dict.get("areas", {}).get(weak_area_str, {})
+
+    # Gather founder source context for strict grounding validation
+    founder_messages = state.get("founder_messages") or []
+    founder_source_text = "\n".join(
+        m.get("content", "") for m in founder_messages if m.get("role") == "founder"
+    ) or state.get("raw_context", "")
+
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(CriticalAssumptionLLMOutput)
+
+    user_message = build_critical_assumption_user_message(
+        weak_area=weak_area_str,
+        reality_check_summary=rc_dict.get("summary", ""),
+        unresolved_uncertainty=rc_dict.get("unresolved_uncertainty", ""),
+        conclusion=rc_dict.get("conclusion", ""),
+        area_knowledge_summary=json.dumps(area_knowledge_dict, indent=2),
+        what_evidence_supports=rc_dict.get("what_evidence_supports") or [],
+        what_evidence_does_not_support=rc_dict.get("what_evidence_does_not_support") or [],
+        relevant_founder_claims=rc_dict.get("relevant_founder_claims") or [],
+        available_founder_evidence=rc_dict.get("available_founder_evidence") or [],
+        founder_source_context=founder_source_text,
+    )
+
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": CRITICAL_ASSUMPTION_SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+
+    attempt = 0
+    last_error: Exception | None = None
+
+    while attempt < 2:
+        attempt += 1
+        t_start = time.monotonic()
+        try:
+            result: CriticalAssumptionLLMOutput = structured_llm.invoke(messages)
+            latency_ms = (time.monotonic() - t_start) * 1000
+
+            if not isinstance(result, CriticalAssumptionLLMOutput):
+                raise ValidationError(f"Expected CriticalAssumptionLLMOutput, got {type(result)}")
+
+            if str(result.area) != weak_area_str:
+                logger.warning(
+                    "generate_critical_assumption: LLM returned area %s instead of weak_area %s. Normalizing.",
+                    result.area,
+                    weak_area_str,
+                )
+                result.area = StartupArea(weak_area_str)
+
+            # --- Deterministic Grounding Validation (M2.6.2) ---
+            is_valid, val_reason = validate_critical_assumption_grounding(
+                result, rc_dict, founder_source_text, weak_area_str
+            )
+
+            if not is_valid:
+                logger.warning(
+                    "generate_critical_assumption: Grounding validation failed on attempt %d: %s.",
+                    attempt,
+                    val_reason,
+                )
+                if attempt < 2:
+                    blocked_concepts = extract_blocked_grounding_concepts(val_reason, result.statement, rc_dict)
+                    logger.warning(
+                        "critical_assumption_retry | attempt=2 rejected_reason=%s blocked_concepts=%s",
+                        val_reason,
+                        blocked_concepts,
+                    )
+                    messages.append({"role": "assistant", "content": result.statement})
+                    blocked_str = ", ".join(f"'{c}'" for c in blocked_concepts) if blocked_concepts else "None"
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"GROUNDING VALIDATION FAILED: {val_reason}\n"
+                            f"REJECTED STATEMENT: {result.statement}\n"
+                            f"BLOCKED CONCEPTS / PHRASES: {blocked_str}\n\n"
+                            "You must NOT use any of the blocked concepts or phrases above. "
+                            "You must NOT invent ungrounded numeric thresholds, percentages, frequencies (e.g. weekly), or unevidenced failure modes. "
+                            "Reformulate the critical assumption to test the core uncertainty using ONLY founder-grounded facts and Reality Check constraints."
+                        ),
+                    })
+                    continue
+                else:
+                    logger.warning(
+                        "generate_critical_assumption: Attempt 2 failed grounding validation: %s. Attempting fallback.",
+                        val_reason,
+                    )
+                    fallback = build_grounded_critical_assumption_fallback(
+                        weak_area_str, rc_dict, founder_source_text, state
+                    )
+                    if fallback:
+                        is_fb_valid, fb_val_reason = validate_critical_assumption_grounding(
+                            fallback, rc_dict, founder_source_text, weak_area_str
+                        )
+                        if is_fb_valid:
+                            logger.info(
+                                "critical_assumption_fallback | used=True area=%s statement=%s",
+                                weak_area_str,
+                                fallback.statement[:80],
+                            )
+                            trace = AITrace(
+                                module_name="generate_critical_assumption",
+                                prompt_version=CRITICAL_ASSUMPTION_PROMPT_VERSION,
+                                input_data={
+                                    "weak_area": weak_area_str,
+                                    "conclusion": rc_dict.get("conclusion"),
+                                    "fallback_used": True,
+                                },
+                                output_data=fallback.model_dump(),
+                                latency_ms=(time.monotonic() - t_start) * 1000,
+                                project_id=project_id,
+                            )
+                            existing_traces = list(state.get("traces") or [])
+                            existing_traces.append(trace.model_dump(mode="json"))
+                            return {
+                                "critical_assumption_output": fallback.model_dump(),
+                                "last_trace": trace.model_dump(mode="json"),
+                                "traces": existing_traces,
+                            }
+                        else:
+                            logger.error(
+                                "critical_assumption_recovery_failed | reason=Fallback failed validation: %s",
+                                fb_val_reason,
+                            )
+                            raise CriticalAssumptionGroundingError(
+                                f"generate_critical_assumption failed grounding validation after retry and fallback: {fb_val_reason}"
+                            )
+                    else:
+                        logger.error(
+                            "critical_assumption_recovery_failed | reason=%s",
+                            val_reason,
+                        )
+                        raise CriticalAssumptionGroundingError(
+                            f"generate_critical_assumption failed grounding validation after retry: {val_reason}"
+                        )
+
+            trace = AITrace(
+                module_name="generate_critical_assumption",
+                prompt_version=CRITICAL_ASSUMPTION_PROMPT_VERSION,
+                input_data={"weak_area": weak_area_str, "conclusion": rc_dict.get("conclusion")},
+                output_data=result.model_dump(),
+                latency_ms=latency_ms,
+                project_id=project_id,
+            )
+
+            existing_traces = list(state.get("traces") or [])
+            existing_traces.append(trace.model_dump(mode="json"))
+
+            logger.info("generate_critical_assumption | validated statement: %s (attempt=%d)", result.statement[:80], attempt)
+            return {
+                "critical_assumption_output": result.model_dump(),
+                "last_trace": trace.model_dump(mode="json"),
+                "traces": existing_traces,
+            }
+        except Exception as exc:
+            if isinstance(exc, CriticalAssumptionGroundingError):
+                raise
+            last_error = exc
+            logger.warning("generate_critical_assumption failed attempt %d: %s", attempt, exc)
+            if attempt < 2 and not isinstance(exc, CriticalAssumptionGroundingError):
+                continue
+            raise
+
+    raise RuntimeError(f"generate_critical_assumption failed after 2 attempts. Error: {last_error}")
+
+
+# ---------------------------------------------------------------------------
+# 14. save_critical_assumption (Deterministic Python — Milestone 2)
+# ---------------------------------------------------------------------------
+
+def save_critical_assumption(state: StartaryGraphState) -> dict:
+    """
+    Deterministic Node:
+    - Validates generated critical assumption
+    - Instantiates first-class Assumption domain model
+    - Stores exactly one active critical assumption in state
+    - Updates WorkflowPhase to TEST
+    """
+    project_id = state.get("project_id", "<unknown>")
+    iteration = state.get("iteration", 1)
+    weak_area_str = state.get("weak_area")
+    ca_output = state.get("critical_assumption_output")
+
+    if not ca_output or "statement" not in ca_output:
+        raise ValueError(f"save_critical_assumption | project_id={project_id}: critical_assumption_output missing.")
+
+    statement = ca_output["statement"].strip()
+    if not statement:
+        raise ValueError("Critical assumption statement cannot be empty.")
+
+    area_enum = StartupArea(weak_area_str or ca_output["area"])
+
+    assumption = Assumption(
+        id=str(uuid.uuid4()),
+        project_id=project_id,
+        statement=statement,
+        area=area_enum,
+        status=AssumptionStatus.UNTESTED,
+        is_critical=True,
+        iteration_created=iteration,
+    )
+
+    logger.info(
+        "save_critical_assumption | project_id=%s assumption_id=%s area=%s",
+        project_id,
+        assumption.id,
+        assumption.area,
+    )
+
+    return {
+        "active_assumption": assumption.model_dump(mode="json"),
+        "active_critical_assumption": assumption.model_dump(mode="json"),
+        "phase": WorkflowPhase.TEST,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Backward Compatibility Aliases (M2.5 → M2.6)
+# ---------------------------------------------------------------------------
+
+def assess_context_sufficiency(state: StartaryGraphState) -> dict:
+    """
+    Backward-compatible node for M2.5 tests.
+
+    This is a standalone node that uses ContextSufficiencyLLMOutput (the M2.5 schema)
+    rather than the new InformationGapPlanLLMOutput. It is kept so that existing
+    test_context_sufficiency.py tests continue to pass without modification.
+
+    In the live M2.6 graph, this node is NOT used. plan_information_gap is used instead.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    startup_state_dict = state.get("startup_state", {})
+    diagnosis_dict = state.get("diagnosis", {})
+    founder_messages = state.get("founder_messages") or []
+
+    history_lines = []
+    for msg in founder_messages:
+        history_lines.append(f"{msg.get('role', 'founder').upper()}: {msg.get('content')}")
+    history_text = "\n".join(history_lines) if history_lines else (state.get("raw_context") or "")
+
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(ContextSufficiencyLLMOutput)
+
+    user_message = build_context_sufficiency_user_message(
+        startup_state_json=__import__("json").dumps(startup_state_dict, indent=2),
+        diagnosis_summary=diagnosis_dict.get("summary", ""),
+        conversation_history_text=history_text,
+    )
+
+    messages = [
+        {"role": "system", "content": ASSESS_CONTEXT_SUFFICIENCY_SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+
+    attempt = 0
+    last_error: Exception | None = None
+
+    while attempt < 2:
+        attempt += 1
+        t_start = time.monotonic()
+        try:
+            result: ContextSufficiencyLLMOutput = structured_llm.invoke(messages)
+            latency_ms = (time.monotonic() - t_start) * 1000
+
+            from startary.domain.sufficiency import GroundingQuality as _GQ
+            grounding_quality_val = result.grounding_quality if isinstance(result.grounding_quality, str) else str(result.grounding_quality)
+            try:
+                gq = _GQ(grounding_quality_val)
+            except (ValueError, TypeError):
+                gq = _GQ.WEAK
+
+            cs_domain = ContextSufficiencyAssessment(
+                sufficient=bool(result.sufficient),
+                grounding_quality=gq,
+                would_one_more_answer_materially_change_direction=bool(result.would_one_more_answer_materially_change_direction),
+                reason=result.reason if isinstance(result.reason, str) else "",
+                blocking_unknowns=list(result.blocking_unknowns) if result.blocking_unknowns else [],
+                usable_grounding=list(result.usable_grounding) if result.usable_grounding else [],
+                prohibited_inferences=list(result.prohibited_inferences) if result.prohibited_inferences else [],
+                recommended_question_area=result.recommended_question_area if isinstance(result.recommended_question_area, (str, type(None))) else None,
+                information_goal=result.information_goal if isinstance(result.information_goal, str) else "",
+            )
+
+            trace = AITrace(
+                module_name="assess_context_sufficiency",
+                prompt_version=CONTEXT_SUFFICIENCY_PROMPT_VERSION,
+                input_data={"messages_count": len(founder_messages)},
+                output_data=result.model_dump(),
+                latency_ms=latency_ms,
+                project_id=project_id,
+            )
+
+            existing_traces = list(state.get("traces") or [])
+            existing_traces.append(trace.model_dump(mode="json"))
+
+            return {
+                "context_sufficiency_output": result.model_dump(),
+                "context_sufficiency": cs_domain.model_dump(mode="json"),
+                "is_sufficient": cs_domain.sufficient,
+                "last_trace": trace.model_dump(mode="json"),
+                "traces": existing_traces,
+            }
+        except Exception as exc:
+            last_error = exc
+            logger.warning("assess_context_sufficiency failed attempt %d: %s", attempt, exc)
+
+    raise RuntimeError(f"assess_context_sufficiency failed after 2 attempts. Error: {last_error}")
+
+
+# ---------------------------------------------------------------------------
+# Milestone 2.6.1 Nodes: Baseline Startup Check-In
+# ---------------------------------------------------------------------------
+
+def assess_baseline_state_sufficiency(state: StartaryGraphState) -> dict:
+    """
+    Evaluates whether Startary has gathered sufficient minimum operational context
+    across the 5 core baseline dimensions (TEAM, CAPACITY, PRODUCT_STAGE, VALIDATION_OR_USER, RESOURCE).
+
+    Fast path shortcut: If all 5 dimensions are already known from extraction,
+    immediately returns is_sufficient=True without calling the LLM.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    exec_ctx = state.get("execution_context") or {}
+    prog = state.get("startup_progress") or {}
+
+    # 1. Team
+    fc = exec_ctx.get("founder_count") or {}
+    ats = exec_ctx.get("active_team_size") or {}
+    members = exec_ctx.get("team_members") or []
+    team_known = (fc.get("provenance") not in ("UNKNOWN", None)) or (ats.get("provenance") not in ("UNKNOWN", None)) or len(members) > 0
+
+    # 2. Capacity
+    wh = exec_ctx.get("approximate_weekly_hours_per_member") or {}
+    tot_cap = exec_ctx.get("total_weekly_capacity_hours") or {}
+    cap_known = (wh.get("provenance") not in ("UNKNOWN", None)) or (tot_cap.get("provenance") not in ("UNKNOWN", None))
+
+    # 3. Product Stage
+    stage = prog.get("development_stage") or {}
+    pstatus = prog.get("product_status") or {}
+    proto = prog.get("prototype_exists") or {}
+    mvp = prog.get("mvp_exists") or {}
+    launched = prog.get("launched") or {}
+    stage_known = any(f.get("provenance") not in ("UNKNOWN", None) for f in (stage, pstatus, proto, mvp, launched))
+
+    # 4. Validation / Users
+    val_act = prog.get("validation_activity") or {}
+    interviews = prog.get("interviews_completed") or {}
+    users = prog.get("active_users") or {}
+    paying = prog.get("paying_customers") or {}
+    val_known = any(f.get("provenance") not in ("UNKNOWN", None) for f in (val_act, interviews, users, paying))
+
+    # 5. Resource
+    budget = exec_ctx.get("available_budget_amount") or {}
+    funding = exec_ctx.get("funding_status") or {}
+    curr = exec_ctx.get("budget_currency") or {}
+    resource_known = any(f.get("provenance") not in ("UNKNOWN", None) for f in (budget, funding, curr))
+
+    dim_statuses = {
+        BaselineDimension.TEAM: BaselineDimensionStatus.KNOWN_ENOUGH if team_known else BaselineDimensionStatus.MISSING,
+        BaselineDimension.CAPACITY: BaselineDimensionStatus.KNOWN_ENOUGH if cap_known else BaselineDimensionStatus.MISSING,
+        BaselineDimension.PRODUCT_STAGE: BaselineDimensionStatus.KNOWN_ENOUGH if stage_known else BaselineDimensionStatus.MISSING,
+        BaselineDimension.VALIDATION_OR_USER: BaselineDimensionStatus.KNOWN_ENOUGH if val_known else BaselineDimensionStatus.MISSING,
+        BaselineDimension.RESOURCE: BaselineDimensionStatus.KNOWN_ENOUGH if resource_known else BaselineDimensionStatus.MISSING,
+    }
+
+    missing = [dim for dim, status in dim_statuses.items() if status == BaselineDimensionStatus.MISSING]
+
+    # Fast path shortcut: all 5 dimensions known
+    if not missing:
+        suff_domain = BaselineStartupStateSufficiency(
+            is_sufficient=True,
+            dimension_statuses=dim_statuses,
+            missing_groups=[],
+            reason="All 5 baseline operational dimensions are sufficiently grounded.",
+        )
+        logger.info("assess_baseline_state_sufficiency | project_id=%s -> SUFFICIENT (Fast path shortcut)", project_id)
+        return {
+            "baseline_sufficiency": suff_domain.model_dump(mode="json"),
+            "is_baseline_sufficient": True,
+        }
+
+    # Otherwise call LLM with BASELINE_STATE_SUFFICIENCY_SYSTEM_PROMPT
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(BaselineSufficiencyLLMOutput)
+
+    founder_messages = state.get("founder_messages") or []
+    history_lines = [f"{m.get('role', 'founder').upper()}: {m.get('content')}" for m in founder_messages if m.get("role") == "founder"]
+    history_text = "\n".join(history_lines) if history_lines else (state.get("raw_context") or "")
+
+    user_msg = build_baseline_sufficiency_user_message(
+        execution_context_json=_json.dumps(exec_ctx, indent=2, default=str),
+        progress_json=_json.dumps(prog, indent=2, default=str),
+        founder_messages_text=history_text,
+    )
+
+    messages = [
+        {"role": "system", "content": BASELINE_STATE_SUFFICIENCY_SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
+
+    attempt = 0
+    last_err = None
+    while attempt < 2:
+        attempt += 1
+        t_start = time.monotonic()
+        try:
+            res: BaselineSufficiencyLLMOutput = structured_llm.invoke(messages)
+            latency_ms = (time.monotonic() - t_start) * 1000
+
+            def _map_st(val: str, fallback_known: bool) -> BaselineDimensionStatus:
+                try:
+                    return BaselineDimensionStatus(val)
+                except (ValueError, TypeError):
+                    return BaselineDimensionStatus.KNOWN_ENOUGH if fallback_known else BaselineDimensionStatus.MISSING
+
+            res_dim_statuses = {
+                BaselineDimension.TEAM: _map_st(res.team_status, team_known),
+                BaselineDimension.CAPACITY: _map_st(res.capacity_status, cap_known),
+                BaselineDimension.PRODUCT_STAGE: _map_st(res.product_stage_status, stage_known),
+                BaselineDimension.VALIDATION_OR_USER: _map_st(res.validation_status, val_known),
+                BaselineDimension.RESOURCE: _map_st(res.resource_status, resource_known),
+            }
+            res_missing = [dim for dim, status in res_dim_statuses.items() if status == BaselineDimensionStatus.MISSING]
+
+            suff_domain = BaselineStartupStateSufficiency(
+                is_sufficient=bool(res.is_sufficient) and len(res_missing) == 0,
+                dimension_statuses=res_dim_statuses,
+                missing_groups=res_missing,
+                reason=res.reason if isinstance(res.reason, str) else "",
+            )
+
+            trace = AITrace(
+                module_name="assess_baseline_state_sufficiency",
+                prompt_version=BASELINE_STATE_SUFFICIENCY_PROMPT_VERSION,
+                input_data={"messages_count": len(founder_messages)},
+                output_data=res.model_dump(),
+                latency_ms=latency_ms,
+                project_id=project_id,
+            )
+            existing_traces = list(state.get("traces") or [])
+            existing_traces.append(trace.model_dump(mode="json"))
+
+            logger.info("assess_baseline_state_sufficiency | project_id=%s is_sufficient=%s missing=%s", project_id, suff_domain.is_sufficient, res_missing)
+            return {
+                "baseline_sufficiency": suff_domain.model_dump(mode="json"),
+                "is_baseline_sufficient": suff_domain.is_sufficient,
+                "last_trace": trace.model_dump(mode="json"),
+                "traces": existing_traces,
+            }
+        except Exception as exc:
+            last_err = exc
+            logger.warning("assess_baseline_state_sufficiency failed attempt %d: %s", attempt, exc)
+
+    # Fallback inspection result on error
+    fallback_domain = BaselineStartupStateSufficiency(
+        is_sufficient=len(missing) == 0,
+        dimension_statuses=dim_statuses,
+        missing_groups=missing,
+        reason=f"Fallback inspection used after error: {last_err}",
+    )
+    return {
+        "baseline_sufficiency": fallback_domain.model_dump(mode="json"),
+        "is_baseline_sufficient": fallback_domain.is_sufficient,
+    }
+
+
+def plan_baseline_question(state: StartaryGraphState) -> dict:
+    """
+    Selects the next missing baseline operational group and formulates ONE compact,
+    grouped natural-language question.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    base_suff = state.get("baseline_sufficiency") or {}
+    missing_groups = base_suff.get("missing_groups") or ["TEAM"]
+    exec_ctx = state.get("execution_context") or {}
+    prog = state.get("startup_progress") or {}
+    baseline_history = state.get("baseline_history") or []
+    turns_used = state.get("baseline_question_turns", 0)
+
+    # Milestone 3.2.1: Semantic Duplication & Repetition Guard
+    q_history = state.get("question_history") or []
+    answered_targets = {h.get("information_target") for h in q_history if h.get("answered")}
+
+    # Inspect current state to determine which operational areas are already known
+    team_known = bool((exec_ctx.get("founder_count") or {}).get("value") or (exec_ctx.get("team_members") or []))
+    capacity_known = bool((exec_ctx.get("approximate_weekly_hours_per_member") or {}).get("value") or (exec_ctx.get("total_weekly_capacity_hours") or {}).get("value"))
+    product_stage_known = bool((prog.get("development_stage") or {}).get("value") or (prog.get("product_status") or {}).get("value") or (prog.get("prototype_exists") or {}).get("value"))
+    validation_known = bool((prog.get("validation_activity") or {}).get("value") or (prog.get("interviews_completed") or {}).get("value") or (prog.get("active_users") or {}).get("value"))
+    resource_known = bool((exec_ctx.get("available_budget_amount") or {}).get("value") or (exec_ctx.get("funding_status") or {}).get("value"))
+
+    known_status = {
+        "TEAM": team_known,
+        "CAPACITY": capacity_known,
+        "PRODUCT_STAGE": product_stage_known,
+        "VALIDATION_OR_USER": validation_known,
+        "RESOURCE": resource_known,
+    }
+
+    # Filter missing_groups: exclude groups already known or already answered
+    effective_missing = [
+        g for g in missing_groups
+        if not known_status.get(g, False) and g not in answered_targets
+    ]
+    if not effective_missing:
+        effective_missing = [g for g in ["TEAM", "CAPACITY", "PRODUCT_STAGE", "VALIDATION_OR_USER", "RESOURCE"] if not known_status.get(g, False)] or ["CAPACITY"]
+
+    prev_questions = [h.get("question") for h in baseline_history if h.get("question")]
+
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(BaselineQuestionPlanLLMOutput)
+
+    user_msg = build_baseline_question_planner_user_message(
+        missing_groups=effective_missing,
+        execution_context_json=_json.dumps(exec_ctx, indent=2, default=str),
+        progress_json=_json.dumps(prog, indent=2, default=str),
+        previous_baseline_questions=prev_questions,
+        turns_used=turns_used,
+        max_turns=MAX_BASELINE_QUESTION_TURNS,
+    )
+
+    messages = [
+        {"role": "system", "content": BASELINE_QUESTION_PLANNER_SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
+
+    attempt = 0
+    last_err = None
+    while attempt < 2:
+        attempt += 1
+        t_start = time.monotonic()
+        try:
+            res: BaselineQuestionPlanLLMOutput = structured_llm.invoke(messages)
+            latency_ms = (time.monotonic() - t_start) * 1000
+
+            target_group_str = res.target_group or (effective_missing[0] if effective_missing else "CAPACITY")
+            # Guard against LLM re-selecting already-answered or known group
+            if target_group_str in answered_targets or known_status.get(target_group_str, False):
+                logger.info("plan_baseline_question: LLM re-selected known target %s; overriding with %s", target_group_str, effective_missing[0])
+                target_group_str = effective_missing[0]
+
+            try:
+                t_dim = BaselineDimension(target_group_str)
+            except (ValueError, TypeError):
+                t_dim = BaselineDimension.TEAM
+
+            q_plan = BaselineQuestionPlan(
+                should_ask=bool(res.should_ask),
+                target_group=t_dim,
+                target_fields=res.target_fields or [],
+                question=res.question,
+                reason=res.reason if isinstance(res.reason, str) else "",
+            )
+
+            trace = AITrace(
+                module_name="plan_baseline_question",
+                prompt_version=BASELINE_QUESTION_PLANNER_PROMPT_VERSION,
+                input_data={"missing_groups": effective_missing, "turns_used": turns_used},
+                output_data=res.model_dump(),
+                latency_ms=latency_ms,
+                project_id=project_id,
+            )
+            existing_traces = list(state.get("traces") or [])
+            existing_traces.append(trace.model_dump(mode="json"))
+
+            q_text = res.question or "Could you describe your team, what exists product-wise today, and your current testing activity?"
+
+            # Canonical NextTurnDecision (Milestone 3.2.1)
+            qid = f"q_base_{turns_used + 1}_{uuid.uuid4().hex[:6]}"
+            decision = NextTurnDecision(
+                question_id=qid,
+                source_phase=WorkflowPhase.CLARIFYING_CONTEXT,
+                information_target=target_group_str,
+                canonical_question=q_text,
+                should_ask_question=True,
+                clarification_reason=res.reason or "Baseline startup onboarding collection",
+                planner_version=BASELINE_QUESTION_PLANNER_PROMPT_VERSION,
+            )
+
+            logger.info("plan_baseline_question | project_id=%s target_group=%s qid=%s question=%s", project_id, target_group_str, qid, q_text[:70])
+            return {
+                "active_next_turn_decision": decision.model_dump(),
+                "current_baseline_question": {
+                    "question": q_text,
+                    "target_group": target_group_str,
+                    "target_fields": res.target_fields or [],
+                    "information_goal": res.reason or "",
+                },
+                "current_clarifying_question": {
+                    "question": q_text,
+                    "target_area": target_group_str,
+                    "information_goal": res.reason or "",
+                },
+                "active_interrupt_type": "baseline",
+                "phase": WorkflowPhase.CLARIFYING_CONTEXT,
+                "last_trace": trace.model_dump(mode="json"),
+                "traces": existing_traces,
+            }
+        except Exception as exc:
+            last_err = exc
+            logger.warning("plan_baseline_question failed attempt %d: %s", attempt, exc)
+
+    # Fallback question based on missing group
+    fallback_group = effective_missing[0] if effective_missing else "CAPACITY"
+    fallback_q_map = {
+        "TEAM": "Are you building this alone or with a team, and what does each person mainly work on?",
+        "CAPACITY": "Roughly how much time can you and the team realistically give the startup each week?",
+        "PRODUCT_STAGE": "What exists today — just the idea, designs, a prototype, an MVP, or a launched product, and has anyone tried it yet?",
+        "VALIDATION_OR_USER": "Have you spoken with potential users or had anyone try the product yet? Roughly how many, and how are you reaching them?",
+        "RESOURCE": "Are you self-funded or externally funded, and roughly what budget can you realistically spend on testing the startup?",
+    }
+    q_fallback = fallback_q_map.get(fallback_group, "Could you tell me a bit more about your team, current product status, and testing so far?")
+    fb_qid = f"q_base_fb_{turns_used + 1}_{uuid.uuid4().hex[:6]}"
+    fb_decision = NextTurnDecision(
+        question_id=fb_qid,
+        source_phase=WorkflowPhase.CLARIFYING_CONTEXT,
+        information_target=fallback_group,
+        canonical_question=q_fallback,
+        should_ask_question=True,
+        clarification_reason="Fallback baseline collection",
+        planner_version=BASELINE_QUESTION_PLANNER_PROMPT_VERSION,
+    )
+    return {
+        "active_next_turn_decision": fb_decision.model_dump(),
+        "current_baseline_question": {
+            "question": q_fallback,
+            "target_group": fallback_group,
+            "target_fields": [],
+            "information_goal": "Fallback baseline collection",
+        },
+        "current_clarifying_question": {
+            "question": q_fallback,
+            "target_area": fallback_group,
+            "information_goal": "Fallback baseline collection",
+        },
+        "active_interrupt_type": "baseline",
+        "phase": WorkflowPhase.CLARIFYING_CONTEXT,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Milestone 2.6.1 Nodes: Weak-Link Discrimination
+# ---------------------------------------------------------------------------
+
+def assess_weak_link_discrimination(state: StartaryGraphState) -> dict:
+    """
+    Evaluates whether the deterministic weak-link selection is sufficiently discriminated
+    or if multiple areas share maximum score / near-identical risk requiring clarification.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    weak_area = state.get("weak_area") or "Problem"
+    weak_details = state.get("weak_link_details") or {}
+    area_assessments = state.get("area_assessments") or []
+    diagnosis_dict = state.get("diagnosis") or {}
+    wl_history = state.get("weak_link_clarification_history") or []
+    turns_used = state.get("weak_link_clarification_turns", 0)
+
+    # Check max turns
+    if turns_used >= MAX_WEAK_LINK_CLARIFICATION_TURNS:
+        logger.info("assess_weak_link_discrimination | Max turns reached (%d); proceeding with deterministic winner under LOW confidence", turns_used)
+        return {
+            "selection_confidence": "LOW",
+            "should_clarify": False,
+            "should_clarify_weak_link": False,
+            "discrimination_reason": "Maximum weak-link clarification turns reached; proceeding with best available deterministic selection under explicit LOW confidence.",
+        }
+
+    telemetry = weak_details.get("saturation_telemetry") or {}
+    sat_count = telemetry.get("saturated_area_count", 0)
+    tie_count = telemetry.get("max_score_tie_count", 1)
+    tie_broken = telemetry.get("tie_breaker_used", False)
+    max_score = weak_details.get("score", 1)
+
+    # Sort areas by score
+    sorted_areas = sorted(area_assessments, key=lambda x: x.get("calculated_decision_risk", 1), reverse=True)
+    runner_up_score = sorted_areas[1].get("calculated_decision_risk", 1) if len(sorted_areas) > 1 else 1
+    score_gap = max_score - runner_up_score
+
+    # Fast path: Clear single winner (>= 10 point gap and no tie)
+    if tie_count == 1 and score_gap >= 10 and not tie_broken:
+        logger.info("assess_weak_link_discrimination | Single clear winner (score=%d runner_up=%d gap=%d); proceeding with HIGH confidence", max_score, runner_up_score, score_gap)
+        disc_domain = WeakLinkDiscrimination(
+            selection_confidence=SelectionConfidence.HIGH,
+            current_best_area=StartupArea(weak_area),
+            competing_areas=[],
+            discrimination_reason=f"Decisive {score_gap}-point risk score lead over closest competing area.",
+            should_clarify=False,
+        )
+        return {
+            "weak_link_discrimination": disc_domain.model_dump(mode="json"),
+            "selection_confidence": "HIGH",
+            "competing_weak_areas": [],
+            "should_clarify": False,
+            "should_clarify_weak_link": False,
+        }
+
+    # Ambiguity detected -> invoke LLM discrimination evaluation
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(WeakLinkDiscriminationLLMOutput)
+
+    # Format table
+    table_lines = [f"{a.get('area')}: Score={a.get('calculated_decision_risk')} (Imp={a.get('importance')}, Unc={a.get('uncertainty')}, Gap={a.get('evidence_gap')}, Con={a.get('consequence_if_wrong')})" for a in area_assessments]
+    table_str = "\n".join(table_lines)
+
+    prev_qa = [f"Q: {h.get('question')} | A: {h.get('founder_answer')}" for h in wl_history]
+
+    user_msg = build_weak_link_discrimination_user_message(
+        area_assessments_table=table_str,
+        current_winner_area=weak_area,
+        winner_score=max_score,
+        tie_telemetry_json=_json.dumps(telemetry, indent=2, default=str),
+        diagnosis_summary=diagnosis_dict.get("summary", ""),
+        previous_weak_link_qa=prev_qa,
+        turns_used=turns_used,
+        max_turns=MAX_WEAK_LINK_CLARIFICATION_TURNS,
+    )
+
+    messages = [
+        {"role": "system", "content": WEAK_LINK_DISCRIMINATION_SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
+
+    attempt = 0
+    last_err = None
+    while attempt < 2:
+        attempt += 1
+        t_start = time.monotonic()
+        try:
+            res: WeakLinkDiscriminationLLMOutput = structured_llm.invoke(messages)
+            latency_ms = (time.monotonic() - t_start) * 1000
+
+            try:
+                conf_enum = SelectionConfidence(res.selection_confidence)
+            except (ValueError, TypeError):
+                conf_enum = SelectionConfidence.LOW if (tie_count > 1 or sat_count > 1) else SelectionConfidence.MEDIUM
+
+            competing = [str(a) for a in res.competing_areas]
+
+            trace = AITrace(
+                module_name="assess_weak_link_discrimination",
+                prompt_version=WEAK_LINK_DISCRIMINATION_PROMPT_VERSION,
+                input_data={"winner": weak_area, "score": max_score, "turns_used": turns_used},
+                output_data=res.model_dump(),
+                latency_ms=latency_ms,
+                project_id=project_id,
+            )
+            existing_traces = list(state.get("traces") or [])
+            existing_traces.append(trace.model_dump(mode="json"))
+
+            res_mode = getattr(res, "resolution_mode", "FOUNDER_KNOWLEDGE") or "FOUNDER_KNOWLEDGE"
+            if str(res_mode).upper() == "EXTERNAL_EVIDENCE":
+                clarify_flag = False
+            else:
+                clarify_flag = bool(res.should_clarify) and turns_used < MAX_WEAK_LINK_CLARIFICATION_TURNS
+            route_selected = "select_weak_link_question" if clarify_flag else "reality_check"
+            logger.info(
+                "assess_weak_link_discrimination | winner=%s conf=%s should_clarify=%s res_mode=%s competing=%s turns=%d route=%s",
+                weak_area,
+                conf_enum.value,
+                clarify_flag,
+                res_mode,
+                competing,
+                turns_used,
+                route_selected,
+            )
+            disc_dump = res.model_dump()
+            disc_dump["should_clarify"] = clarify_flag
+            return {
+                "weak_link_discrimination": disc_dump,
+                "selection_confidence": conf_enum.value,
+                "competing_weak_areas": competing,
+                "should_clarify": clarify_flag,
+                "should_clarify_weak_link": clarify_flag,
+                "last_trace": trace.model_dump(mode="json"),
+                "traces": existing_traces,
+            }
+        except Exception as exc:
+            last_err = exc
+            logger.warning("assess_weak_link_discrimination failed attempt %d: %s", attempt, exc)
+
+    # Fallback discrimination logic on error
+    fallback_conf = "LOW" if (tie_count > 1 or sat_count > 1) else "MEDIUM"
+    fallback_competing = [str(a.get("area")) for a in sorted_areas[:3] if a.get("area") != weak_area]
+    fallback_clarify = (fallback_conf == "LOW") and turns_used < MAX_WEAK_LINK_CLARIFICATION_TURNS
+    return {
+        "selection_confidence": fallback_conf,
+        "competing_weak_areas": fallback_competing,
+        "should_clarify": fallback_clarify,
+        "should_clarify_weak_link": fallback_clarify,
+        "discrimination_reason": f"Fallback rule evaluation used after error: {last_err}",
+    }
+
+
+def select_weak_link_question(state: StartaryGraphState) -> dict:
+    """
+    Formulates exactly ONE focused clarifying question to differentiate competing weak-link areas.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    weak_area = state.get("weak_area") or "Problem"
+    competing = list(state.get("competing_weak_areas") or [])
+    if weak_area not in competing:
+        competing.insert(0, weak_area)
+
+    disc = state.get("weak_link_discrimination") or {}
+    info_goal = disc.get("recommended_information_goal") or f"Differentiate whether {weak_area} is more critical than {', '.join(competing[1:])}"
+    diagnosis_dict = state.get("diagnosis") or {}
+
+    founder_messages = state.get("founder_messages") or []
+    history_lines = [f"{m.get('role', 'founder').upper()}: {m.get('content')}" for m in founder_messages]
+    history_text = "\n".join(history_lines) if history_lines else (state.get("raw_context") or "")
+
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(WeakLinkClarifyingQuestionLLMOutput)
+
+    user_msg = build_weak_link_clarifying_question_user_message(
+        competing_areas=competing,
+        information_goal=info_goal,
+        diagnosis_summary=diagnosis_dict.get("summary", ""),
+        conversation_history_text=history_text,
+    )
+
+    messages = [
+        {"role": "system", "content": WEAK_LINK_CLARIFYING_QUESTION_SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
+
+    attempt = 0
+    last_err = None
+    while attempt < 2:
+        attempt += 1
+        t_start = time.monotonic()
+        try:
+            res: WeakLinkClarifyingQuestionLLMOutput = structured_llm.invoke(messages)
+            latency_ms = (time.monotonic() - t_start) * 1000
+
+            trace = AITrace(
+                module_name="select_weak_link_question",
+                prompt_version=WEAK_LINK_CLARIFICATION_PROMPT_VERSION,
+                input_data={"competing_areas": competing, "turn": state.get("weak_link_clarification_turns", 0)},
+                output_data=res.model_dump(),
+                latency_ms=latency_ms,
+                project_id=project_id,
+            )
+            existing_traces = list(state.get("traces") or [])
+            existing_traces.append(trace.model_dump(mode="json"))
+
+            target_str = str(res.competing_areas[0]) if res.competing_areas else weak_area
+            wl_target = f"WEAK_LINK_{target_str}"
+            wl_qid = f"q_wl_{state.get('weak_link_clarification_turns', 0) + 1}_{uuid.uuid4().hex[:6]}"
+            wl_decision = NextTurnDecision(
+                question_id=wl_qid,
+                source_phase=WorkflowPhase.CLARIFYING_CONTEXT,
+                information_target=wl_target,
+                canonical_question=res.question,
+                should_ask_question=True,
+                clarification_reason=res.information_goal or "",
+                planner_version=WEAK_LINK_CLARIFICATION_PROMPT_VERSION,
+            )
+
+            logger.info("select_weak_link_question | competing=%s qid=%s question=%s", competing, wl_qid, res.question[:70])
+            return {
+                "active_next_turn_decision": wl_decision.model_dump(),
+                "current_weak_link_question": res.model_dump(),
+                "current_clarifying_question": {
+                    "question": res.question,
+                    "target_area": target_str,
+                    "information_goal": res.information_goal,
+                },
+                "active_interrupt_type": "weak_link",
+                "phase": WorkflowPhase.CLARIFYING_CONTEXT,
+                "last_trace": trace.model_dump(mode="json"),
+                "traces": existing_traces,
+            }
+        except Exception as exc:
+            last_err = exc
+            logger.warning("select_weak_link_question failed attempt %d: %s", attempt, exc)
+
+    # Fallback question
+    fallback_q = f"When considering {weak_area} versus other aspects of your startup, what specific user behavior or outcome have you observed most directly?"
+    fb_wl_qid = f"q_wl_fb_{state.get('weak_link_clarification_turns', 0) + 1}_{uuid.uuid4().hex[:6]}"
+    fb_wl_decision = NextTurnDecision(
+        question_id=fb_wl_qid,
+        source_phase=WorkflowPhase.CLARIFYING_CONTEXT,
+        information_target=f"WEAK_LINK_{weak_area}",
+        canonical_question=fallback_q,
+        should_ask_question=True,
+        clarification_reason=info_goal,
+        planner_version=WEAK_LINK_CLARIFICATION_PROMPT_VERSION,
+    )
+    return {
+        "active_next_turn_decision": fb_wl_decision.model_dump(),
+        "current_weak_link_question": {
+            "question": fallback_q,
+            "competing_areas": competing,
+            "information_goal": info_goal,
+            "why_this_question_now": f"Fallback question after error: {last_err}",
+        },
+        "current_clarifying_question": {
+            "question": fallback_q,
+            "target_area": weak_area,
+            "information_goal": info_goal,
+        },
+        "active_interrupt_type": "weak_link",
+        "phase": WorkflowPhase.CLARIFYING_CONTEXT,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Milestone 3 Nodes: Experiment Generation & Critic
+# ---------------------------------------------------------------------------
+
+def generate_experiment(state: StartaryGraphState) -> dict:
+    """
+    LLM Node: Formulate ONE specific, testable, cost-effective experiment designed
+    to reduce uncertainty in the active critical assumption (Milestone 3).
+    Respects founder execution constraints and previous critic instructions if revising.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    active_assumption = state.get("active_assumption")
+    if not active_assumption or not active_assumption.get("statement"):
+        raise ValueError(f"generate_experiment | project_id={project_id}: active_assumption missing.")
+
+    statement = active_assumption["statement"]
+    weak_area = state.get("weak_area") or str(active_assumption.get("area", "Problem"))
+    rc = state.get("reality_check") or {}
+    exec_ctx = state.get("execution_context") or {}
+    prog = state.get("startup_progress") or {}
+    founder_messages = state.get("founder_messages") or []
+    founder_evidence_summary = "\n".join(
+        m.get("content", "") for m in founder_messages if m.get("role") == "founder"
+    ) or state.get("raw_context", "")
+
+    previous_experiments = state.get("previous_experiments") or []
+    prev_exp_summary = ""
+    if previous_experiments:
+        prev_exp_summary = "\n".join(
+            f"- [{e.get('experiment_type')}] {e.get('objective')} (Status: {e.get('status')})"
+            for e in previous_experiments
+        )
+
+    revision_instructions = state.get("critic_revision_instructions") or ""
+
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(ExperimentGeneratorLLMOutput)
+
+    user_msg = build_experiment_generator_user_message(
+        critical_assumption=statement,
+        weak_area=weak_area,
+        reality_check_summary=rc.get("summary", ""),
+        unresolved_uncertainty=rc.get("unresolved_uncertainty", ""),
+        what_evidence_supports=rc.get("what_evidence_supports") or [],
+        what_evidence_does_not_support=rc.get("what_evidence_does_not_support") or [],
+        execution_context_json=json.dumps(exec_ctx, indent=2, default=str),
+        startup_progress_json=json.dumps(prog, indent=2, default=str),
+        founder_evidence_summary=founder_evidence_summary,
+        previous_experiments_summary=prev_exp_summary,
+        critic_revision_instructions=revision_instructions,
+    )
+
+    messages = [
+        {"role": "system", "content": EXPERIMENT_GENERATOR_SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
+
+    attempt = 0
+    last_err = None
+    while attempt < 2:
+        attempt += 1
+        t_start = time.monotonic()
+        try:
+            res: ExperimentGeneratorLLMOutput = structured_llm.invoke(messages)
+            latency_ms = (time.monotonic() - t_start) * 1000
+
+            res_data = res.model_dump() if hasattr(res, "model_dump") and isinstance(res.model_dump(), dict) else (res if isinstance(res, dict) else {})
+
+            trace = AITrace(
+                module_name="generate_experiment",
+                prompt_version=EXPERIMENT_GENERATOR_PROMPT_VERSION,
+                input_data={
+                    "assumption_id": active_assumption.get("id"),
+                    "weak_area": weak_area,
+                    "revision_instructions": revision_instructions[:100] if revision_instructions else None,
+                },
+                output_data=res_data,
+                latency_ms=latency_ms,
+                project_id=project_id,
+            )
+            existing_traces = list(state.get("traces") or [])
+            existing_traces.append(trace.model_dump(mode="json"))
+
+            exp_type = getattr(res, "experiment_type", res_data.get("experiment_type", "OTHER"))
+            obj = getattr(res, "objective", res_data.get("objective", ""))
+            logger.info("generate_experiment | type=%s objective=%s (attempt=%d)", exp_type, obj[:60], attempt)
+            return {
+                "proposed_experiment_output": res_data,
+                "last_trace": trace.model_dump(mode="json"),
+                "traces": existing_traces,
+            }
+        except Exception as exc:
+            last_err = exc
+            logger.warning("generate_experiment failed attempt %d: %s", attempt, exc)
+
+    raise RuntimeError(f"generate_experiment failed after 2 attempts. Error: {last_err}")
+
+
+def validate_proposed_experiment(state: StartaryGraphState) -> dict:
+    """
+    Deterministic Node:
+    Validates structural completeness and parameters of the proposed experiment
+    before sending it to the Experiment Critic.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    exp_output = state.get("proposed_experiment_output")
+    active_assumption = state.get("active_assumption") or {}
+    statement = active_assumption.get("statement", "")
+
+    if not exp_output:
+        raise ValueError(f"validate_proposed_experiment | project_id={project_id}: proposed_experiment_output missing.")
+
+    # 1. Non-empty required fields
+    required_str_fields = [
+        "objective", "method", "evidence_to_collect",
+        "support_signal", "contradiction_signal", "inconclusive_signal"
+    ]
+    for field in required_str_fields:
+        val = (exp_output.get(field) or "").strip()
+        if len(val) < 5:
+            raise ValueError(f"validate_proposed_experiment | field '{field}' is empty or too short: '{val}'")
+
+    if not exp_output.get("founder_actions"):
+        raise ValueError("validate_proposed_experiment | founder_actions cannot be empty.")
+
+    if not exp_output.get("valid_inferences"):
+        raise ValueError("validate_proposed_experiment | valid_inferences cannot be empty.")
+
+    if not exp_output.get("invalid_inferences"):
+        raise ValueError("validate_proposed_experiment | invalid_inferences cannot be empty.")
+
+    # 2. Hypothesis alignment
+    if not exp_output.get("hypothesis") or exp_output.get("hypothesis") != statement:
+        exp_output["hypothesis"] = statement
+
+    # 3. Fake precision validation on parameters
+    for p in exp_output.get("parameters") or []:
+        val_str = str(p.get("value", ""))
+        if re.search(r"\b\d+\.\d+%", val_str) or re.search(r"\b\d+\.\d+\s*(?:users|customers|sellers|people)\b", val_str):
+            logger.warning("validate_proposed_experiment: parameter '%s' contains fake precision '%s'. Normalizing.", p.get("name"), val_str)
+
+    logger.info("validate_proposed_experiment | experiment validated for critic evaluation.")
+    return {
+        "proposed_experiment_output": exp_output,
+    }
+
+
+def critique_experiment(state: StartaryGraphState) -> dict:
+    """
+    LLM Node: Evaluates proposed experiment for assumption alignment, evidence validity,
+    feasibility, cost efficiency, and falsifiability. Decides ACCEPT or REVISE.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    active_assumption = state.get("active_assumption") or {}
+    statement = active_assumption.get("statement", "")
+    weak_area = state.get("weak_area") or str(active_assumption.get("area", "Problem"))
+    rc = state.get("reality_check") or {}
+    exp_output = state.get("proposed_experiment_output") or {}
+    exec_ctx = state.get("execution_context") or {}
+    prog = state.get("startup_progress") or {}
+    founder_messages = state.get("founder_messages") or []
+    founder_evidence_summary = "\n".join(
+        m.get("content", "") for m in founder_messages if m.get("role") == "founder"
+    ) or state.get("raw_context", "")
+
+    revision_count = state.get("critic_revision_count", 0)
+
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(ExperimentCriticLLMOutput)
+
+    user_msg = build_experiment_critic_user_message(
+        critical_assumption=statement,
+        weak_area=weak_area,
+        reality_check_summary=rc.get("summary", ""),
+        proposed_experiment_json=json.dumps(exp_output, indent=2, default=str),
+        execution_context_json=json.dumps(exec_ctx, indent=2, default=str),
+        startup_progress_json=json.dumps(prog, indent=2, default=str),
+        founder_evidence_summary=founder_evidence_summary,
+    )
+
+    messages = [
+        {"role": "system", "content": EXPERIMENT_CRITIC_SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
+
+    attempt = 0
+    last_err = None
+    while attempt < 2:
+        attempt += 1
+        t_start = time.monotonic()
+        try:
+            res: ExperimentCriticLLMOutput = structured_llm.invoke(messages)
+            latency_ms = (time.monotonic() - t_start) * 1000
+
+            res_data = res.model_dump() if hasattr(res, "model_dump") and isinstance(res.model_dump(), dict) else (res if isinstance(res, dict) else {})
+
+            trace = AITrace(
+                module_name="critique_experiment",
+                prompt_version=EXPERIMENT_CRITIC_PROMPT_VERSION,
+                input_data={
+                    "assumption_id": active_assumption.get("id"),
+                    "experiment_type": exp_output.get("experiment_type"),
+                    "revision_count": revision_count,
+                },
+                output_data=res_data,
+                latency_ms=latency_ms,
+                project_id=project_id,
+            )
+            existing_traces = list(state.get("traces") or [])
+            existing_traces.append(trace.model_dump(mode="json"))
+
+            verdict_raw = getattr(res, "verdict", res_data.get("verdict", "REVISE"))
+            verdict_norm = str(verdict_raw).upper().strip()
+            if "ACCEPT" in verdict_norm:
+                verdict_norm = "ACCEPT"
+            else:
+                verdict_norm = "REVISE"
+            if hasattr(res, "verdict"):
+                res.verdict = verdict_norm
+            res_data["verdict"] = verdict_norm
+
+            issues = getattr(res, "issues", res_data.get("issues", []))
+            logger.info("critique_experiment | verdict=%s revision_count=%d issues=%s", verdict_norm, revision_count, issues)
+
+            updates: dict[str, Any] = {
+                "experiment_critic_output": res_data,
+                "last_trace": trace.model_dump(mode="json"),
+                "traces": existing_traces,
+            }
+
+            if verdict_norm == "REVISE":
+                updates["critic_revision_count"] = revision_count + 1
+                updates["critic_revision_instructions"] = res.revision_instructions or "; ".join(res.issues)
+
+            return updates
+        except Exception as exc:
+            last_err = exc
+            logger.warning("critique_experiment failed attempt %d: %s", attempt, exc)
+
+    raise RuntimeError(f"critique_experiment failed after 2 attempts. Error: {last_err}")
+
+
+def save_final_experiment(state: StartaryGraphState) -> dict:
+    """
+    Deterministic Node:
+    Instantiates first-class Experiment domain model with status=READY,
+    links to active_assumption, appends to previous_experiments, and updates state.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    iteration = state.get("iteration", 1)
+    active_assumption = state.get("active_assumption")
+    exp_output = state.get("proposed_experiment_output")
+
+    if not active_assumption or not active_assumption.get("id"):
+        raise ValueError(f"save_final_experiment | project_id={project_id}: active_assumption missing.")
+    if not exp_output:
+        raise ValueError(f"save_final_experiment | project_id={project_id}: proposed_experiment_output missing.")
+
+    params = [
+        ExperimentParameter(
+            name=p.get("name", "param"),
+            value=str(p.get("value", "")),
+            provenance=ParameterProvenance(p.get("provenance", "AI_PROPOSED")),
+            notes=p.get("notes"),
+        )
+        for p in exp_output.get("parameters") or []
+    ]
+
+    exp = Experiment(
+        id=str(uuid.uuid4()),
+        assumption_id=active_assumption["id"],
+        project_id=project_id,
+        experiment_type=ExperimentType(exp_output.get("experiment_type", ExperimentType.OTHER)),
+        objective=exp_output["objective"],
+        hypothesis=active_assumption["statement"],
+        method=exp_output.get("method"),
+        target_participants_or_scope=exp_output.get("target_participants_or_scope"),
+        founder_actions=exp_output.get("founder_actions") or [],
+        evidence_to_collect=exp_output.get("evidence_to_collect"),
+        support_signal=exp_output.get("support_signal"),
+        contradiction_signal=exp_output.get("contradiction_signal"),
+        inconclusive_signal=exp_output.get("inconclusive_signal"),
+        valid_inferences=exp_output.get("valid_inferences") or [],
+        invalid_inferences=exp_output.get("invalid_inferences") or [],
+        estimated_time=exp_output.get("estimated_time"),
+        estimated_cost=exp_output.get("estimated_cost"),
+        required_capabilities=exp_output.get("required_capabilities") or [],
+        required_access=exp_output.get("required_access") or [],
+        parameters=params,
+        status=ExperimentStatus.READY,
+        created_iteration=iteration,
+    )
+
+    prev_experiments = list(state.get("previous_experiments") or [])
+    prev_experiments.append(exp.model_dump(mode="json"))
+
+    logger.info("save_final_experiment | experiment_id=%s type=%s status=READY", exp.id, exp.experiment_type)
+    return {
+        "active_experiment": exp.model_dump(mode="json"),
+        "previous_experiments": prev_experiments,
+        "phase": WorkflowPhase.TEST,
+    }
+
+
+def assess_can_execute(state: StartaryGraphState) -> dict:
+    """
+    Deterministic Node:
+    Evaluates whether the founder has the assets, budget, customer access, and capabilities
+    to execute the accepted experiment under current constraints.
+    Returns CAN_EXECUTE, NEEDS_HELP, or BLOCKED.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    exp_dict = state.get("active_experiment") or {}
+    exec_ctx = state.get("execution_context") or {}
+    prog = state.get("startup_progress") or {}
+
+    exp_type = exp_dict.get("experiment_type", "OTHER")
+    required_access = exp_dict.get("required_access") or []
+    estimated_cost = (exp_dict.get("estimated_cost") or "").lower()
+
+    missing_requirements: list[str] = []
+    blockers: list[str] = []
+
+    # 1. Prototype requirement check
+    if exp_type == ExperimentType.PROTOTYPE_TEST.value:
+        mvp_field = prog.get("mvp_exists")
+        mvp_val = mvp_field.get("value") if isinstance(mvp_field, dict) else mvp_field
+        if str(mvp_val).lower() not in ("true", "yes"):
+            missing_requirements.append(
+                "Experiment requires testing a working prototype, but no prototype exists yet."
+            )
+
+def resolve_customer_access(state: StartaryGraphState) -> CustomerAccessAssessment:
+    """
+    Deterministic Access Evidence Resolver (Milestone 4.0.1):
+    Aggregates factual signals of customer/user access across the entire startup state:
+      - execution_context (customer_access, existing_audience_or_community, key_assets)
+      - startup_progress (active_users_count, users_count, paying_customers_count, mvp_exists)
+      - startup_state area knowledge (Target User, Problem, Demand Signal, Existing Alternatives)
+      - founder_messages and raw_context for demonstrated customer interactions
+      - historical evidence records
+    Distinguishes NONE from LIMITED (demonstrated past users/testers) from ESTABLISHED.
+    """
+    exec_ctx = state.get("execution_context") or {}
+    prog = state.get("startup_progress") or {}
+    startup_st = state.get("startup_state") or {}
+    area_knowledge = startup_st.get("area_knowledge") or {}
+    founder_messages = state.get("founder_messages") or []
+    raw_context = state.get("raw_context") or ""
+    founder_evidence = state.get("founder_evidence") or []
+
+    evidence_sources: list[str] = []
+    relevant_segments: list[str] = []
+
+    # 1. Check explicit execution_context fields
+    cust_access_field = exec_ctx.get("customer_access")
+    existing_aud_field = exec_ctx.get("existing_audience_or_community")
+    for field_name, f in [("customer_access", cust_access_field), ("existing_audience", existing_aud_field)]:
+        if isinstance(f, dict) and f.get("value") is not None and f.get("provenance") != "UNKNOWN":
+            val_str = str(f.get("value", "")).strip()
+            if val_str.lower() not in ("none", "no", "unknown", ""):
+                evidence_sources.append(f"{field_name}: {val_str}")
+
+    key_assets = exec_ctx.get("key_assets") or []
+    for asset in key_assets:
+        asset_str = str(asset).lower()
+        if any(kw in asset_str for kw in ("user", "community", "audience", "partner", "network", "client", "customer")):
+            evidence_sources.append(f"key asset: {asset}")
+
+    # 2. Check startup_progress (active users, user counts, MVP testing)
+    for user_key in ("active_users_count", "users_count", "paying_customers_count"):
+        uf = prog.get(user_key)
+        if isinstance(uf, dict) and uf.get("value") is not None:
+            try:
+                count_val = int(float(uf.get("value", 0)))
+                if count_val > 0:
+                    evidence_sources.append(f"{user_key}: {count_val}")
+            except (ValueError, TypeError):
+                pass
+
+    mvp_field = prog.get("mvp_exists")
+    mvp_val = str(mvp_field.get("value") if isinstance(mvp_field, dict) else mvp_field).lower()
+    has_mvp = mvp_val in ("true", "yes")
+
+    # 3. Check area knowledge (Target User, Demand Signal, Problem, etc.)
+    target_user_data = area_knowledge.get("Target User") or {}
+    if target_user_data.get("understanding"):
+        relevant_segments.append(str(target_user_data["understanding"])[:80])
+
+    interaction_keywords = [
+        "tested by", "student tester", "student testers", "user feedback", "interviewed",
+        "conversations with", "pilot", "users reported", "talking to users", "feedback from",
+        "beta user", "beta testers", "spoke to", "used by students", "tested with students"
+    ]
+
+    for area_name, area_data in area_knowledge.items():
+        claims = area_data.get("founder_claims") or []
+        ev_provided = area_data.get("evidence_provided") or []
+        understanding = str(area_data.get("understanding") or "")
+        all_text = " ".join([str(c) for c in claims] + [str(e) for e in ev_provided] + [understanding]).lower()
+        for kw in interaction_keywords:
+            if kw in all_text:
+                evidence_sources.append(f"{area_name}: mentioned '{kw}'")
+                break
+
+    # 4. Check conversation text & raw context
+    all_msgs_text = " ".join([str(m.get("content", "")) for m in founder_messages] + [raw_context]).lower()
+    if has_mvp and any(kw in all_msgs_text for kw in ("tested by", "feedback", "users used", "students used", "testers", "tried")):
+        evidence_sources.append("MVP user testing: students/users tested MVP and provided feedback")
+
+    for kw in ("interviewed", "pilot with", "spoke to 5", "spoke to 6", "spoke to 7", "spoke to 8", "talked to 10"):
+        if kw in all_msgs_text:
+            evidence_sources.append(f"conversation history: mentioned '{kw}'")
+
+    # 5. Check historical evidence submissions
+    if founder_evidence:
+        evidence_sources.append(f"historical evidence: {len(founder_evidence)} completed experiment submission(s)")
+
+    # Deduplicate sources
+    evidence_sources = list(dict.fromkeys(evidence_sources))
+
+    # Evaluate access status and strength
+    if not evidence_sources:
+        return CustomerAccessAssessment(
+            access_status=CustomerAccessStatus.NONE,
+            access_strength=CustomerAccessStrength.WEAK,
+            evidence_sources=[],
+            relevant_segments=relevant_segments,
+            explanation="No evidence of customer access, user testing, or past conversations found in the startup state.",
+        )
+
+    # Check if access is established (direct explicit customer access, active user base, or community/audience)
+    has_established_access = (
+        any("customer_access:" in s for s in evidence_sources)
+        or any("existing_audience:" in s for s in evidence_sources)
+        or any(("active_users_count" in s or "paying_customers_count" in s) for s in evidence_sources)
+        or any("audience" in s.lower() for s in evidence_sources)
+    )
+
+    if has_established_access:
+        return CustomerAccessAssessment(
+            access_status=CustomerAccessStatus.ESTABLISHED,
+            access_strength=CustomerAccessStrength.STRONG,
+            evidence_sources=evidence_sources,
+            relevant_segments=relevant_segments,
+            explanation=f"Established customer access via direct channels or existing user base ({'; '.join(evidence_sources[:3])}).",
+        )
+
+    # Otherwise access is demonstrated but limited (e.g. prior MVP testers, small interview sample, feedback from students)
+    return CustomerAccessAssessment(
+        access_status=CustomerAccessStatus.LIMITED,
+        access_strength=CustomerAccessStrength.MODERATE,
+        evidence_sources=evidence_sources,
+        relevant_segments=relevant_segments,
+        explanation=f"Demonstrated access to past users or testers ({'; '.join(evidence_sources[:3])}), but recruitment capacity for specific new sample cohorts is unconfirmed.",
+    )
+
+
+def assess_can_execute(state: StartaryGraphState) -> dict:
+    """
+    Deterministic Node (Milestone 3 & Milestone 4.0.1):
+    Evaluates whether the accepted experiment can be executed under the startup's
+    practical operating reality (ExecutionContext + StartupProgress + CustomerAccessAssessment).
+
+    Readiness Levels:
+      - CAN_EXECUTE: Founder has capacity, access, and budget to execute immediately.
+      - NEEDS_HELP: Valid experiment, but requires assistance, assets, or access.
+      - BLOCKED: Direct violation of immutable constraints (e.g. requires cash with $0 budget).
+    """
+    project_id = state.get("project_id", "<unknown>")
+    exp_dict = state.get("active_experiment") or {}
+    exec_ctx = state.get("execution_context") or {}
+    prog = state.get("startup_progress") or {}
+
+    exp_type = exp_dict.get("experiment_type", "OTHER")
+    required_access = exp_dict.get("required_access") or []
+    estimated_cost = (exp_dict.get("estimated_cost") or "").lower()
+
+    missing_requirements: list[str] = []
+    blockers: list[str] = []
+
+    # 1. Prototype requirement check
+    if exp_type == ExperimentType.PROTOTYPE_TEST.value:
+        mvp_field = prog.get("mvp_exists")
+        mvp_val = mvp_field.get("value") if isinstance(mvp_field, dict) else mvp_field
+        if str(mvp_val).lower() not in ("true", "yes"):
+            missing_requirements.append(
+                "Experiment requires testing a working prototype, but no prototype exists yet."
+            )
+
+    # 2. Customer access check (Milestone 4.0.1)
+    access_assessment = resolve_customer_access(state)
+    sample_needed = exp_dict.get("sample_size") or "qualifying participants"
+
+    if required_access or exp_type in (ExperimentType.PROBLEM_INTERVIEW.value, ExperimentType.PROTOTYPE_TEST.value):
+        req_str = ", ".join(required_access) if required_access else "target customer segment"
+        if access_assessment.access_status == CustomerAccessStatus.NONE:
+            missing_requirements.append(
+                f"Experiment requires specific customer/channel access ({req_str}), but founder has no demonstrated customer access."
+            )
+        elif access_assessment.access_status in (CustomerAccessStatus.LIMITED, CustomerAccessStatus.UNKNOWN):
+            missing_requirements.append(
+                f"Existing customer access is demonstrated ({'; '.join(access_assessment.evidence_sources[:2])}), but it is not yet clear that you can recruit the specific sample required for this experiment ({sample_needed})."
+            )
+        # If ESTABLISHED, access requirement is satisfied without missing requirement!
+
+    # 3. Budget check
+    budget_field = exec_ctx.get("available_budget_amount")
+    if isinstance(budget_field, dict) and budget_field.get("value") is not None and budget_field.get("provenance") != "UNKNOWN":
+        try:
+            available_amt = float(budget_field.get("value", 0))
+            cost_matches = re.findall(r"\$?\b(\d+)\b", estimated_cost)
+            if cost_matches:
+                estimated_amt = float(cost_matches[0])
+                if estimated_amt > available_amt and estimated_amt > 0:
+                    if available_amt == 0 and estimated_amt > 100:
+                        blockers.append(
+                            f"Estimated cost (${estimated_amt:.0f}) exceeds zero available budget."
+                        )
+                    else:
+                        missing_requirements.append(
+                            f"Estimated cost (${estimated_amt:.0f}) exceeds available budget (${available_amt:.0f})."
+                        )
+        except (ValueError, TypeError):
+            pass
+
+    # Determine readiness
+    if blockers:
+        readiness = ExecutionReadiness.BLOCKED
+        reason = f"Experiment cannot be executed under current constraints: {'; '.join(blockers)}"
+    elif missing_requirements:
+        readiness = ExecutionReadiness.NEEDS_HELP
+        reason = f"Experiment is valid but founder requires assistance or assets: {'; '.join(missing_requirements)}"
+    else:
+        readiness = ExecutionReadiness.CAN_EXECUTE
+        reason = "Founder has sufficient capacity, access, and budget to execute this experiment immediately."
+
+    # Grounding & contradiction guard (Milestone 4.0.1)
+    if access_assessment.access_status != CustomerAccessStatus.NONE:
+        reason = re.sub(r"founder has no established customer access", "existing customer access is limited and recruitment capacity for this sample is unconfirmed", reason, flags=re.IGNORECASE)
+        reason = re.sub(r"founder has no demonstrated customer access", "existing customer access is limited and recruitment capacity for this sample is unconfirmed", reason, flags=re.IGNORECASE)
+        reason = re.sub(r"has no access to users", "has limited demonstrated access to users", reason, flags=re.IGNORECASE)
+        reason = re.sub(r"no customer conversations exist", "limited customer conversations exist", reason, flags=re.IGNORECASE)
+
+    assessment = CanExecuteAssessment(
+        readiness=readiness,
+        reason=reason,
+        missing_requirements=missing_requirements,
+        blockers=blockers,
+    )
+
+    logger.info("assess_can_execute | readiness=%s access_status=%s reason=%s", readiness, access_assessment.access_status.value, reason[:80])
+    return {
+        "can_execute_result": assessment.model_dump(mode="json"),
+        "customer_access_assessment": access_assessment.model_dump(mode="json"),
+        "phase": WorkflowPhase.TEST,
+    }
+
+
+def handle_experiment_failure_stop(state: StartaryGraphState) -> dict:
+    """
+    Deterministic Node (Milestone 4.0.4, 4.0.6 & 4.0.7.1.1):
+    Gracefully stops the workflow if Experiment Critic rejects proposed experiments
+    after maximum revisions or if unrecoverable validation error occurs.
+    Preserves diagnosis, weak link, and critical assumption, setting experiment_design_status
+    to QUALITY_BAR_NOT_MET so the terminal renderer displays EXPERIMENT_DESIGN_NEEDS_REVISION.
+    Composes FallbackLearningAction (Milestone 4.0.6) so the founder receives a bounded,
+    safe next learning step rather than an abrupt halt.
+    Sets phase authoritatively to WAITING_FOR_LEARNING_INPUT and cleans up all active
+    execution state (active_experiment, active_execution_handoff, can_execute_result).
+    """
+    project_id = state.get("project_id", "<unknown>")
+    critic_output = state.get("experiment_critic_output") or {}
+    issues = critic_output.get("issues") or []
+    issues_str = "; ".join(issues) if issues else "Critique criteria failed."
+
+    msg = f"Experiment generation stopped: unable to produce an accepted experiment after revision. Issues: {issues_str}"
+    logger.warning("handle_experiment_failure_stop | project_id=%s: %s", project_id, msg)
+
+    active_asmp = state.get("active_assumption") or state.get("active_critical_assumption")
+    weak_link = state.get("weak_area") or (active_asmp.get("area") if isinstance(active_asmp, dict) else None)
+    rejected_exp = state.get("proposed_experiment_output") or state.get("active_experiment")
+    snapshot = state.get("diagnosis_snapshot")
+
+    fallback = compose_fallback_learning_action(
+        assumption=active_asmp,
+        weak_link=weak_link,
+        critic_output=critic_output,
+        rejected_experiment=rejected_exp,
+        state=state,
+        diagnosis_snapshot=snapshot,
+    )
+
+    # Invalidate / clear stale current-cycle execution state (Milestone 4.0.7.1.1)
+    # If active_experiment is already an explicit blocked record (e.g. from test setups), preserve it as BLOCKED;
+    # otherwise, clear it to None so no rejected or prior-iteration experiment masquerades as active/ready.
+    active_exp = state.get("active_experiment")
+    cleared_active_exp = None
+    if isinstance(active_exp, dict):
+        if active_exp.get("execution_readiness") == ExecutionReadiness.BLOCKED.value and not (
+            active_exp.get("created_iteration") and active_exp.get("created_iteration") < state.get("iteration", 1)
+        ):
+            cleared_active_exp = dict(active_exp)
+            cleared_active_exp["status"] = ExperimentStatus.BLOCKED.value
+
+    return {
+        "status_message": msg,
+        "phase": WorkflowPhase.WAITING_FOR_LEARNING_INPUT,
+        "experiment_design_status": ExperimentDesignStatus.QUALITY_BAR_NOT_MET.value,
+        "fallback_learning_action": fallback.model_dump(),
+        "learning_input_mode": "FALLBACK",
+        "active_experiment": cleared_active_exp,
+        "active_execution_handoff": None,
+        "execution_handoff_text": None,
+        "can_execute_result": None,
+        "waiting_response": None,
+        "post_evidence_answer": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Milestone 3.1: Startup Diagnosis Composer Node
+# ---------------------------------------------------------------------------
+
+def compose_startup_diagnosis(state: StartaryGraphState) -> dict:
+    """
+    LLM Node (Milestone 3.1):
+    Synthesizes the internal diagnostic intelligence (stage, grounded areas, advantages,
+    constraints, major uncertainties, weak link, confidence, competing risks, reality summary,
+    and active critical assumption) into a founder-facing StartupDiagnosisSnapshot.
+
+    Deterministic Invariants:
+      - active_assumption statement is preserved verbatim.
+      - weak_link matches selected weak link.
+      - weak_link_confidence matches discrimination result.
+      - major_uncertainties capped at 5.
+      - competing_risks capped at 3.
+      - Never invents fake startup scores or new ungrounded facts.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    iteration = state.get("iteration", 1)
+
+    active_ca = state.get("active_assumption") or {}
+    ca_statement = active_ca.get("statement", "")
+
+    weak_link = state.get("weak_area") or "Problem"
+    confidence = state.get("selection_confidence") or "LOW"
+
+    # Stage resolution
+    startup_prog = state.get("startup_progress") or {}
+    dev_stage_val = (startup_prog.get("development_stage") or {}).get("value")
+    if not dev_stage_val or dev_stage_val == "UNKNOWN":
+        diag = state.get("diagnosis") or {}
+        dev_stage_val = diag.get("startup_stage") or "Pre-MVP"
+
+    stage_name = str(dev_stage_val).replace("_", " ").title()
+    stage_explanation = f"The startup is currently in the {stage_name} phase, where foundational market assumptions are being tested."
+
+    # Competing risks from area assessments
+    assessments = state.get("area_assessments") or []
+    sorted_areas = sorted(
+        assessments,
+        key=lambda x: x.get("calculated_decision_risk", 0),
+        reverse=True,
+    )
+    competing_risks = [
+        a.get("area") for a in sorted_areas
+        if a.get("area") != weak_link and a.get("area")
+    ][:3]
+
+    reality_check = state.get("reality_check") or {}
+    rc_summary = reality_check.get("summary", "")
+    what_supports = reality_check.get("what_evidence_supports") or []
+    what_not_supports = reality_check.get("what_evidence_does_not_support") or []
+
+    exec_context = state.get("execution_context") or {}
+
+    grounded_summary_items = []
+    for s in what_supports:
+        grounded_summary_items.append(f"Supported: {s}")
+    if exec_context.get("team_size", {}).get("value"):
+        grounded_summary_items.append(f"Team: {exec_context['team_size']['value']}")
+    if exec_context.get("customer_access", {}).get("value"):
+        grounded_summary_items.append(f"Customer Access: {exec_context['customer_access']['value']}")
+    grounded_facts_summary = "; ".join(grounded_summary_items)
+
+    user_msg = build_startup_diagnosis_composer_user_message(
+        stage=stage_name,
+        stage_explanation=stage_explanation,
+        weak_link=weak_link,
+        selection_confidence=confidence,
+        competing_risks=competing_risks,
+        reality_check_summary=rc_summary,
+        what_evidence_supports=what_supports,
+        what_evidence_does_not_support=what_not_supports,
+        critical_assumption=ca_statement,
+        execution_context_json=json.dumps(exec_context, indent=2, default=str),
+        startup_progress_json=json.dumps(startup_prog, indent=2, default=str),
+        grounded_facts_summary=grounded_facts_summary,
+    )
+
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(StartupDiagnosisSnapshotLLMOutput)
+
+    snapshot_output = None
+    last_error = None
+
+    for attempt in range(1, 3):
+        try:
+            logger.info("compose_startup_diagnosis | attempt %d | project_id=%s", attempt, project_id)
+            res: StartupDiagnosisSnapshotLLMOutput = structured_llm.invoke([
+                {"role": "system", "content": STARTUP_DIAGNOSIS_COMPOSER_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ])
+
+            # Apply deterministic guards
+            res_dict = res.model_dump()
+            res_dict["critical_assumption"] = ca_statement
+            res_dict["weak_link"] = weak_link
+            res_dict["weak_link_confidence"] = confidence
+            res_dict["competing_risks"] = res_dict.get("competing_risks", [])[:3] or competing_risks[:3]
+            res_dict["major_uncertainties"] = res_dict.get("major_uncertainties", [])[:5]
+
+            # Milestone 4.0.4: Filter execution constraints so unknown capabilities never appear as limitations
+            raw_constraints = res_dict.get("execution_constraints") or []
+            filtered_constraints = []
+            for c in raw_constraints:
+                c_str = str(c)
+                c_lower = c_str.lower()
+                # Check design capability
+                if any(w in c_lower for w in ["design", "ui", "ux", "designer"]):
+                    dc = exec_context.get("design_capability") or {}
+                    dc_val = dc.get("value") if isinstance(dc, dict) else getattr(dc, "value", None)
+                    dc_prov = dc.get("provenance") if isinstance(dc, dict) else getattr(dc, "provenance", "UNKNOWN")
+                    if dc_val is not False or dc_prov != "EXPLICIT":
+                        logger.info("compose_startup_diagnosis | omitting ungrounded design constraint: %s", c_str)
+                        continue
+                # Check marketing capability
+                if any(w in c_lower for w in ["marketing", "marketer", "gtm"]):
+                    mc = exec_context.get("marketing_capability") or {}
+                    mc_val = mc.get("value") if isinstance(mc, dict) else getattr(mc, "value", None)
+                    mc_prov = mc.get("provenance") if isinstance(mc, dict) else getattr(mc, "provenance", "UNKNOWN")
+                    if mc_val is not False or mc_prov != "EXPLICIT":
+                        logger.info("compose_startup_diagnosis | omitting ungrounded marketing constraint: %s", c_str)
+                        continue
+                # Check sales capability
+                if any(w in c_lower for w in ["sales", "selling"]):
+                    sc = exec_context.get("sales_capability") or {}
+                    sc_val = sc.get("value") if isinstance(sc, dict) else getattr(sc, "value", None)
+                    sc_prov = sc.get("provenance") if isinstance(sc, dict) else getattr(sc, "provenance", "UNKNOWN")
+                    if sc_val is not False or sc_prov != "EXPLICIT":
+                        logger.info("compose_startup_diagnosis | omitting ungrounded sales constraint: %s", c_str)
+                        continue
+                filtered_constraints.append(c_str)
+
+            snapshot = StartupDiagnosisSnapshot(
+                project_id=project_id,
+                iteration=iteration,
+                stage=res_dict.get("stage") or stage_name,
+                stage_explanation=res_dict.get("stage_explanation") or stage_explanation,
+                grounded_areas=res_dict.get("grounded_areas") or [s for s in what_supports[:3]],
+                current_advantages=res_dict.get("current_advantages") or [],
+                execution_constraints=filtered_constraints,
+                major_uncertainties=res_dict.get("major_uncertainties") or [reality_check.get("unresolved_uncertainty", "Market demand validation")],
+                weak_link=weak_link,
+                weak_link_reason=res_dict.get("weak_link_reason") or f"{weak_link} currently represents the primary bottleneck with highest decision risk.",
+                weak_link_confidence=confidence,
+                weak_link_confidence_explanation=res_dict.get("weak_link_confidence_explanation") or f"Confidence is {confidence} because several strategic areas have competing uncertainties.",
+                competing_risks=res_dict["competing_risks"],
+                reality_summary=res_dict.get("reality_summary") or rc_summary,
+                recommended_learning_goal=res_dict.get("recommended_learning_goal") or f"Validate whether the core {weak_link.lower()} friction exists repeatedly.",
+                critical_assumption=ca_statement,
+            )
+            snapshot_output = snapshot.model_dump()
+            break
+        except Exception as exc:
+            last_error = exc
+            logger.warning("compose_startup_diagnosis failed attempt %d: %s", attempt, exc)
+
+    if snapshot_output is None:
+        logger.warning("compose_startup_diagnosis: using deterministic fallback due to LLM error: %s", last_error)
+        fallback_snapshot = StartupDiagnosisSnapshot(
+            project_id=project_id,
+            iteration=iteration,
+            stage=stage_name,
+            stage_explanation=stage_explanation,
+            grounded_areas=[s for s in what_supports[:4]] or ["Initial founder concept described"],
+            current_advantages=[exec_context["customer_access"]["value"]] if exec_context.get("customer_access", {}).get("value") else [],
+            execution_constraints=[f"Team: {exec_context['team_size']['value']}"] if exec_context.get("team_size", {}).get("value") else ["Resource-constrained early team"],
+            major_uncertainties=[reality_check.get("unresolved_uncertainty", "Problem severity and customer behavior")],
+            weak_link=weak_link,
+            weak_link_reason=f"{weak_link} represents the most critical immediate uncertainty.",
+            weak_link_confidence=confidence,
+            weak_link_confidence_explanation=f"Confidence is {confidence} based on available evidence and competing risks.",
+            competing_risks=competing_risks[:3],
+            reality_summary=rc_summary or "Early problem indicators exist but remain unverified across broader customers.",
+            recommended_learning_goal=f"Determine whether target customers experience the {weak_link.lower()} friction.",
+            critical_assumption=ca_statement,
+        )
+        snapshot_output = fallback_snapshot.model_dump()
+
+    trace = AITrace(
+        module_name="compose_startup_diagnosis",
+        prompt_version=STARTUP_DIAGNOSIS_COMPOSER_PROMPT_VERSION,
+        input_data={
+            "weak_link": weak_link,
+            "confidence": confidence,
+            "stage": stage_name,
+        },
+        output_data={"snapshot_id": snapshot_output.get("id"), "weak_link": weak_link},
+        latency_ms=0,
+        project_id=project_id,
+    )
+    existing_traces = list(state.get("traces") or [])
+    existing_traces.append(trace.model_dump(mode="json"))
+
+    return {
+        "diagnosis_snapshot": snapshot_output,
+        "traces": existing_traces,
+        "last_trace": trace.model_dump(mode="json"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Milestone 3.2 Node 1: interpret_founder_turn (LLM)
+# ---------------------------------------------------------------------------
+
+def interpret_founder_turn(state: StartaryGraphState) -> dict:
+    """
+    LLM Node (Milestone 3.2): Interpret latest founder turn intent, questions, concerns,
+    corrections, and ability to act/answer separately from factual state extraction.
+    """
+    import json as _json
+
+    project_id = state.get("project_id", "<unknown>")
+    founder_messages = state.get("founder_messages") or []
+    pending_question = state.get("pending_question")
+    workflow_phase = str(state.get("phase", WorkflowPhase.UNDERSTAND))
+    interrupt_type = state.get("active_interrupt_type")
+    raw_context = state.get("raw_context") or ""
+    weak_link = state.get("weak_area")
+
+    # Find latest founder message
+    latest_founder_msg = ""
+    latest_turn_index = 0
+    for i, msg in enumerate(reversed(founder_messages)):
+        if msg.get("role") == "founder":
+            latest_founder_msg = (msg.get("content") or "").strip()
+            latest_turn_index = len(founder_messages) - 1 - i
+            break
+
+    # If no founder message yet, provide default initial turn interpretation
+    if not latest_founder_msg:
+        logger.info("interpret_founder_turn | no founder messages to interpret")
+        return {}
+
+    # Format recent history (last 3-6 turns)
+    recent_msgs = founder_messages[-6:]
+    recent_history_text = "\n".join(
+        f"[{m.get('role', 'unknown').capitalize()}] {m.get('content', '')}"
+        for m in recent_msgs
+    )
+
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(FounderTurnInterpretationLLMOutput)
+
+    user_msg = build_founder_turn_interpreter_user_message(
+        latest_founder_message=latest_founder_msg,
+        pending_question=pending_question,
+        recent_history_text=recent_history_text,
+        workflow_phase=workflow_phase,
+        interrupt_type=interrupt_type,
+        startup_summary=raw_context[:300],
+        weak_link=weak_link,
+    )
+
+    messages = [
+        {"role": "system", "content": FOUNDER_TURN_INTERPRETER_SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
+
+    attempt = 0
+    last_error: Exception | None = None
+    interpretation_dict: dict[str, Any] | None = None
+    t_start = time.monotonic()
+
+    while attempt < 2:
+        attempt += 1
+        try:
+            res: FounderTurnInterpretationLLMOutput = structured_llm.invoke(messages)
+            res_data = res.model_dump()
+
+            # Deterministic overrides for core safety & priority
+            msg_lower = latest_founder_msg.lower()
+            intent_types = list(res_data.get("intent_types") or [])
+
+            # 1. Direct question check
+            has_question = bool(res_data.get("direct_question")) or ("?" in latest_founder_msg)
+            if has_question and "QUESTION" not in intent_types:
+                intent_types.append("QUESTION")
+
+            # 2. Fear / Concern check
+            fear_keywords = ["fear", "scared", "worry", "worried", "concern", "risk", "waste", "hesitant", "doubt"]
+            has_concern = bool(res_data.get("concern_or_goal")) or any(k in msg_lower for k in fear_keywords)
+            if has_concern and "CONCERN" not in intent_types:
+                intent_types.append("CONCERN")
+
+            # 3. Correction check
+            correction_keywords = ["not the", "not my", "i'm not", "im not", "actually i", "wrong"]
+            is_correction = bool(res_data.get("correction")) or any(k in msg_lower for k in correction_keywords)
+            if is_correction and "CORRECTION" not in intent_types:
+                intent_types.append("CORRECTION")
+
+            # 4. Does not know check
+            dnk_keywords = ["i don't know", "i dont know", "dont know", "not sure", "no idea", "hard to say"]
+            is_dnk = bool(res_data.get("cannot_answer_now")) or any(k in msg_lower for k in dnk_keywords)
+            if is_dnk:
+                res_data["cannot_answer_now"] = True
+                if "DOES_NOT_KNOW" not in intent_types:
+                    intent_types.append("DOES_NOT_KNOW")
+
+            # 5. Cannot act now check
+            cannot_act_keywords = ["cannot make conversation", "cant talk", "cannot talk", "not today", "not right now", "cant do", "cannot do"]
+            is_cannot_act = bool(res_data.get("cannot_act_now")) or any(k in msg_lower for k in cannot_act_keywords)
+            if is_cannot_act:
+                res_data["cannot_act_now"] = True
+                if "CANNOT_ACT_NOW" not in intent_types:
+                    intent_types.append("CANNOT_ACT_NOW")
+
+            # 6. Already answered claim check (Milestone 3.2.1 Section 10)
+            already_answered_keywords = ["already answered", "already said", "already told you", "we talked about team", "already answered that", "already gave you that"]
+            is_already_ans = bool(res_data.get("is_already_answered_claim")) or any(k in msg_lower for k in already_answered_keywords)
+            if is_already_ans:
+                res_data["is_already_answered_claim"] = True
+                if "CORRECTION" not in intent_types:
+                    intent_types.append("CORRECTION")
+                res_data["response_priority"] = "HIGH"
+
+            # 7. Founder goal check (Milestone 3.2.1 Section 11/12)
+            detected_goal = res_data.get("detected_founder_goal")
+            if not detected_goal:
+                if any(k in msg_lower for k in ["find the right market", "find our market", "which market", "find the niche", "find initial market", "target market"]):
+                    detected_goal = "FIND_INITIAL_MARKET"
+                elif any(k in msg_lower for k in ["worth my time", "worth spending time", "should i continue", "worth to spend"]):
+                    detected_goal = "DECIDE_IF_WORTH_CONTINUING"
+                elif any(k in msg_lower for k in ["find customers", "get users", "reach customers"]):
+                    detected_goal = "FIND_CUSTOMERS"
+                elif any(k in msg_lower for k in ["validate problem", "is this a problem", "problem exists"]):
+                    detected_goal = "VALIDATE_PROBLEM"
+            if detected_goal:
+                res_data["detected_founder_goal"] = detected_goal
+
+            # Priority escalation: HIGH if question, concern, correction, inabilities, or claim
+            if has_question or has_concern or is_correction or is_cannot_act or is_dnk or is_already_ans:
+                res_data["response_priority"] = "HIGH"
+            elif not res_data.get("response_priority"):
+                res_data["response_priority"] = "NORMAL"
+
+            if not intent_types:
+                intent_types = ["ANSWER"]
+            res_data["intent_types"] = intent_types
+            if not res_data.get("interpretation_summary"):
+                res_data["interpretation_summary"] = f"Founder turn interpreted with {res_data.get('response_priority', 'NORMAL')} priority."
+            interpretation_dict = res_data
+            break
+        except Exception as exc:
+            last_error = exc
+            logger.warning("interpret_founder_turn failed attempt %d: %s", attempt, exc)
+
+    latency_ms = (time.monotonic() - t_start) * 1000
+
+    if interpretation_dict is None:
+        logger.warning("interpret_founder_turn: using deterministic fallback due to LLM error: %s", last_error)
+        msg_lower = latest_founder_msg.lower()
+        has_q = "?" in latest_founder_msg
+        has_fear = any(k in msg_lower for k in ["fear", "worry", "waste", "doubt"])
+        is_corr = any(k in msg_lower for k in ["not the", "not my", "i'm not", "already answered"])
+        is_dnk = any(k in msg_lower for k in ["i don't know", "dont know", "not sure"])
+        is_cna = any(k in msg_lower for k in ["cannot talk", "cant talk", "not right now"])
+
+        intents = ["ANSWER"]
+        if has_q: intents.append("QUESTION")
+        if has_fear: intents.append("CONCERN")
+        if is_corr: intents.append("CORRECTION")
+        if is_dnk: intents.append("DOES_NOT_KNOW")
+        if is_cna: intents.append("CANNOT_ACT_NOW")
+
+        priority = "HIGH" if (has_q or has_fear or is_corr or is_dnk or is_cna) else "NORMAL"
+        interpretation_dict = {
+            "intent_types": intents,
+            "direct_answer": True,
+            "direct_question": latest_founder_msg if has_q else None,
+            "concern_or_goal": "Founder expressed risk or hesitation" if has_fear else None,
+            "correction": "Founder corrected previous assumption" if is_corr else None,
+            "cannot_answer_now": is_dnk,
+            "cannot_act_now": is_cna,
+            "uncertainty_statement": None,
+            "new_evidence_summary": None,
+            "founder_preference_or_constraint": None,
+            "response_priority": priority,
+            "interpretation_summary": f"Fallback interpretation: founder provided input with {priority} response priority.",
+        }
+
+    # Wrap in domain model
+    domain_interpretation = FounderTurnInterpretation(
+        project_id=project_id,
+        turn_index=latest_turn_index,
+        **interpretation_dict,
+    )
+    interpretation_output = domain_interpretation.model_dump()
+
+    trace = AITrace(
+        module_name="interpret_founder_turn",
+        prompt_version=FOUNDER_TURN_INTERPRETER_PROMPT_VERSION,
+        input_data={
+            "latest_founder_message": latest_founder_msg[:100],
+            "pending_question": pending_question[:100] if pending_question else None,
+        },
+        output_data={
+            "intent_types": interpretation_output.get("intent_types"),
+            "response_priority": interpretation_output.get("response_priority"),
+        },
+        latency_ms=latency_ms,
+        project_id=project_id,
+    )
+    existing_traces = list(state.get("traces") or [])
+    existing_traces.append(trace.model_dump(mode="json"))
+
+    updates = {
+        "latest_founder_turn_interpretation": interpretation_output,
+        "traces": existing_traces,
+        "last_trace": trace.model_dump(mode="json"),
+    }
+
+    if interpretation_output.get("concern_or_goal"):
+        updates["founder_current_concern"] = interpretation_output["concern_or_goal"]
+    if interpretation_output.get("cannot_act_now"):
+        updates["cannot_act_now_context"] = True
+    if interpretation_output.get("correction"):
+        corrections = list(state.get("recent_corrections") or [])
+        corrections.append(interpretation_output["correction"])
+        updates["recent_corrections"] = corrections
+
+    # Goal persistence (Milestone 3.2.1 Section 11/12)
+    detected_goal_str = interpretation_dict.get("detected_founder_goal")
+    if detected_goal_str:
+        try:
+            goal_enum = FounderGoalType(detected_goal_str)
+        except ValueError:
+            goal_enum = FounderGoalType.OTHER
+        updates["founder_current_goal"] = {
+            "goal_type": goal_enum.value,
+            "raw_statement": latest_founder_msg,
+            "turn_acquired": latest_turn_index,
+            "is_active": True,
+        }
+    elif state.get("founder_current_goal"):
+        updates["founder_current_goal"] = state["founder_current_goal"]
+
+    logger.info(
+        "interpret_founder_turn | priority=%s intents=%s goal=%s",
+        interpretation_output.get("response_priority"),
+        interpretation_output.get("intent_types"),
+        (updates.get("founder_current_goal") or {}).get("goal_type"),
+    )
+    return updates
+
+
+# ---------------------------------------------------------------------------
+# Milestone 3.2 Node 2: compose_advisor_response (LLM — Milestone 3.2.1 Patched)
+# ---------------------------------------------------------------------------
+
+def compose_advisor_response(state: StartaryGraphState) -> dict:
+    """
+    LLM Node (Milestone 3.2 & 3.2.1): Compose empathetic, grounded, conversational advisor response.
+    The planner's NextTurnDecision is the SOLE AUTHORITY for what information Startary needs next.
+    The composer determines only HOW that decision is communicated.
+
+    Guarantees:
+    - Enforces semantic-target matching (res.next_question_target == decision.information_target).
+    - Enforces question_id matching (res.question_id == decision.question_id).
+    - Retries once on validation mismatch; falls back to deterministic text if retry fails.
+    - Sets intro_summary_shown = True so startup summary appears only once.
+    """
+    import json as _json
+
+    project_id = state.get("project_id", "<unknown>")
+    interpretation = state.get("latest_founder_turn_interpretation") or {}
+    founder_messages = state.get("founder_messages") or []
+    workflow_phase = str(state.get("phase", WorkflowPhase.UNDERSTAND))
+    raw_context = state.get("raw_context") or ""
+    weak_link = state.get("weak_area")
+    reality_check = state.get("reality_check") or {}
+    diagnosis = state.get("diagnosis") or {}
+
+    # Sole authority: active_next_turn_decision
+    active_decision = state.get("active_next_turn_decision")
+    if not active_decision:
+        # Fallback for backward compatibility or direct calls
+        active_type = state.get("active_interrupt_type") or "strategic"
+        if active_type == "baseline" and state.get("current_baseline_question"):
+            q_dict = state["current_baseline_question"]
+        elif active_type == "weak_link" and state.get("current_weak_link_question"):
+            q_dict = state["current_weak_link_question"]
+        else:
+            q_dict = state.get("current_clarifying_question") or {}
+        raw_q = q_dict.get("question")
+        if not raw_q:
+            exec_ctx = state.get("execution_context") or {}
+            prog = state.get("startup_progress") or {}
+            team_val = exec_ctx.get("team_size")
+            team_known = bool(team_val and (team_val.get("provenance") if isinstance(team_val, dict) else getattr(team_val, "provenance", None)) not in (None, "UNKNOWN"))
+            mvp_val = prog.get("mvp_exists")
+            mvp_known = bool(mvp_val and (mvp_val.get("provenance") if isinstance(mvp_val, dict) else getattr(mvp_val, "provenance", None)) not in (None, "UNKNOWN"))
+
+            gap_plan = state.get("gap_plan") or {}
+            missing_info = gap_plan.get("missing_information") or gap_plan.get("information_goal")
+
+            if team_known or mvp_known:
+                if missing_info:
+                    raw_q = f"Could you share more detail regarding {missing_info}?"
+                else:
+                    raw_q = "Could you tell me more about how potential customers currently handle this problem?"
+            else:
+                raw_q = "Could you describe your team, current product status, and testing so far?"
+
+        tgt = q_dict.get("target_group") or q_dict.get("target_area") or "Context"
+        active_decision = NextTurnDecision(
+            question_id=f"q_compat_{uuid.uuid4().hex[:6]}",
+            source_phase=WorkflowPhase.UNDERSTAND,
+            information_target=str(tgt),
+            canonical_question=raw_q,
+            should_ask_question=True,
+        ).model_dump()
+
+    canonical_question = active_decision.get("canonical_question") or "Could you provide more context about your startup?"
+    information_target = active_decision.get("information_target") or "Context"
+    question_id = active_decision.get("question_id") or f"q_{uuid.uuid4().hex[:6]}"
+
+    # Conversational state: goal & intro summary gate
+    founder_goal_dict = state.get("founder_current_goal") or {}
+    founder_current_goal = founder_goal_dict.get("raw_statement")
+    intro_summary_shown = bool(state.get("intro_summary_shown", False))
+
+    # Latest founder message
+    latest_founder_msg = ""
+    for msg in reversed(founder_messages):
+        if msg.get("role") == "founder":
+            latest_founder_msg = msg.get("content", "")
+            break
+
+    # Format recent history
+    recent_msgs = founder_messages[-6:]
+    recent_history_text = "\n".join(
+        f"[{m.get('role', 'unknown').capitalize()}] {m.get('content', '')}"
+        for m in recent_msgs
+    )
+
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(AdvisorResponseLLMOutput)
+
+    # Milestone 4.0.4: Deterministically determine conversational response mode
+    response_mode = determine_conversational_response_mode(
+        state=state,
+        founder_interpretation=interpretation,
+        founder_turn=latest_founder_msg,
+        previous_state=state.get("_previous_state"),
+    )
+
+    user_msg = build_advisor_response_composer_user_message(
+        latest_founder_message=latest_founder_msg or "[Initial entry]",
+        founder_interpretation_json=_json.dumps(interpretation, indent=2, default=str),
+        recent_history_text=recent_history_text,
+        canonical_question=canonical_question,
+        information_target=information_target,
+        question_id=question_id,
+        founder_current_goal=founder_current_goal,
+        intro_summary_shown=intro_summary_shown,
+        startup_summary=raw_context[:300],
+        diagnosis_summary=diagnosis.get("summary", "")[:300] if isinstance(diagnosis, dict) else "",
+        weak_link=weak_link,
+        reality_check_summary=reality_check.get("summary"),
+        workflow_phase=workflow_phase,
+        response_mode=response_mode.value,
+    )
+
+    messages = [
+        {"role": "system", "content": ADVISOR_RESPONSE_COMPOSER_SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
+
+    attempt = 0
+    last_error: Exception | None = None
+    advisor_output: dict[str, Any] | None = None
+    t_start = time.monotonic()
+
+    while attempt < 2:
+        attempt += 1
+        try:
+            res: AdvisorResponseLLMOutput = structured_llm.invoke(messages)
+            res_dict = res.model_dump()
+
+            # Target & Token Validation (Milestone 3.2.1 Section 4 & 7)
+            has_active_decision = bool(state.get("active_next_turn_decision"))
+            target_matches = (res_dict.get("next_question_target") == information_target)
+            qid_matches = (res_dict.get("question_id") == question_id) if has_active_decision else True
+
+            if not (target_matches and qid_matches):
+                logger.warning(
+                    "compose_advisor_response validation mismatch: expected (target=%s, qid=%s), got (target=%s, qid=%s). Retrying with correction.",
+                    information_target, question_id, res_dict.get("next_question_target"), res_dict.get("question_id"),
+                )
+                retry_messages = [
+                    {"role": "system", "content": ADVISOR_RESPONSE_COMPOSER_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                    {"role": "assistant", "content": _json.dumps(res_dict)},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"VALIDATION FAILURE: Your output changed the information target or question_id.\n"
+                            f"You MUST set question_id='{question_id}' and next_question_target='{information_target}'.\n"
+                            f"Preserve the exact semantic goal of the planner's canonical question: '{canonical_question}'."
+                        ),
+                    },
+                ]
+                try:
+                    retry_res: AdvisorResponseLLMOutput = structured_llm.invoke(retry_messages)
+                    retry_dict = retry_res.model_dump()
+                    if retry_dict.get("next_question_target") == information_target and retry_dict.get("question_id") == question_id:
+                        res_dict = retry_dict
+                    else:
+                        raise ValueError(f"Retry still mismatched target: {retry_dict.get('next_question_target')}")
+                except Exception as exc:
+                    logger.warning("compose_advisor_response retry failed: %s", exc)
+                    advisor_output = None
+                    break
+
+            text = (res_dict.get("response_text") or "").strip()
+            if not text:
+                parts = [p for p in [res_dict.get("acknowledge"), res_dict.get("answer_to_founder"), res_dict.get("diagnosis_delta"), res_dict.get("next_question_rephrased") or canonical_question] if p]
+                text = " ".join(parts)
+                res_dict["response_text"] = text
+
+            advisor_output = res_dict
+            break
+        except Exception as exc:
+            last_error = exc
+            logger.warning("compose_advisor_response failed attempt %d: %s", attempt, exc)
+
+    latency_ms = (time.monotonic() - t_start) * 1000
+
+    # Deterministic Fallback (Milestone 3.2.1 Section 23)
+    if advisor_output is None:
+        logger.warning("compose_advisor_response: using deterministic fallback (target=%s, qid=%s)", information_target, question_id)
+        has_direct_q = bool(interpretation.get("direct_question"))
+        has_concern = bool(interpretation.get("concern_or_goal"))
+        has_corr = bool(interpretation.get("correction"))
+        is_already_answered = bool(interpretation.get("is_already_answered_claim"))
+
+        if is_already_answered or has_corr:
+            fallback_text = f"You're right—thank you for keeping me aligned. {canonical_question}"
+        elif response_mode == ConversationalResponseMode.DIRECT_ANSWER or has_direct_q:
+            fallback_text = f"Not yet — that is the key question to test. {canonical_question}"
+        elif response_mode == ConversationalResponseMode.CONCERN_RESPONSE or has_concern:
+            fallback_text = f"That concern makes complete sense. To evaluate it, {canonical_question}"
+        elif response_mode == ConversationalResponseMode.BRIEF_CONTINUE:
+            fallback_text = f"Got it. {canonical_question}"
+        else:
+            fallback_text = f"Understood. {canonical_question}"
+
+        advisor_output = {
+            "question_id": question_id,
+            "next_question_target": information_target,
+            "next_question_rephrased": canonical_question,
+            "next_question": canonical_question,
+            "acknowledge": "Got it." if response_mode == ConversationalResponseMode.BRIEF_CONTINUE else "Understood.",
+            "answer_to_founder": None,
+            "diagnosis_delta": None,
+            "should_ask_next_question": True,
+            "response_mode": response_mode.value,
+            "response_text": fallback_text,
+        }
+
+    # Ensure compatibility fields
+    if "next_question" not in advisor_output:
+        advisor_output["next_question"] = advisor_output.get("next_question_rephrased") or canonical_question
+
+    domain_response = AdvisorResponse(
+        project_id=project_id,
+        turn_index=state.get("clarification_turn_count", 0),
+        **advisor_output,
+    )
+    final_output = domain_response.model_dump()
+
+    trace = AITrace(
+        module_name="compose_advisor_response",
+        prompt_version=ADVISOR_RESPONSE_COMPOSER_PROMPT_VERSION,
+        input_data={
+            "question_id": question_id,
+            "information_target": information_target,
+            "has_founder_question": bool(interpretation.get("direct_question")),
+            "priority": interpretation.get("response_priority"),
+        },
+        output_data={
+            "question_id": final_output.get("question_id"),
+            "next_question_target": final_output.get("next_question_target"),
+            "response_text": final_output.get("response_text")[:100],
+            "should_ask_next_question": final_output.get("should_ask_next_question"),
+        },
+        latency_ms=latency_ms,
+        project_id=project_id,
+    )
+    existing_traces = list(state.get("traces") or [])
+    existing_traces.append(trace.model_dump(mode="json"))
+
+    logger.info("compose_advisor_response | qid=%s target=%s response_text=%s", question_id, information_target, final_output.get("response_text")[:60])
+    return {
+        "latest_advisor_response": final_output,
+        "intro_summary_shown": True,
+        "traces": existing_traces,
+        "last_trace": trace.model_dump(mode="json"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Milestone 4 Nodes: Evidence Intake, Evidence Analysis & Re-Diagnosis Loop
+# ---------------------------------------------------------------------------
+
+def compose_execution_handoff(state: StartaryGraphState) -> dict:
+    """
+    Deterministic Node (Milestone 4.0.3 & 4.0.5):
+    Composes a clear, founder-facing ExecutionHandoff object from the accepted
+    experiment, critical assumption, and founder constraints before pausing for evidence.
+    Creates both compact (default) and full methodology renderings and populates FounderExperimentSummary.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    active_exp = dict(state.get("active_experiment") or {})
+    active_asmp = state.get("active_assumption") or state.get("active_critical_assumption") or {}
+    snapshot = state.get("diagnosis_snapshot") or {}
+
+    exp_id = active_exp.get("id") or str(uuid.uuid4())
+    asmp_id = active_exp.get("assumption_id") or active_asmp.get("id") or "asmp-unknown"
+    exp_type = active_exp.get("experiment_type") or "CUSTOMER_INTERVIEWS"
+    learning_goal = active_exp.get("objective") or active_asmp.get("learning_goal") or "Validate critical assumption with real-world feedback"
+    what_testing = active_exp.get("hypothesis") or active_asmp.get("statement") or "Critical assumption under test"
+
+    actions = list(active_exp.get("founder_actions") or [])
+    target = active_exp.get("target_participants_or_scope") or active_exp.get("target_participants_or_context") or ""
+    if not target or target.lower() in ["target customer cohort", "cohort", "none"]:
+        target = "Qualifying target stores or users"
+    evidence_to_collect = active_exp.get("evidence_to_collect") or "Customer feedback, observed behaviors, quotes, and concrete counts"
+    support_signal = active_exp.get("support_signal") or ""
+    contradiction_signal = active_exp.get("contradiction_signal") or ""
+    inconclusive_signal = active_exp.get("inconclusive_signal") or ""
+
+    do_nots = []
+    for ii in active_exp.get("invalid_inferences") or []:
+        do_nots.append(f"Do not treat early exploratory feedback as proving: {ii}")
+
+    summary = compose_founder_experiment_summary(
+        experiment=active_exp,
+        assumption=active_asmp,
+        state=state,
+        diagnosis_snapshot=snapshot,
+    )
+
+    crit_asmp_stmt = (active_asmp or {}).get("statement") or summary.critical_assumption
+
+    handoff = ExecutionHandoff(
+        experiment_id=exp_id,
+        assumption_id=asmp_id,
+        critical_assumption=crit_asmp_stmt,
+        experiment_type=exp_type,
+        learning_goal=learning_goal,
+        what_we_are_testing=what_testing,
+        founder_actions=actions,
+        target_participants_or_context=target,
+        evidence_to_collect=evidence_to_collect,
+        support_signal=support_signal,
+        contradiction_signal=contradiction_signal,
+        inconclusive_signal=inconclusive_signal,
+        important_constraints=do_nots,
+        valid_inferences=list(active_exp.get("valid_inferences") or []),
+        invalid_inferences=list(active_exp.get("invalid_inferences") or []),
+        completion_instruction=(
+            "Return to Startary and tell me what actually happened. "
+            "You can also ask me to explain the experiment or tell me if something blocks you."
+        ),
+        summary=summary,
+    )
+    compact_text = render_execution_handoff_text(handoff, mode="compact")
+    full_text = render_execution_handoff_text(handoff, mode="full")
+    handoff.response_text = compact_text
+    handoff.full_response_text = full_text
+
+    logger.info(
+        "execution_handoff_created | experiment_id=%s assumption_id=%s compact_len=%d full_len=%d",
+        exp_id, asmp_id, len(compact_text), len(full_text),
+    )
+
+    return {
+        "active_execution_handoff": handoff.model_dump(),
+        "execution_handoff_text": compact_text,
+    }
+
+
+def wait_for_evidence(state: StartaryGraphState) -> dict:
+    """
+    LangGraph Interrupt Node (Milestone 4.0.3):
+    Marks active experiment IN_PROGRESS, sets phase to WAITING_FOR_EVIDENCE,
+    and pauses execution waiting for real-world founder evidence.
+    Displays the execution handoff (or advisor response) and never renders None.
+    """
+    exp = dict(state.get("active_experiment") or {})
+    exp["status"] = ExperimentStatus.IN_PROGRESS.value
+    project_id = state.get("project_id", "<unknown>")
+    iteration = state.get("iteration", 1)
+
+    handoff_dict = state.get("active_execution_handoff") or {}
+    handoff_text = handoff_dict.get("response_text") or state.get("execution_handoff_text")
+    waiting_response = state.get("waiting_response")
+
+    if waiting_response:
+        prompt_text = str(waiting_response)
+    elif handoff_text:
+        prompt_text = str(handoff_text)
+    else:
+        prompt_text = render_execution_handoff_text(exp)
+
+    post_ans = state.get("post_evidence_answer")
+    if post_ans:
+        prompt_text = f"{post_ans}\n\n{prompt_text}"
+
+    logger.info(
+        "wait_for_evidence | project_id=%s iteration=%d experiment_id=%s prompt_len=%d (interrupt)",
+        project_id, iteration, exp.get("id"), len(prompt_text),
+    )
+
+    founder_input = interrupt({
+        "type": "WAITING_FOR_EVIDENCE",
+        "interrupt_type": "waiting_for_evidence",
+        "message": prompt_text,
+        "question": prompt_text,
+        "handoff_text": prompt_text,
+        "execution_handoff": handoff_dict,
+        "experiment_id": exp.get("id"),
+        "assumption_id": exp.get("assumption_id"),
+        "iteration": iteration,
+    })
+
+    raw_evidence = ""
+    if isinstance(founder_input, dict):
+        raw_evidence = founder_input.get("founder_response") or founder_input.get("content") or ""
+    elif isinstance(founder_input, str):
+        raw_evidence = founder_input
+    if not raw_evidence and state.get("founder_response"):
+        raw_evidence = str(state.get("founder_response"))
+
+    founder_messages = list(state.get("founder_messages") or [])
+    if raw_evidence:
+        founder_messages.append({"role": "founder", "content": raw_evidence})
+
+    return {
+        "active_experiment": exp,
+        "phase": WorkflowPhase.WAITING_FOR_EVIDENCE,
+        "founder_response": raw_evidence,
+        "founder_messages": founder_messages,
+        "waiting_response": None,
+        "post_evidence_answer": None,
+        "evidence_turn_assessment": None,
+        "pending_post_evidence_question": None,
+    }
+
+
+def pause_needs_help(state: StartaryGraphState) -> dict:
+    """
+    Deterministic Node (Milestone 4):
+    Gracefully pauses if the experiment is valid but founder lacks requirements.
+    """
+    can_exec = state.get("can_execute_result") or {}
+    missing = can_exec.get("missing_requirements") or []
+    missing_str = "; ".join(missing) if missing else "Required assets or customer access are missing."
+    msg = f"Experiment cannot run yet. Missing requirement: {missing_str}. When you have obtained access or are ready to continue, let me know."
+    logger.info("pause_needs_help | %s", msg)
+    return {
+        "status_message": msg,
+        "phase": WorkflowPhase.TEST,
+    }
+
+
+def classify_waiting_for_evidence_turn(state: StartaryGraphState) -> dict:
+    """
+    Structured Admission Gate Node (Milestone 4.0.3):
+    Classifies founder turn submitted during WAITING_FOR_EVIDENCE to verify whether
+    actual completed execution results exist before allowing access to Evidence Extractor / Analyzer.
+    Applies deterministic guards to prevent non-evidence questions and promises from being analyzed.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    raw_message = state.get("founder_response") or ""
+    if not raw_message:
+        founder_messages = state.get("founder_messages") or []
+        for m in reversed(founder_messages):
+            if m.get("role") == "founder":
+                raw_message = m.get("content", "")
+                break
+
+    active_exp = state.get("active_experiment") or {}
+    active_asmp = state.get("active_assumption") or state.get("active_critical_assumption") or {}
+    asmp_text = active_asmp.get("statement", "")
+    exp_summary = (
+        f"Type: {active_exp.get('experiment_type')}\n"
+        f"Goal: {active_exp.get('objective')}\n"
+        f"Actions: {active_exp.get('founder_actions')}\n"
+        f"Target: {active_exp.get('target_participants_or_scope')}\n"
+        f"Support Signal: {active_exp.get('support_signal')}\n"
+        f"Contradiction Signal: {active_exp.get('contradiction_signal')}"
+    )
+    turn_interpretation = state.get("latest_founder_turn_interpretation") or {}
+    interpretation_json = json.dumps(turn_interpretation, indent=2, default=str)
+
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(EvidenceTurnAssessmentLLMOutput)
+
+    user_msg = build_evidence_admission_gate_user_message(
+        founder_message=raw_message,
+        active_experiment_summary=exp_summary,
+        active_assumption_text=asmp_text,
+        latest_interpretation_json=interpretation_json,
+    )
+    messages = [
+        {"role": "system", "content": EVIDENCE_ADMISSION_GATE_SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
+
+    llm_assessment = None
+    attempt = 0
+    while attempt < 2:
+        attempt += 1
+        try:
+            res: EvidenceTurnAssessmentLLMOutput = structured_llm.invoke(messages)
+            llm_assessment = res
+            break
+        except Exception as exc:
+            logger.warning("classify_waiting_for_evidence_turn attempt %d failed: %s", attempt, exc)
+
+    msg_lower = raw_message.lower().strip()
+
+    # Deterministic signals
+    is_question_only = any(
+        phrase in msg_lower
+        for phrase in [
+            "what should i do", "then what should i do", "what do i do now",
+            "what next", "can you explain", "i don't understand", "im confused",
+            "why should i", "can you show me", "what should i ask"
+        ]
+    )
+    is_help_only = any(
+        phrase in msg_lower
+        for phrase in [
+            "how do i find", "how to find", "where do i find", "who do i talk to",
+            "can i only talk to"
+        ]
+    )
+    is_future_only = any(
+        phrase in msg_lower
+        for phrase in [
+            "i will do it", "i will interview", "i will talk", "ill do it",
+            "tomorrow", "going to start", "haven't started", "have not started",
+            "haven't done", "not yet"
+        ]
+    )
+    is_cannot_execute = any(
+        phrase in msg_lower
+        for phrase in [
+            "i can't find any", "cannot find any", "unable to find",
+            "no longer allows", "cannot run this", "cant run this"
+        ]
+    )
+    action_verbs = [
+        "interviewed", "spoke to", "spoke with", "talked to", "talked with",
+        "messaged", "sent", "contacted", "reached out", "ran the", "tested",
+        "tried contacting", "tried it", "asked", "showed", "visited",
+        "completed the interviews", "completed interviews", "finished the interviews",
+        "done with interviews", "finished interviews", "completed the calls", "finished the calls",
+    ]
+    has_action_verb = any(v in msg_lower for v in action_verbs)
+    has_count = any(c in msg_lower for c in ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "15", "20", "50", "one", "two", "three", "four", "five", "six"])
+    has_results_words = any(w in msg_lower for w in ["said", "replied", "answered", "agreed", "rejected", "result", "found that", "nobody replied", "loss", "pain", "stockout", "waste"])
+
+    has_completed_action = has_action_verb or (has_count and has_results_words)
+
+    if llm_assessment:
+        disp_str = llm_assessment.disposition.upper().strip()
+        try:
+            final_disp = EvidenceTurnDisposition(disp_str)
+        except ValueError:
+            final_disp = EvidenceTurnDisposition.AMBIGUOUS
+        has_completed_action = llm_assessment.contains_completed_external_action or has_completed_action
+        has_results = llm_assessment.contains_results or has_results_words
+        is_future = llm_assessment.contains_only_future_intent or is_future_only
+        asks_help = llm_assessment.asks_for_help or is_help_only
+        asks_expl = llm_assessment.asks_for_explanation or is_question_only
+        cannot_exec = llm_assessment.cannot_execute or is_cannot_execute
+        candidate_text = llm_assessment.evidence_candidate_text
+        rationale = llm_assessment.rationale_summary
+    else:
+        if has_completed_action:
+            final_disp = EvidenceTurnDisposition.ACTUAL_EVIDENCE
+            rationale = "Deterministic fallback: detected completed action and observation signals."
+        elif is_help_only:
+            final_disp = EvidenceTurnDisposition.REQUEST_FOR_EXECUTION_HELP
+            rationale = "Deterministic fallback: founder asking how to execute or find participants."
+        elif is_question_only:
+            final_disp = EvidenceTurnDisposition.QUESTION_ABOUT_EXPERIMENT
+            rationale = "Deterministic fallback: founder asking what to do or about the experiment."
+        elif is_future_only:
+            final_disp = EvidenceTurnDisposition.FUTURE_INTENTION
+            rationale = "Deterministic fallback: founder stating future intention."
+        elif is_cannot_execute:
+            final_disp = EvidenceTurnDisposition.CANNOT_EXECUTE
+            rationale = "Deterministic fallback: founder stating inability to execute."
+        else:
+            final_disp = EvidenceTurnDisposition.AMBIGUOUS
+            rationale = "Deterministic fallback: ambiguous turn."
+        has_results = has_results_words
+        is_future = is_future_only
+        asks_help = is_help_only
+        asks_expl = is_question_only
+        cannot_exec = is_cannot_execute
+        candidate_text = raw_message if has_completed_action else None
+
+    # CRITICAL DETERMINISTIC OVERRIDE:
+    if is_future_only or is_future:
+        if (is_question_only or asks_expl) and not any(w in msg_lower for w in ["tomorrow", "will ", "ill ", "going to"]):
+            final_disp = EvidenceTurnDisposition.QUESTION_ABOUT_EXPERIMENT
+            rationale += " [Overridden: question/explanation request]."
+        else:
+            final_disp = EvidenceTurnDisposition.FUTURE_INTENTION
+            rationale += " [Overridden: future intention expressed]."
+        has_completed_action = False
+    elif final_disp == EvidenceTurnDisposition.ACTUAL_EVIDENCE and not has_completed_action:
+        if is_question_only or asks_expl:
+            final_disp = EvidenceTurnDisposition.QUESTION_ABOUT_EXPERIMENT
+            rationale += " [Overridden: no completed action detected, treated as question]."
+        elif is_help_only or asks_help:
+            final_disp = EvidenceTurnDisposition.REQUEST_FOR_EXECUTION_HELP
+            rationale += " [Overridden: no completed action detected, treated as help request]."
+        elif is_cannot_execute or cannot_exec:
+            final_disp = EvidenceTurnDisposition.CANNOT_EXECUTE
+            rationale += " [Overridden: no completed action detected, treated as cannot execute]."
+        else:
+            final_disp = EvidenceTurnDisposition.AMBIGUOUS
+            rationale += " [Overridden: no completed action detected, treated as ambiguous]."
+
+    # Mixed message check: if message contains completed action AND is not future intent, admit evidence!
+    if has_completed_action and not (is_future_only or is_future):
+        final_disp = EvidenceTurnDisposition.ACTUAL_EVIDENCE
+        if is_question_only or asks_expl or asks_help:
+            rationale += " [Admitted: mixed submission with completed action and question]."
+
+    admitted = (final_disp == EvidenceTurnDisposition.ACTUAL_EVIDENCE)
+
+    logger.info(
+        "evidence_turn_classified | disposition=%s admitted=%s",
+        final_disp.value, admitted,
+    )
+    if not admitted:
+        logger.info("evidence_admission_rejected | reason=%s", rationale)
+
+    # Mixed-intent preservation: detect and preserve questions in admitted evidence turns (Milestone 4.0.7)
+    pending_q = None
+    if admitted:
+        has_question = (
+            "?" in raw_message
+            or is_question_only
+            or asks_expl
+            or asks_help
+            or any(
+                phrase in msg_lower
+                for phrase in [
+                    "what should i do", "what do you think", "what next", "what now",
+                    "what to do", "what do i do", "where do we go", "is this enough",
+                    "how should i", "next step", "what's next", "whats next"
+                ]
+            )
+        )
+        if has_question:
+            import re
+            sentences = [s.strip() for s in re.split(r"[\n.!?]+", raw_message) if s.strip()]
+            q_candidates = [
+                s for s in sentences
+                if any(w in s.lower() for w in ["what", "how", "should", "think", "next", "enough", "do", "where"])
+                and not any(w in s.lower() for w in ["interviewed", "spoke with", "talked with", "stockout", "shops"])
+            ]
+            if q_candidates:
+                pending_q = q_candidates[-1].strip() + ("?" if not q_candidates[-1].endswith("?") else "")
+            else:
+                pending_q = "What should I do next?"
+            logger.info("mixed_evidence_question_preserved | has_question=true question=%s", pending_q)
+
+    assessment = EvidenceTurnAssessment(
+        disposition=final_disp,
+        contains_completed_external_action=has_completed_action,
+        contains_results=has_results,
+        contains_only_future_intent=is_future,
+        asks_for_help=asks_help,
+        asks_for_explanation=asks_expl,
+        cannot_execute=cannot_exec,
+        evidence_candidate_text=candidate_text,
+        rationale_summary=rationale,
+    )
+
+    return {
+        "evidence_turn_assessment": assessment.model_dump(mode="json"),
+        "pending_post_evidence_question": pending_q,
+    }
+
+
+def respond_to_waiting_founder(state: StartaryGraphState) -> dict:
+    """
+    Conversational Advisor Node (Milestone 4.0.3 & 4.0.7):
+    Responds conversationally to non-evidence messages received during WAITING_FOR_EVIDENCE.
+    Explains the accepted experiment, offers execution help, acknowledges future plans,
+    or handles blockers without completing the experiment or mutating assumption status.
+    Architecture rule (Milestone 4.0.7):
+    Evidence Admission Gate decides WHAT the turn is.
+    Advisor decides HOW to respond.
+    This node MUST NOT reclassify or overwrite ACTUAL_EVIDENCE.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    disp = get_evidence_turn_disposition(state)
+    disposition = disp.value if disp else "QUESTION_ABOUT_EXPERIMENT"
+    raw_message = state.get("founder_response") or state.get("founder_turn") or ""
+
+    # Invariant (Milestone 4.0.7): If ACTUAL_EVIDENCE reached here unexpectedly, do NOT reclassify as question
+    if disp == EvidenceTurnDisposition.ACTUAL_EVIDENCE:
+        logger.warning("respond_to_waiting_founder | disposition=ACTUAL_EVIDENCE reached unexpectedly; preserving evidence")
+        reply_text = "I have received your experiment results. Processing and analyzing the findings now."
+        founder_messages = list(state.get("founder_messages") or [])
+        founder_messages.append({"role": "assistant", "content": reply_text})
+        return {
+            "waiting_response": reply_text,
+            "founder_messages": founder_messages,
+            "phase": WorkflowPhase.WAITING_FOR_EVIDENCE,
+        }
+
+    handoff_dict = state.get("active_execution_handoff") or {}
+    handoff_text = handoff_dict.get("response_text") or state.get("execution_handoff_text") or ""
+    active_exp = state.get("active_experiment") or {}
+    active_asmp = state.get("active_assumption") or state.get("active_critical_assumption") or {}
+    asmp_text = active_asmp.get("statement", "")
+
+    msg_lower = raw_message.lower()
+
+    # Fallback Learning Action Handling (Milestone 4.0.6)
+    fallback_dict = state.get("fallback_learning_action") or {}
+    is_fallback_mode = (
+        state.get("learning_input_mode") == "FALLBACK"
+        or bool(fallback_dict)
+        or state.get("phase") == WorkflowPhase.WAITING_FOR_LEARNING_INPUT
+    )
+
+    if is_fallback_mode and fallback_dict:
+        if any(p in msg_lower for p in ["who should i talk to", "who to talk to", "who do i talk to", "who to engage"]):
+            who = fallback_dict.get("who_to_engage", "target participants")
+            reply_text = (
+                f"For this learning action, engage: {who}.\n\n"
+                f"Focus on speaking with people who experience the problem directly in their day-to-day operations."
+            )
+            founder_messages = list(state.get("founder_messages") or [])
+            founder_messages.append({"role": "assistant", "content": reply_text})
+            return {
+                "waiting_response": reply_text,
+                "founder_messages": founder_messages,
+                "phase": state.get("phase", WorkflowPhase.WAITING_FOR_LEARNING_INPUT),
+            }
+
+        if any(p in msg_lower for p in ["can i start with 3", "start with 3", "fewer shops", "can i do fewer", "start small"]):
+            reply_text = (
+                "Yes, absolutely. Starting with 2–3 conversations is an excellent way to pilot the questions, "
+                "reconstruct initial incidents, and refine your approach before completing the full set of 5–8."
+            )
+            founder_messages = list(state.get("founder_messages") or [])
+            founder_messages.append({"role": "assistant", "content": reply_text})
+            return {
+                "waiting_response": reply_text,
+                "founder_messages": founder_messages,
+                "phase": state.get("phase", WorkflowPhase.WAITING_FOR_LEARNING_INPUT),
+            }
+
+        if any(p in msg_lower for p in ["what questions", "what should i ask", "what to ask", "exact questions"]):
+            questions = fallback_dict.get("what_to_ask_or_observe") or []
+            q_str = "\n".join(f"- {q}" for q in questions)
+            reply_text = f"Here are the specific questions to ask in each conversation:\n\n{q_str}"
+            founder_messages = list(state.get("founder_messages") or [])
+            founder_messages.append({"role": "assistant", "content": reply_text})
+            return {
+                "waiting_response": reply_text,
+                "founder_messages": founder_messages,
+                "phase": state.get("phase", WorkflowPhase.WAITING_FOR_LEARNING_INPUT),
+            }
+
+        if any(p in msg_lower for p in ["what should i bring back", "what to bring back", "what to bring"]):
+            bring = fallback_dict.get("what_to_bring_back") or []
+            b_str = "\n".join(f"- {b}" for b in bring)
+            reply_text = f"Here is what to record and bring back:\n\n{b_str}"
+            founder_messages = list(state.get("founder_messages") or [])
+            founder_messages.append({"role": "assistant", "content": reply_text})
+            return {
+                "waiting_response": reply_text,
+                "founder_messages": founder_messages,
+                "phase": state.get("phase", WorkflowPhase.WAITING_FOR_LEARNING_INPUT),
+            }
+
+        if any(p in msg_lower for p in ["what should i avoid", "what not to infer", "what should i not do"]):
+            not_inf = fallback_dict.get("what_not_to_infer") or []
+            n_str = "\n".join(f"- {n}" for n in not_inf)
+            reply_text = (
+                f"Keep in mind that this step is for learning, not validation. It does NOT prove:\n\n{n_str}"
+            )
+            founder_messages = list(state.get("founder_messages") or [])
+            founder_messages.append({"role": "assistant", "content": reply_text})
+            return {
+                "waiting_response": reply_text,
+                "founder_messages": founder_messages,
+                "phase": state.get("phase", WorkflowPhase.WAITING_FOR_LEARNING_INPUT),
+            }
+
+        # Check if founder returned with fallback observations
+        action_verbs = ["interviewed", "spoke to", "spoke with", "talked to", "talked with", "asked", "found that", "visited"]
+        has_obs = any(v in msg_lower for v in action_verbs)
+        if has_obs:
+            reply_text = (
+                "Thank you for bringing back these firsthand observations. I have captured these notes into your startup state. "
+                "They provide grounded real-world context for our next diagnostic and experiment formulation step "
+                "(without prematurely marking the assumption validated)."
+            )
+            founder_messages = list(state.get("founder_messages") or [])
+            founder_messages.append({"role": "assistant", "content": reply_text})
+
+            st_state = dict(state.get("startup_state") or {})
+            areas = dict(st_state.get("areas") or st_state.get("area_knowledge") or {})
+            target_area = fallback_dict.get("target_area", "Problem")
+            area_data = dict(areas.get(target_area) or {})
+            ev_list = list(area_data.get("evidence_provided") or [])
+            ev_list.append(raw_message)
+            area_data["evidence_provided"] = ev_list
+            areas[target_area] = area_data
+            st_state["areas"] = areas
+
+            founder_ev = list(state.get("founder_evidence") or [])
+            founder_ev.append({
+                "source": "FALLBACK_LEARNING_ACTION",
+                "content": raw_message,
+                "target_area": target_area,
+            })
+
+            return {
+                "waiting_response": reply_text,
+                "founder_messages": founder_messages,
+                "startup_state": st_state,
+                "founder_evidence": founder_ev,
+                "learning_input_mode": None,
+                "phase": WorkflowPhase.TEST,
+            }
+
+    # Full guide / full test requests
+    full_guide_triggers = [
+        "full guide", "show full guide", "full interview guide", "show me the full guide",
+        "full experiment", "show full test", "show me the full test", "show test again",
+        "repeat test", "show me the test", "see the test", "display the test", "full details"
+    ]
+    if any(p in msg_lower for p in full_guide_triggers):
+        full_text = handoff_dict.get("full_response_text") or render_execution_handoff_text(handoff_dict, mode="full")
+        reply_text = f"Here is the complete experiment methodology and interview guide:\n\n{full_text}"
+        founder_messages = list(state.get("founder_messages") or [])
+        founder_messages.append({"role": "assistant", "content": reply_text})
+        return {
+            "waiting_response": reply_text,
+            "founder_messages": founder_messages,
+            "phase": WorkflowPhase.WAITING_FOR_EVIDENCE,
+        }
+
+    # Exact questions requests
+    question_triggers = [
+        "exact questions", "what questions", "what should i ask", "give me the questions",
+        "interview questions", "interview guide"
+    ]
+    if any(p in msg_lower for p in question_triggers):
+        actions = active_exp.get("founder_actions") or []
+        evidence = active_exp.get("evidence_to_collect") or ""
+        actions_str = "\n".join(f"  {i}. {a}" for i, a in enumerate(actions, 1)) if actions else "  - Run the planned interview questions."
+        reply_text = (
+            f"Here are the specific actions and questions for this test:\n\n"
+            f"{actions_str}\n\n"
+            f"Evidence to record:\n  - {evidence}\n\n"
+            f"When you have completed the interviews, return here and share what happened."
+        )
+        founder_messages = list(state.get("founder_messages") or [])
+        founder_messages.append({"role": "assistant", "content": reply_text})
+        return {
+            "waiting_response": reply_text,
+            "founder_messages": founder_messages,
+            "phase": WorkflowPhase.WAITING_FOR_EVIDENCE,
+        }
+
+    # Decision rules / success criteria requests
+    rule_triggers = [
+        "decision rule", "decision rules", "success criteria", "what counts as success",
+        "show me the decision rule", "show decision rule"
+    ]
+    if any(p in msg_lower for p in rule_triggers):
+        supp = active_exp.get("support_signal") or "Not specified"
+        contra = active_exp.get("contradiction_signal") or "Not specified"
+        inconc = active_exp.get("inconclusive_signal") or "Not specified"
+        reply_text = (
+            f"Here are the exact decision rules for this experiment:\n\n"
+            f"- Validates assumption:\n  {supp}\n\n"
+            f"- Weakens/disproves assumption:\n  {contra}\n\n"
+            f"- Inconclusive:\n  {inconc}\n\n"
+            f"Return here with what actually happened, and Startary will evaluate your evidence against these criteria."
+        )
+        founder_messages = list(state.get("founder_messages") or [])
+        founder_messages.append({"role": "assistant", "content": reply_text})
+        return {
+            "waiting_response": reply_text,
+            "founder_messages": founder_messages,
+            "phase": WorkflowPhase.WAITING_FOR_EVIDENCE,
+        }
+
+    # What to avoid / guardrails requests
+    avoid_triggers = ["what should i avoid", "what to avoid", "what should i not do", "guardrails", "do not"]
+    if any(p in msg_lower for p in avoid_triggers):
+        do_nots = handoff_dict.get("important_constraints") or []
+        invalid_inf = active_exp.get("invalid_inferences") or []
+        lines = ["Here are the critical guardrails and boundaries for this test:\n"]
+        if do_nots:
+            lines.append("Important guardrails:")
+            for dn in do_nots:
+                lines.append(f"- {dn}")
+        if invalid_inf:
+            lines.append("\nWhat this test CANNOT prove:")
+            for ii in invalid_inf:
+                lines.append(f"- Do not treat this test as proving: {ii}")
+        lines.append("\nReturn here when you have completed the observations.")
+        reply_text = "\n".join(lines)
+        founder_messages = list(state.get("founder_messages") or [])
+        founder_messages.append({"role": "assistant", "content": reply_text})
+        return {
+            "waiting_response": reply_text,
+            "founder_messages": founder_messages,
+            "phase": WorkflowPhase.WAITING_FOR_EVIDENCE,
+        }
+
+    # Why this test matters
+    why_triggers = ["why does this test matter", "why this test", "why are we doing this", "what does this test prove", "learning goal"]
+    if any(p in msg_lower for p in why_triggers):
+        goal = active_exp.get("objective") or (active_asmp.get("learning_goal") if isinstance(active_asmp, dict) else "")
+        valid_inf = active_exp.get("valid_inferences") or []
+        lines = [
+            f"Strategic purpose of this test:\n{goal}\n",
+            "What this test CAN legitimately establish:"
+        ]
+        for vi in valid_inf:
+            lines.append(f"- {vi}")
+        lines.append("\nLet me know if you are ready to begin or if you need help finding participants.")
+        reply_text = "\n".join(lines)
+        founder_messages = list(state.get("founder_messages") or [])
+        founder_messages.append({"role": "assistant", "content": reply_text})
+        return {
+            "waiting_response": reply_text,
+            "founder_messages": founder_messages,
+            "phase": WorkflowPhase.WAITING_FOR_EVIDENCE,
+        }
+
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(WaitingForEvidenceAdvisorLLMOutput)
+
+    user_msg = build_waiting_for_evidence_advisor_user_message(
+        founder_message=raw_message,
+        disposition=str(disposition),
+        execution_handoff_text=handoff_text,
+        active_experiment_json=json.dumps(active_exp, indent=2, default=str),
+        active_assumption_text=asmp_text,
+    )
+    messages = [
+        {"role": "system", "content": WAITING_FOR_EVIDENCE_ADVISOR_SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
+
+    try:
+        res: WaitingForEvidenceAdvisorLLMOutput = structured_llm.invoke(messages)
+        reply_text = res.response_text
+    except Exception as exc:
+        logger.warning("respond_to_waiting_founder LLM failed: %s, using deterministic fallback", exc)
+        if disposition == EvidenceTurnDisposition.QUESTION_ABOUT_EXPERIMENT.value or disposition == "QUESTION_ABOUT_EXPERIMENT":
+            actions = active_exp.get("founder_actions") or ["Interview target customers to validate the assumption."]
+            actions_formatted = "\n".join(f"- {a}" for a in actions)
+            reply_text = (
+                f"Here is what to do for this test:\n\n"
+                f"{actions_formatted}\n\n"
+                f"Target: {active_exp.get('target_participants_or_scope', 'Target customers')}\n\n"
+                f"Once you've done these, return here and share what happened."
+            )
+        elif disposition == EvidenceTurnDisposition.REQUEST_FOR_EXECUTION_HELP.value or disposition == "REQUEST_FOR_EXECUTION_HELP":
+            target = active_exp.get("target_participants_or_scope", "target customers")
+            reply_text = (
+                f"To find qualifying participants for this test ({target}), start with people or stores in your existing network, "
+                f"ask for warm introductions, or visit local stores directly during quiet hours. "
+                f"Keep conversations focused on their real past experiences."
+            )
+        elif disposition == EvidenceTurnDisposition.FUTURE_INTENTION.value or disposition == "FUTURE_INTENTION":
+            reply_text = (
+                "Sounds good! Take your time to run the conversations. "
+                "When you have completed them, return here and tell me what actually happened."
+            )
+        elif disposition == EvidenceTurnDisposition.CANNOT_EXECUTE.value or disposition == "CANNOT_EXECUTE":
+            reply_text = (
+                "Understood. If you're blocked from running this test as designed, "
+                "let me know what specific resource or access is missing so we can adjust our execution path."
+            )
+        else:
+            reply_text = (
+                f"We are currently waiting for real-world results from the active test:\n\n"
+                f"Objective: {active_exp.get('objective')}\n\n"
+                f"Let me know if you have questions about running it or if something is blocking you."
+            )
+
+    founder_messages = list(state.get("founder_messages") or [])
+    founder_messages.append({"role": "assistant", "content": reply_text})
+
+    logger.info("respond_to_waiting_founder | disposition=%s reply_len=%d", disposition, len(reply_text))
+
+    return {
+        "waiting_response": reply_text,
+        "founder_messages": founder_messages,
+        "phase": WorkflowPhase.WAITING_FOR_EVIDENCE,
+    }
+
+
+def extract_experiment_evidence(state: StartaryGraphState) -> dict:
+    """
+    LLM Node (Milestone 4):
+    Extracts structured factual observations and results from founder-submitted evidence.
+    Separates what was actually observed and executed from subjective interpretation.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    raw_submission = state.get("founder_response") or ""
+    if not raw_submission:
+        founder_messages = state.get("founder_messages") or []
+        for m in reversed(founder_messages):
+            if m.get("role") == "founder":
+                raw_submission = m.get("content", "")
+                break
+
+    active_experiment = state.get("active_experiment") or {}
+    active_assumption = state.get("active_assumption") or state.get("active_critical_assumption") or {}
+    assumption_text = active_assumption.get("statement", "Critical assumption under test")
+
+    import json as _json
+    exp_json = _json.dumps(active_experiment, indent=2, default=str)
+    evidence_reqs = active_experiment.get("evidence_to_collect") or ""
+
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(ExtractedEvidenceLLMOutput)
+
+    user_msg = build_evidence_extractor_user_message(
+        raw_founder_submission=raw_submission,
+        active_experiment_json=exp_json,
+        active_assumption_text=assumption_text,
+        evidence_requirements=evidence_reqs,
+    )
+
+    messages = [
+        {"role": "system", "content": EVIDENCE_EXTRACTOR_SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
+
+    attempt = 0
+    last_err = None
+    while attempt < 2:
+        attempt += 1
+        t_start = time.monotonic()
+        try:
+            res: ExtractedEvidenceLLMOutput = structured_llm.invoke(messages)
+            latency_ms = (time.monotonic() - t_start) * 1000
+
+            res_dict = res.model_dump()
+            trace = AITrace(
+                module_name="extract_experiment_evidence",
+                prompt_version=EVIDENCE_EXTRACTOR_PROMPT_VERSION,
+                input_data={"raw_len": len(raw_submission), "experiment_id": active_experiment.get("id")},
+                output_data={"actions_count": len(res.actions_completed), "is_future": res.is_future_intention_only},
+                latency_ms=latency_ms,
+                project_id=project_id,
+            )
+            existing_traces = list(state.get("traces") or [])
+            existing_traces.append(trace.model_dump(mode="json"))
+
+            logger.info("extract_experiment_evidence | actions=%d is_future=%s summary=%s",
+                        len(res.actions_completed), res.is_future_intention_only, res.direct_evidence_summary[:60])
+            return {
+                "extracted_evidence": res_dict,
+                "traces": existing_traces,
+                "last_trace": trace.model_dump(mode="json"),
+            }
+        except Exception as exc:
+            last_err = exc
+            logger.warning("extract_experiment_evidence attempt %d failed: %s", attempt, exc)
+
+    # Fallback extraction on error
+    fallback = ExtractedEvidenceLLMOutput(
+        actions_completed=[],
+        sample_or_counts={},
+        observed_behaviors=[],
+        quotes=[],
+        quantitative_outcomes={},
+        incomplete_actions=[],
+        deviations_from_plan=[],
+        missing_result_information=[],
+        is_future_intention_only=False,
+        evidence_items=[],
+        direct_evidence_summary=raw_submission[:200] if raw_submission else "No evidence details extracted.",
+    )
+    return {
+        "extracted_evidence": fallback.model_dump(),
+    }
+
+
+def assess_evidence_submission_sufficiency(state: StartaryGraphState) -> dict:
+    """
+    Deterministic Node (Milestone 4):
+    Assesses whether submitted evidence is sufficient for analysis, or requires clarification.
+    """
+    extracted = state.get("extracted_evidence") or {}
+    raw = state.get("founder_response") or ""
+    turns = state.get("evidence_clarification_turns", 0)
+
+    is_future = extracted.get("is_future_intention_only", False)
+    actions = extracted.get("actions_completed") or []
+    counts = extracted.get("sample_or_counts") or {}
+    behaviors = extracted.get("observed_behaviors") or []
+
+    # If founder only stated future intentions:
+    if is_future:
+        return {
+            "evidence_submission_sufficiency": EvidenceSubmissionSufficiency.NEEDS_CLARIFICATION.value,
+            "evidence_clarification_question": (
+                "It sounds like this is a plan for what you will do. "
+                "To evaluate this experiment, Startary needs the actual results from actions you have already completed. "
+                "What specifically happened when you conducted this test?"
+            ),
+        }
+
+    # If completely empty or extremely brief without facts and clarification turns < 2:
+    if len(raw.strip().split()) < 4 and not actions and not counts and not behaviors and turns < 2:
+        return {
+            "evidence_submission_sufficiency": EvidenceSubmissionSufficiency.NEEDS_CLARIFICATION.value,
+            "evidence_clarification_question": (
+                "Could you share more detail about what happened when you ran the experiment? "
+                "How many people did you speak with, and what specifically did they say or do?"
+            ),
+        }
+
+    return {
+        "evidence_submission_sufficiency": EvidenceSubmissionSufficiency.SUFFICIENT_FOR_ANALYSIS.value,
+        "evidence_clarification_question": None,
+    }
+
+
+def ask_evidence_clarification(state: StartaryGraphState) -> dict:
+    """
+    Interrupt Node (Milestone 4):
+    Asks one focused clarification question regarding the submitted experiment results.
+    """
+    q = state.get("evidence_clarification_question") or "Could you share more specific details from running the experiment?"
+    turns = state.get("evidence_clarification_turns", 0) + 1
+
+    founder_input = interrupt({
+        "type": "EVIDENCE_CLARIFICATION",
+        "question": q,
+        "turn": turns,
+    })
+
+    raw = ""
+    if isinstance(founder_input, dict):
+        raw = founder_input.get("founder_response") or founder_input.get("content") or ""
+    elif isinstance(founder_input, str):
+        raw = founder_input
+    if not raw and state.get("founder_response"):
+        raw = str(state.get("founder_response"))
+
+    founder_messages = list(state.get("founder_messages") or [])
+    if raw:
+        founder_messages.append({"role": "founder", "content": raw})
+
+    return {
+        "founder_response": raw,
+        "evidence_clarification_turns": turns,
+        "founder_messages": founder_messages,
+    }
+
+
+def analyze_evidence(state: StartaryGraphState) -> dict:
+    """
+    LLM Node (Milestone 4):
+    Evaluates extracted evidence against the active Critical Assumption and experiment decision rules.
+    Respects valid vs invalid inferences and determines conclusion & evidence strength.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    active_experiment = state.get("active_experiment") or {}
+    active_assumption = state.get("active_assumption") or state.get("active_critical_assumption") or {}
+    statement = active_assumption.get("statement", "Critical assumption")
+
+    extracted = state.get("extracted_evidence") or {}
+    raw = state.get("founder_response") or ""
+    rc = state.get("reality_check") or {}
+
+    import json as _json
+    exp_json = _json.dumps(active_experiment, indent=2, default=str)
+    extracted_json = _json.dumps(extracted, indent=2, default=str)
+
+    support_signal = active_experiment.get("support_signal") or "Result confirms expected problem or behavior."
+    contradiction_signal = active_experiment.get("contradiction_signal") or "Result shows problem is rare, unaddressed, or adequately solved."
+    inconclusive_signal = active_experiment.get("inconclusive_signal") or "Sample is too small, biased, or result does not discriminate."
+    valid_inferences = active_experiment.get("valid_inferences") or []
+    invalid_inferences = active_experiment.get("invalid_inferences") or []
+    rc_summary = rc.get("summary") or ""
+
+    settings = get_settings()
+    llm = get_llm_client(settings)
+    structured_llm = llm.with_structured_output(EvidenceAnalysisLLMOutput)
+
+    user_msg = build_evidence_analyzer_user_message(
+        active_assumption=statement,
+        active_experiment_json=exp_json,
+        extracted_evidence_json=extracted_json,
+        raw_founder_evidence=raw,
+        support_signal=support_signal,
+        contradiction_signal=contradiction_signal,
+        inconclusive_signal=inconclusive_signal,
+        valid_inferences=valid_inferences,
+        invalid_inferences=invalid_inferences,
+        previous_reality_check=rc_summary,
+    )
+
+    messages = [
+        {"role": "system", "content": EVIDENCE_ANALYZER_SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
+
+    attempt = 0
+    last_err = None
+    while attempt < 2:
+        attempt += 1
+        t_start = time.monotonic()
+        try:
+            res: EvidenceAnalysisLLMOutput = structured_llm.invoke(messages)
+            latency_ms = (time.monotonic() - t_start) * 1000
+
+            res_dict = res.model_dump()
+            trace = AITrace(
+                module_name="analyze_evidence",
+                prompt_version=EVIDENCE_ANALYZER_PROMPT_VERSION,
+                input_data={"assumption": statement[:80], "experiment_id": active_experiment.get("id")},
+                output_data={"conclusion": res.conclusion, "strength": res.evidence_strength},
+                latency_ms=latency_ms,
+                project_id=project_id,
+            )
+            existing_traces = list(state.get("traces") or [])
+            existing_traces.append(trace.model_dump(mode="json"))
+
+            logger.info("analyze_evidence | conclusion=%s strength=%s execution_quality=%s reasoning=%s",
+                        res.conclusion, res.evidence_strength, res.experiment_execution_quality, res.reasoning_summary[:60])
+            return {
+                "evidence_analysis": res_dict,
+                "traces": existing_traces,
+                "last_trace": trace.model_dump(mode="json"),
+            }
+        except Exception as exc:
+            last_err = exc
+            logger.warning("analyze_evidence attempt %d failed: %s", attempt, exc)
+
+    # Fallback analysis on error
+    fallback = EvidenceAnalysisLLMOutput(
+        conclusion="INCONCLUSIVE",
+        evidence_strength="WEAK",
+        experiment_execution_quality="PARTIAL",
+        support_findings=[],
+        contradiction_findings=[],
+        inconclusive_findings=["Analysis encountered an unexpected processing error."],
+        deviations_from_plan=[],
+        valid_learnings=[],
+        invalid_learnings=[],
+        assumption_confidence_change="Unchanged due to inconclusive analysis.",
+        reasoning_summary=f"Analysis fallback due to error: {last_err}",
+        recommended_state_updates={},
+    )
+    return {
+        "evidence_analysis": fallback.model_dump(),
+    }
+
+
+def validate_evidence_analysis(state: StartaryGraphState) -> dict:
+    """
+    Deterministic Node (Milestone 4.0.3):
+    Maps analysis conclusion to AssumptionStatus, updates Experiment to COMPLETED,
+    instantiates immutable Evidence record, and updates graph state.
+    Requires a valid completed evidence cycle; otherwise preserves active experiment as IN_PROGRESS.
+    """
+    if not has_valid_completed_evidence_cycle(state):
+        logger.warning("validate_evidence_analysis: non-evidence cycle detected; preserving active experiment as IN_PROGRESS.")
+        active_exp = dict(state.get("active_experiment") or {})
+        active_exp["status"] = ExperimentStatus.IN_PROGRESS.value
+        return {
+            "active_experiment": active_exp,
+            "phase": WorkflowPhase.WAITING_FOR_EVIDENCE,
+        }
+
+    project_id = state.get("project_id", "<unknown>")
+    iteration = state.get("iteration", 1)
+    analysis = state.get("evidence_analysis") or {}
+    raw_conclusion = (analysis.get("conclusion") or "INCONCLUSIVE").upper()
+
+    conclusion_map = {
+        "SUPPORTED": AssumptionStatus.SUPPORTED,
+        "PARTIALLY_SUPPORTED": AssumptionStatus.PARTIALLY_SUPPORTED,
+        "CONTRADICTED": AssumptionStatus.CONTRADICTED,
+        "INCONCLUSIVE": AssumptionStatus.INCONCLUSIVE,
+    }
+    new_assumption_status = conclusion_map.get(raw_conclusion, AssumptionStatus.INCONCLUSIVE)
+
+    # Update active assumption status
+    active_assumption = dict(state.get("active_assumption") or state.get("active_critical_assumption") or {})
+    active_assumption["status"] = new_assumption_status.value
+
+    # Update active experiment status to COMPLETED
+    active_exp = dict(state.get("active_experiment") or {})
+    active_exp["status"] = ExperimentStatus.COMPLETED.value
+
+    # Create immutable Evidence domain record
+    raw_content = state.get("founder_response") or ""
+    if not raw_content:
+        founder_messages = state.get("founder_messages") or []
+        for m in reversed(founder_messages):
+            if m.get("role") == "founder":
+                raw_content = m.get("content", "")
+                break
+
+    extracted = state.get("extracted_evidence") or {}
+    evidence_obj = Evidence(
+        id=str(uuid.uuid4()),
+        project_id=project_id,
+        experiment_id=active_exp.get("id"),
+        assumption_id=active_assumption.get("id"),
+        iteration=iteration,
+        evidence_type=EvidenceType.EXPERIMENT_RESULT,
+        source="founder_experiment_submission",
+        raw_content=raw_content or "Founder submitted experiment results.",
+        structured_observations=extracted.get("observed_behaviors") or [],
+        quantitative_results=extracted.get("quantitative_outcomes") or extracted.get("sample_or_counts") or {},
+        provenance=EvidenceProvenance.FOUNDER_REPORTED,
+        result=EvidenceResult.ANALYZED,
+    )
+
+    founder_evidence_list = list(state.get("founder_evidence") or [])
+    founder_evidence_list.append(evidence_obj.model_dump(mode="json"))
+
+    logger.info(
+        "valid_evidence_cycle | experiment_id=%s evidence_id=%s conclusion=%s",
+        active_exp.get("id"), evidence_obj.id, raw_conclusion,
+    )
+    logger.info("validate_evidence_analysis | assumption_status=%s experiment_status=COMPLETED evidence_id=%s",
+                new_assumption_status.value, evidence_obj.id)
+
+    return {
+        "active_assumption": active_assumption,
+        "active_critical_assumption": active_assumption,
+        "active_experiment": active_exp,
+        "founder_evidence": founder_evidence_list,
+        "active_evidence": evidence_obj.model_dump(mode="json"),
+    }
+
+
+def apply_validated_state_updates(state: StartaryGraphState) -> dict:
+    """
+    Deterministic Node (Milestone 4.0.3):
+    Applies bounded state updates strictly to the startup area tested by the critical assumption.
+    Requires a valid completed evidence cycle.
+    Unrelated fields (Team, Budget, Technical Capability, etc.) are strictly protected.
+    """
+    if not has_valid_completed_evidence_cycle(state):
+        logger.warning("apply_validated_state_updates skipped: no valid completed evidence cycle.")
+        return {}
+
+    startup_state_dict = dict(state.get("startup_state") or {})
+    active_assumption = state.get("active_assumption") or state.get("active_critical_assumption") or {}
+    analysis = state.get("evidence_analysis") or {}
+    tested_area_str = active_assumption.get("area") or "Problem"
+
+    area_knowledge_map = dict(startup_state_dict.get("area_knowledge") or {})
+    current_area_knowledge = dict(area_knowledge_map.get(tested_area_str) or {})
+
+    support_findings = analysis.get("support_findings") or []
+    contradiction_findings = analysis.get("contradiction_findings") or []
+    reasoning = analysis.get("reasoning_summary") or ""
+    conclusion = analysis.get("conclusion") or "INCONCLUSIVE"
+
+    iteration = state.get("iteration", 1)
+    new_evidence_entry = f"Iteration {iteration} Experiment [{conclusion}]: {reasoning}"
+    evidence_provided = list(current_area_knowledge.get("evidence_provided") or [])
+    evidence_provided.append(new_evidence_entry)
+    current_area_knowledge["evidence_provided"] = evidence_provided
+
+    # Update understanding and status bounded strictly to tested area
+    if conclusion in ("SUPPORTED", "PARTIALLY_SUPPORTED"):
+        current_area_knowledge["status"] = AreaStatus.KNOWN.value
+        if support_findings:
+            current_area_knowledge["understanding"] = f"Supported by experiment: {'; '.join(support_findings)}"
+    elif conclusion == "CONTRADICTED":
+        current_area_knowledge["status"] = AreaStatus.PARTIALLY_KNOWN.value
+        if contradiction_findings:
+            current_area_knowledge["understanding"] = f"Weakened by experiment: {'; '.join(contradiction_findings)}"
+
+    area_knowledge_map[tested_area_str] = current_area_knowledge
+    startup_state_dict["area_knowledge"] = area_knowledge_map
+
+    logger.info("apply_validated_state_updates | updated area=%s status=%s evidence_count=%d",
+                tested_area_str, current_area_knowledge.get("status"), len(evidence_provided))
+
+    return {
+        "startup_state": startup_state_dict,
+    }
+
+
+def increment_iteration(state: StartaryGraphState) -> dict:
+    """
+    Deterministic Node (Milestone 4.0.3 & Milestone 4.0.7.1.1):
+    Advances learning loop iteration, archives previous assumption and snapshot,
+    and transitions phase to LEARN. Requires a valid completed evidence cycle.
+    Resets active execution state from the completed cycle to prevent cross-iteration leaks.
+    """
+    if not has_valid_completed_evidence_cycle(state):
+        logger.warning("increment_iteration skipped: no valid completed evidence cycle.")
+        return {}
+
+    current_iter = state.get("iteration", 1)
+    new_iter = current_iter + 1
+
+    prev_assumptions = list(state.get("previous_assumptions") or [])
+    active_assumption = state.get("active_assumption") or state.get("active_critical_assumption")
+    if active_assumption:
+        prev_assumptions.append(active_assumption)
+
+    prev_snapshot = state.get("diagnosis_snapshot")
+    prev_weak = state.get("weak_area") or "Problem"
+
+    logger.info("increment_iteration | advancing iteration %d -> %d, phase -> LEARN", current_iter, new_iter)
+
+    return {
+        "iteration": new_iter,
+        "phase": WorkflowPhase.LEARN,
+        "previous_assumptions": prev_assumptions,
+        "previous_diagnosis_snapshot": prev_snapshot,
+        "previous_weak_area": prev_weak,
+        "active_assumption": None,
+        "active_critical_assumption": None,
+        "active_experiment": None,
+        "proposed_experiment_output": None,
+        "experiment_critic_output": None,
+        "critic_revision_count": 0,
+        "critic_revision_instructions": "",
+        # Milestone 4.0.7.1.1: Reset active execution artifacts from prior cycle
+        "active_execution_handoff": None,
+        "execution_handoff_text": None,
+        "can_execute_result": None,
+        "experiment_design_status": None,
+        "fallback_learning_action": None,
+        "learning_input_mode": None,
+        "waiting_response": None,
+        "post_evidence_answer": None,
+        "status_message": None,
+    }
+
+
+def can_compose_learning_delta(state: StartaryGraphState) -> bool:
+    """
+    Deterministic Eligibility Guard (Milestone 4.0.1):
+    Returns True ONLY if all of the following are satisfied:
+      1. iteration > 1
+      2. there is a completed evidence record for the immediately previous learning cycle
+      3. there is a validated EvidenceAnalysis with a valid conclusion
+      4. there is a previous tested assumption
+      5. there is a previous diagnosis / weak link to compare against
+      6. evidence has already been applied to startup state
+    If any are missing, returns False so compose_learning_delta is safely skipped.
+    """
+    iteration = state.get("iteration", 1)
+    if iteration <= 1:
+        return False
+
+    # 2. Completed evidence record
+    founder_evidence = state.get("founder_evidence") or []
+    if not founder_evidence:
+        return False
+    has_prior_evidence = any(
+        e.get("iteration") == (iteration - 1) or e.get("result") in ("ANALYZED", "COMPLETED")
+        for e in founder_evidence
+    )
+    if not has_prior_evidence:
+        return False
+
+    # 3. Validated EvidenceAnalysis
+    analysis = state.get("evidence_analysis") or {}
+    conclusion = analysis.get("conclusion")
+    if not conclusion or conclusion not in ("SUPPORTED", "PARTIALLY_SUPPORTED", "CONTRADICTED", "INCONCLUSIVE"):
+        return False
+
+    # 4. Previous tested assumption
+    prev_assumptions = state.get("previous_assumptions") or []
+    if not prev_assumptions:
+        return False
+
+    # 5. Previous diagnosis / weak link to compare against
+    prev_weak = state.get("previous_weak_area") or prev_assumptions[-1].get("area")
+    if not prev_weak:
+        return False
+
+    # 6. Evidence applied to startup state
+    startup_st = state.get("startup_state") or {}
+    area_knowledge = startup_st.get("area_knowledge") or {}
+    tested_area_str = str(prev_assumptions[-1].get("area") or prev_weak)
+    area_data = area_knowledge.get(tested_area_str) or {}
+    evidence_provided = area_data.get("evidence_provided") or []
+    if not evidence_provided:
+        return False
+
+    return True
+
+
+def compose_learning_delta(state: StartaryGraphState) -> dict:
+    """
+    Deterministic Node (Milestone 4):
+    Synthesizes the founder-facing LearningDelta comparing Iteration N-1 to Iteration N.
+    Only runs when can_compose_learning_delta is True.
+    """
+    if not can_compose_learning_delta(state):
+        logger.info(
+            "compose_learning_delta | skipped (ineligible: iteration=%s, no completed evidence cycle)",
+            state.get("iteration", 1),
+        )
+        return {
+            "learning_delta": None,
+        }
+
+    prev_assumptions = state.get("previous_assumptions") or []
+    prev_assumption_obj = prev_assumptions[-1] if prev_assumptions else {}
+    prev_assumption_stmt = prev_assumption_obj.get("statement", "Critical startup assumption")
+
+    prev_weak = state.get("previous_weak_area") or prev_assumption_obj.get("area") or "Problem"
+    current_weak = state.get("weak_area") or "Problem"
+    weak_changed = (str(prev_weak) != str(current_weak))
+
+    analysis = state.get("evidence_analysis") or {}
+    conclusion = analysis.get("conclusion", "INCONCLUSIVE")
+    strength = analysis.get("evidence_strength", "MODERATE")
+
+    support_findings = analysis.get("support_findings") or []
+    contradiction_findings = analysis.get("contradiction_findings") or []
+    inconclusive_findings = analysis.get("inconclusive_findings") or []
+    valid_learnings = analysis.get("valid_learnings") or []
+
+    what_we_learned = valid_learnings if valid_learnings else (support_findings + contradiction_findings)
+    what_became_more_certain = support_findings
+    what_became_less_certain = contradiction_findings
+    what_remains_unknown = inconclusive_findings
+
+    if conclusion == "SUPPORTED":
+        summary = f"The experiment provided {strength.lower()} support for the tested assumption: '{prev_assumption_stmt}'."
+    elif conclusion == "PARTIALLY_SUPPORTED":
+        summary = f"The experiment provided {strength.lower()} directional support, but some aspects remain unconfirmed."
+    elif conclusion == "CONTRADICTED":
+        summary = f"The experiment contradicted or significantly weakened the assumption: '{prev_assumption_stmt}'."
+    else:
+        summary = f"The experiment results were inconclusive and could not reliably confirm or refute the assumption."
+
+    if weak_changed:
+        summary += f" The primary bottleneck has shifted from {prev_weak} to {current_weak}."
+    else:
+        summary += f" {current_weak} remains the primary bottleneck to investigate."
+
+    delta = LearningDelta(
+        previous_assumption=prev_assumption_stmt,
+        evidence_conclusion=conclusion,
+        what_we_learned=what_we_learned,
+        what_became_more_certain=what_became_more_certain,
+        what_became_less_certain=what_became_less_certain,
+        what_remains_unknown=what_remains_unknown,
+        weak_link_changed=weak_changed,
+        previous_weak_link=str(prev_weak),
+        new_weak_link=str(current_weak),
+        founder_facing_summary=summary,
+    )
+
+    logger.info("compose_learning_delta | conclusion=%s weak_changed=%s (%s -> %s)",
+                conclusion, weak_changed, prev_weak, current_weak)
+
+    return {
+        "learning_delta": delta.model_dump(mode="json"),
+    }
+
+
+def answer_post_evidence_question(state: StartaryGraphState) -> dict:
+    """
+    Deterministic Advisor Node (Milestone 4.0.7):
+    Answers the founder's post-evidence question (e.g. "What should I do next?")
+    using the NEW post-diagnosis state (updated startup state, new weak link,
+    new critical assumption, and evidence findings).
+    Ensures transient evidence turn state is cleanly cleared.
+    """
+    pending_q = state.get("pending_post_evidence_question")
+    if not pending_q:
+        return {
+            "evidence_turn_assessment": None,
+            "pending_post_evidence_question": None,
+        }
+
+    iteration = state.get("iteration", 1)
+    analysis = state.get("evidence_analysis") or {}
+    delta = state.get("learning_delta") or {}
+    current_weak = state.get("weak_area") or "Problem"
+    active_asmp = state.get("active_assumption") or state.get("active_critical_assumption") or {}
+    asmp_stmt = active_asmp.get("statement") or "Critical assumption under test."
+
+    # Extract learnings from delta and analysis
+    valid_learnings = delta.get("what_we_learned") or analysis.get("valid_learnings") or analysis.get("support_findings") or []
+    what_changed = delta.get("what_became_more_certain") or []
+    what_unknown = delta.get("what_remains_unknown") or []
+
+    lines = [
+        "What you learned:",
+    ]
+    if valid_learnings:
+        for item in valid_learnings[:4]:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- Observations provided grounded real-world context on operational friction.")
+
+    lines.append("\nWhat changed:")
+    if what_changed:
+        for item in what_changed[:3]:
+            lines.append(f"- {item}")
+    else:
+        lines.append(f"- Evidence base for {current_weak} is updated.")
+    if what_unknown:
+        for item in what_unknown[:2]:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- Commercial willingness to pay and broader adoption remain unproven.")
+
+    lines.append(f"\nNext:\nFocus on {current_weak} — {asmp_stmt}")
+
+    answer_text = "\n".join(lines)
+    logger.info("post_evidence_question_answered | iteration=%s weak_link=%s", iteration, current_weak)
+
+    founder_messages = list(state.get("founder_messages") or [])
+    founder_messages.append({"role": "assistant", "content": answer_text})
+
+    return {
+        "post_evidence_answer": answer_text,
+        "founder_messages": founder_messages,
+        "pending_post_evidence_question": None,
+        "evidence_turn_assessment": None,
+    }
+
+
+
+
