@@ -137,7 +137,7 @@ def test_execution_handoff_schema_validates():
     assert "WHAT SHOULD I DO?" in compact
     assert "WHAT SHOULD I BRING BACK?" in compact
     assert "WHAT COUNTS AS A USEFUL SIGNAL?" in compact
-    assert "WHAT LOOKS PROMISING SO FAR?" in compact
+    assert "WHAT LOOKS PROMISING SO FAR?" not in compact
 
 
 def test_can_execute_creates_handoff_before_wait_for_evidence(m403_base_state):

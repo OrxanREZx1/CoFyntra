@@ -1,6 +1,9 @@
-# Python
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
+*$py.class
+
+# C extensions & packaging
 *.so
 *.egg
 *.egg-info/
@@ -12,24 +15,48 @@ build/
 .venv/
 venv/
 env/
+ENV/
 
-# Environment
+# Environment files & secrets
 .env
+.env.*
+!.env.example
 
-# Testing
+# Testing, type checking & coverage
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
+coverage.xml
 htmlcov/
 
-# IDE
+# Logs
+*.log
+logs/
+
+# Temporary directories & scratch dumps
+scratch/
+temp/
+tmp/
+*.tmp
+
+# Databases & local checkpoints
+*.sqlite
+*.sqlite3
+*.db
+
+# Frontend / node
+node_modules/
+
+# IDE & editors
 .vscode/
 .idea/
 *.swp
+*.swo
 
-# OS
+# OS generated files
 .DS_Store
 Thumbs.db
 
-# LangGraph / LangChain
+# LangGraph / LangChain local state
 .langgraph_api/
-

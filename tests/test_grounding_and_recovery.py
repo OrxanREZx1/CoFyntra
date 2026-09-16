@@ -169,6 +169,8 @@ def test_unknown_capability_omitted_from_execution_constraints(mocker):
         "execution_context": {
             "design_capability": unknown_field().model_dump(),
             "technical_capability": {"value": True, "provenance": "EXPLICIT"},
+            "weekly_hours": {"value": "Only 15 hours per week per founder", "provenance": "FOUNDER_STATED"},
+            "monthly_budget": {"value": "Bootstrap budget under $500", "provenance": "FOUNDER_STATED"},
         },
     }
     res = compose_startup_diagnosis(state)

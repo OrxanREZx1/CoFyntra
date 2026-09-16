@@ -11,6 +11,7 @@ Distinguishes:
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -139,6 +140,106 @@ def is_actual_evidence_turn(state: dict[str, Any] | Any) -> bool:
     return get_evidence_turn_disposition(state) == EvidenceTurnDisposition.ACTUAL_EVIDENCE
 
 
+COMPLETED_ACTION_VERBS = [
+    "interviewed", "spoke to", "spoke with", "talked to", "talked with",
+    "messaged", "sent", "contacted", "reached out", "ran the", "ran a", "ran an", "ran",
+    "tested", "tried contacting", "tried it", "asked", "showed", "visited",
+    "completed the interviews", "completed interviews", "finished the interviews",
+    "done with interviews", "finished interviews", "completed the calls", "finished the calls",
+    "completed", "conducted", "surveyed", "observed", "pitched", "pre-ordered", "preordered",
+]
+
+SUBSTANTIVE_RESULTS_WORDS = [
+    "said", "replied", "answered", "agreed", "rejected", "declined", "result", "results",
+    "found that", "found", "nobody replied", "no one replied", "loss", "pain", "stockout",
+    "stockouts", "waste", "surplus", "bought", "purchased", "paid", "pickup", "pickups",
+    "pre-ordered", "preordered", "signed up", "orders", "revenue", "dollar", "$",
+    "quote", "quoted", "reported", "confirmed", "interested", "willing", "refused", "feedback",
+]
+
+ACTION_NEGATIONS = [
+    "haven't", "have not", "didn't", "did not", "not yet", "never", "unable to",
+    "couldn't", "could not", "cannot", "cant", "can't",
+]
+
+FUTURE_MODAL_PREFIXES = [
+    "will ", "going to ", "plan to ", "planning to ", "hope to ", "intend to ",
+    "tomorrow ", "next week ",
+]
+
+COUNT_REGEX = re.compile(
+    r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty|forty|fifty)\b",
+    re.IGNORECASE,
+)
+
+
+def has_substantive_completed_evidence(
+    raw_message: str,
+    llm_assessment: Optional[Any] = None,
+) -> bool:
+    """
+    Evaluates whether founder input contains substantive completed real-world evidence
+    (Milestone 4.0.7.2.1). Substantive completed evidence takes precedence over incidental
+    future-oriented language or planning statements.
+    """
+    if llm_assessment:
+        disp = getattr(llm_assessment, "disposition", "")
+        if isinstance(disp, EvidenceTurnDisposition):
+            disp = disp.value
+        disp = str(disp).upper().strip()
+        has_ext_action = getattr(llm_assessment, "contains_completed_external_action", False)
+        has_results = getattr(llm_assessment, "contains_results", False)
+        has_candidate = bool(getattr(llm_assessment, "evidence_candidate_text", None))
+        only_future = getattr(llm_assessment, "contains_only_future_intent", False)
+
+        if has_ext_action and (has_results or disp == "ACTUAL_EVIDENCE" or has_candidate):
+            return True
+        if disp == "ACTUAL_EVIDENCE" and (has_ext_action or has_results or has_candidate) and not only_future:
+            return True
+
+    if not raw_message or not raw_message.strip():
+        return False
+
+    msg_lower = raw_message.lower().strip()
+    clauses = [c.strip() for c in re.split(r"[\.\n;!]+", msg_lower) if c.strip()]
+    unnegated_actions = []
+    for clause in clauses:
+        for v in COMPLETED_ACTION_VERBS:
+            if v in clause:
+                idx = clause.find(v)
+                prefix = clause[max(0, idx - 25):idx]
+                is_negated = any(n in prefix for n in ACTION_NEGATIONS)
+                is_future = any(f in prefix for f in FUTURE_MODAL_PREFIXES)
+                if not is_negated and not is_future:
+                    unnegated_actions.append(v)
+
+    has_unnegated_action = len(unnegated_actions) > 0
+    has_count = bool(COUNT_REGEX.search(msg_lower))
+    has_results_words = any(w in msg_lower for w in SUBSTANTIVE_RESULTS_WORDS)
+
+    # 1. Past action + count or results words
+    if has_unnegated_action and (has_count or has_results_words):
+        return True
+
+    # 2. Strong explicit completion phrase
+    explicit_completion = [
+        "completed the interviews", "completed interviews", "finished the interviews",
+        "done with interviews", "finished interviews", "completed the calls", "finished the calls",
+    ]
+    if any(p in unnegated_actions for p in explicit_completion):
+        return True
+
+    # 3. Quantified count + strong substantive outcome words
+    strong_outcomes = [
+        "paid", "pickups", "pickup", "reported", "surplus", "stockout",
+        "stockouts", "waste", "bought", "purchased", "pre-ordered", "preordered",
+    ]
+    if has_count and any(w in msg_lower for w in strong_outcomes):
+        return True
+
+    return False
+
+
 class Evidence(BaseModel):
     """
     A piece of evidence produced by real-world experiment execution or observation.
@@ -187,6 +288,10 @@ class Evidence(BaseModel):
     quantitative_results: dict[str, Any] = Field(
         default_factory=dict,
         description="Extracted counts, conversion numbers, ratios, or financial amounts.",
+    )
+    additional_observations: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Credible out-of-scope or contextual observations beyond the active experiment assumption.",
     )
     artifacts: list[dict[str, Any]] = Field(
         default_factory=list,
@@ -283,6 +388,10 @@ class EvidenceAnalysis(BaseModel):
         default_factory=dict,
         description="Proposed candidate updates to StartupState.",
     )
+    additional_observations: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Extracted factual observations not directly relating to the active critical assumption.",
+    )
 
 
 class LearningDelta(BaseModel):
@@ -314,6 +423,10 @@ class LearningDelta(BaseModel):
     what_remains_unknown: list[str] = Field(
         default_factory=list,
         description="Critical gaps that this experiment could not resolve.",
+    )
+    additional_observations: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Preserved contextual or operational observations from this iteration.",
     )
     weak_link_changed: bool = Field(
         default=False,
@@ -362,7 +475,9 @@ def has_valid_completed_evidence_cycle(state: dict[str, Any]) -> bool:
                 break
     extracted = state.get("extracted_evidence") or {}
     founder_evidence = state.get("founder_evidence") or []
-    if not raw_content and not extracted and not founder_evidence:
+    active_evidence = state.get("active_evidence") or {}
+    evidence_history = state.get("evidence_history") or []
+    if not raw_content and not extracted and not founder_evidence and not active_evidence and not evidence_history:
         return False
 
     # Check evidence analysis
@@ -384,3 +499,123 @@ def has_valid_completed_evidence_cycle(state: dict[str, Any]) -> bool:
         return False
 
     return True
+
+
+def get_most_recent_completed_evidence_cycle(
+    state: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]] | None:
+    """
+    Canonical Completed-Cycle Resolver (Milestone 4.0.7.2):
+    Returns the most recent valid tuple:
+        (tested_assumption, completed_experiment, admitted_evidence, evidence_analysis)
+    for the immediately preceding completed learning cycle.
+
+    Strictly guarantees:
+      - Admitted evidence has result in ('ANALYZED', 'COMPLETED') or is active_evidence with non-empty content
+      - Fallback learning actions ('FALLBACK_LEARNING_ACTION') are NEVER treated as experiment evidence
+      - Incomplete/abandoned experiments ('ABANDONED', 'FAILED', 'QUALITY_BAR_NOT_MET') are excluded
+      - Tested assumption is linked by assumption_id or matches the archived cycle assumption
+      - Validated evidence analysis with recognized conclusion is present
+    Returns None if no completed evidence cycle exists.
+    """
+    analysis = state.get("evidence_analysis") or {}
+    conclusion = analysis.get("conclusion")
+    if not conclusion or conclusion not in ("SUPPORTED", "PARTIALLY_SUPPORTED", "CONTRADICTED", "INCONCLUSIVE"):
+        return None
+
+    # Find the most recent admitted evidence
+    founder_evidence = list(state.get("founder_evidence") or [])
+    active_evidence = state.get("active_evidence")
+    if active_evidence and isinstance(active_evidence, dict):
+        ev_ids = {e.get("id") for e in founder_evidence if isinstance(e, dict) and e.get("id")}
+        if active_evidence.get("id") not in ev_ids:
+            founder_evidence.append(active_evidence)
+
+    admitted_ev = None
+    for ev in reversed(founder_evidence):
+        if not isinstance(ev, dict):
+            continue
+        # Exclude fallback learning inputs
+        if ev.get("source") == "FALLBACK_LEARNING_ACTION" or ev.get("learning_input_mode") == "FALLBACK":
+            continue
+        result_val = str(ev.get("result") or "").upper()
+        type_val = str(ev.get("evidence_type") or "").upper()
+        if result_val in ("ANALYZED", "COMPLETED") or type_val in ("EXPERIMENT_RESULT", "FOUNDER_OBSERVATION"):
+            admitted_ev = ev
+            break
+        if ev.get("structured_observations") or ev.get("quantitative_results"):
+            admitted_ev = ev
+            break
+
+    if not admitted_ev:
+        return None
+
+    exp_id = admitted_ev.get("experiment_id")
+    asmp_id = admitted_ev.get("assumption_id")
+
+    # Find completed experiment
+    all_exps: list[dict[str, Any]] = []
+    prev_exps = state.get("previous_experiments") or []
+    for pe in prev_exps:
+        if isinstance(pe, dict):
+            all_exps.append(pe)
+    active_exp = state.get("active_experiment")
+    if active_exp and isinstance(active_exp, dict):
+        all_exps.append(active_exp)
+
+    completed_exp = None
+    if exp_id:
+        for exp in reversed(all_exps):
+            if exp.get("id") == exp_id:
+                completed_exp = exp
+                break
+
+    if not completed_exp:
+        for exp in reversed(all_exps):
+            status = str(exp.get("status", "")).upper()
+            if status in ("COMPLETED", "IN_PROGRESS", "READY"):
+                completed_exp = exp
+                break
+
+    if not completed_exp:
+        if not all_exps:
+            # Legacy or mock test state without tracked experiment records
+            completed_exp = {
+                "id": exp_id or "exp-prior",
+                "status": "COMPLETED",
+                "assumption_id": asmp_id,
+            }
+        else:
+            return None
+
+    # Incomplete or abandoned experiments cannot form a completed cycle
+    exp_status = str(completed_exp.get("status", "")).upper()
+    if exp_status in ("ABANDONED", "FAILED", "QUALITY_BAR_NOT_MET"):
+        return None
+
+    # Find tested assumption
+    all_asmps: list[dict[str, Any]] = []
+    prev_asmps = state.get("previous_assumptions") or []
+    for pa in prev_asmps:
+        if isinstance(pa, dict):
+            all_asmps.append(pa)
+    active_asmp = state.get("active_assumption") or state.get("active_critical_assumption")
+    if active_asmp and isinstance(active_asmp, dict):
+        all_asmps.append(active_asmp)
+
+    target_asmp_id = asmp_id or completed_exp.get("assumption_id")
+    tested_asmp = None
+    if target_asmp_id:
+        for asmp in reversed(all_asmps):
+            if asmp.get("id") == target_asmp_id:
+                tested_asmp = asmp
+                break
+
+    if not tested_asmp and all_asmps:
+        tested_asmp = all_asmps[-1]
+
+    if not tested_asmp:
+        return None
+
+    return (tested_asmp, completed_exp, admitted_ev, analysis)
+

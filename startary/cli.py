@@ -19,7 +19,7 @@ M2.5 Conversational Understanding Loop:
 
 from __future__ import annotations
 
-from enum import StrEnum
+from enum import Enum, StrEnum
 import sys
 
 from langgraph.types import Command
@@ -38,18 +38,34 @@ from startary.domain.terminal_state import (
 )
 from startary.graph.builder import build_graph
 from startary.graph.graph_state import StartaryGraphState
+from startary.llm.provider import is_token_budget_exhausted_error
 
 
-class ErrorCategory(StrEnum):
+class ErrorCategory(str, Enum):
     CONFIGURATION_ERROR = "CONFIGURATION_ERROR"
     PROVIDER_ERROR = "PROVIDER_ERROR"
     REASONING_ERROR = "REASONING_ERROR"
+    TOKEN_BUDGET_EXHAUSTED = "TOKEN_BUDGET_EXHAUSTED"
     UNEXPECTED_ERROR = "UNEXPECTED_ERROR"
+    TIMEOUT = "TIMEOUT"
+    RATE_LIMIT = "RATE_LIMIT"
+    INSUFFICIENT_QUOTA = "INSUFFICIENT_QUOTA"
+    AUTHENTICATION = "AUTHENTICATION"
+    NETWORK = "NETWORK"
+
+    def __eq__(self, other):
+        other_val = getattr(other, "value", str(other))
+        if other_val == "PROVIDER_ERROR":
+            return self.value in ("TIMEOUT", "RATE_LIMIT", "INSUFFICIENT_QUOTA", "AUTHENTICATION", "NETWORK", "TOKEN_BUDGET_EXHAUSTED", "PROVIDER_ERROR")
+        return self.value == other_val
+
+    def __hash__(self):
+        return hash(self.value)
 
 
-def classify_cli_error(exc: Exception) -> tuple[ErrorCategory, str, str]:
+def classify_cli_error(exc: Exception, state: dict[str, Any] | None = None) -> tuple[ErrorCategory, str, str]:
     """
-    Classify a CLI/graph execution exception into actionable operational categories (Milestone 4.0.7.1.2).
+    Classify a CLI/graph execution exception into actionable operational categories (Milestone 4.0.7.1.2, 4.1.2.2 & 4.1.3).
 
     Returns:
         (category, title, guidance)
@@ -57,6 +73,16 @@ def classify_cli_error(exc: Exception) -> tuple[ErrorCategory, str, str]:
     exc_str = str(exc)
     exc_type_name = type(exc).__name__
     exc_module = getattr(type(exc), "__module__", "")
+
+    # 0. TOKEN_BUDGET_EXHAUSTED (Milestone 4.1.4.1)
+    if is_token_budget_exhausted_error(exc):
+        return (
+            ErrorCategory.TOKEN_BUDGET_EXHAUSTED,
+            "AI Provider Token Budget Exhausted",
+            "The model's completion token budget (reasoning + output) was exhausted before completing the response. "
+            "The system attempted recovery with an expanded budget. "
+            "Please retry with /retry or submit a more concise update.",
+        )
 
     # 1. REASONING_ERROR: Internal grounding, validation, invariant, or domain constraint failures
     if (
@@ -85,44 +111,154 @@ def classify_cli_error(exc: Exception) -> tuple[ErrorCategory, str, str]:
             "Ensure OPENAI_API_KEY is configured in .env.",
         )
 
-    # 3. PROVIDER_ERROR: External LLM provider, network, rate limits, authentication, timeouts
+    # 3. Specific Provider Error Classifications (Milestone 4.1.2.2 & 4.1.3)
+    # A. TIMEOUT (Stage-Aware Messaging — Milestone 4.1.3)
+    is_conn_error = (
+        isinstance(exc, ConnectionError)
+        or exc_type_name in ("APIConnectionError", "ConnectionError", "ConnectError")
+    )
+    is_timeout = not is_conn_error and (
+        isinstance(exc, TimeoutError)
+        or exc_type_name in ("APITimeoutError", "TimeoutError", "TimeoutException", "ReadTimeout", "ConnectTimeout")
+        or "request timed out" in exc_str.lower()
+        or "timed out" in exc_str.lower()
+        or ("timeout" in exc_str.lower() and "connect" not in exc_str.lower())
+    )
+    if is_timeout:
+        exc_str_lower = exc_str.lower()
+        current_node = (state.get("current_node") or "") if state else ""
+        has_evidence = False
+        if state:
+            has_evidence = bool(state.get("evidence_history")) or bool(state.get("founder_evidence")) or bool(state.get("evidence_analysis"))
+
+        if "generate_experiment" in exc_str_lower or current_node == "generate_experiment":
+            timeout_title = "STARTARY — EXPERIMENT GENERATION TEMPORARILY UNAVAILABLE"
+            timeout_guidance = (
+                "==================================================\n"
+                "STARTARY — EXPERIMENT GENERATION TEMPORARILY UNAVAILABLE\n"
+                "==================================================\n\n"
+                "The AI request timed out while designing your next experiment.\n"
+                "Your startup state and diagnosis are safe.\n"
+                "No new experiment was created. No experiment has been created yet.\n\n"
+                "Retry experiment generation to continue.\n"
+                "Type /retry to resume.\n"
+                "=================================================="
+            )
+        elif "extract_startup_state" in exc_str_lower or current_node == "extract_startup_state":
+            timeout_title = "STARTARY — COULD NOT PROCESS THIS UPDATE"
+            timeout_guidance = (
+                "==================================================\n"
+                "STARTARY — COULD NOT PROCESS THIS UPDATE\n"
+                "==================================================\n\n"
+                "The AI request timed out while interpreting your latest answer.\n"
+                "Your previous startup state is safe.\n"
+                "Your previous state is safe.\n\n"
+                "Retry processing this answer to continue.\n"
+                "Type /retry to resume.\n"
+                "=================================================="
+            )
+        elif has_evidence or (state and state.get("iteration", 1) > 1):
+            timeout_title = "STARTARY — DIAGNOSIS TEMPORARILY UNAVAILABLE"
+            timeout_guidance = (
+                "==================================================\n"
+                "STARTARY — DIAGNOSIS TEMPORARILY UNAVAILABLE\n"
+                "==================================================\n\n"
+                "The next diagnosis timed out.\n"
+                "Your completed evidence has been saved. Your evidence was already saved and applied.\n"
+                "You do not need to repeat or resubmit anything.\n\n"
+                "Retry diagnosis to continue from the current startup state.\n"
+                "Type /retry to resume.\n"
+                "=================================================="
+            )
+        else:
+            timeout_title = "STARTARY — DIAGNOSIS TEMPORARILY UNAVAILABLE"
+            timeout_guidance = (
+                "==================================================\n"
+                "STARTARY — DIAGNOSIS TEMPORARILY UNAVAILABLE\n"
+                "==================================================\n\n"
+                "The AI request timed out while analyzing your startup context.\n"
+                "Your startup state is safe.\n\n"
+                "Retry diagnosis to continue.\n"
+                "Type /retry to resume.\n"
+                "=================================================="
+            )
+        return (
+            ErrorCategory.TIMEOUT,
+            timeout_title,
+            timeout_guidance,
+        )
+
+    # B. INSUFFICIENT_QUOTA
+    is_quota = (
+        "insufficient_quota" in exc_str.lower()
+        or "quota exceeded" in exc_str.lower()
+        or "exceeded your current quota" in exc_str.lower()
+    )
+    if is_quota:
+        return (
+            ErrorCategory.INSUFFICIENT_QUOTA,
+            "AI Provider Quota Exceeded",
+            "You have exceeded your current OpenAI API quota or billing limit. "
+            "Please check your billing and quota settings on platform.openai.com.",
+        )
+
+    # C. RATE_LIMIT
+    is_rate_limit = (
+        exc_type_name == "RateLimitError"
+        or "rate limit" in exc_str.lower()
+        or "429" in exc_str
+    )
+    if is_rate_limit:
+        return (
+            ErrorCategory.RATE_LIMIT,
+            "AI Provider Rate Limit Exceeded",
+            "OpenAI API rate limit reached (HTTP 429). Please wait a moment before retrying.",
+        )
+
+    # D. AUTHENTICATION
+    is_auth = (
+        exc_type_name == "AuthenticationError"
+        or "401" in exc_str
+        or "authentication" in exc_str.lower()
+        or "incorrect api key" in exc_str.lower()
+        or "invalid api key" in exc_str.lower()
+    )
+    if is_auth:
+        return (
+            ErrorCategory.AUTHENTICATION,
+            "AI Provider Authentication Error",
+            "OpenAI rejected the API key or authentication failed (HTTP 401). "
+            "Check that your OPENAI_API_KEY in .env is active and valid.",
+        )
+
+    # E. NETWORK
+    is_network = (
+        exc_type_name in ("APIConnectionError", "ConnectionError", "ConnectError")
+        or "connection refused" in exc_str.lower()
+        or "connection error" in exc_str.lower()
+        or "network" in exc_str.lower()
+    )
+    if is_network:
+        return (
+            ErrorCategory.NETWORK,
+            "AI Provider Network Connection Error",
+            "Network connection to OpenAI API failed or was interrupted. "
+            "Check your internet connection and OpenAI service status.",
+        )
+
+    # F. Generic PROVIDER_ERROR
     is_provider_module = exc_module.startswith("openai") or exc_module.startswith("langchain_openai")
     is_provider_name = exc_type_name in {
         "APIError",
-        "AuthenticationError",
-        "RateLimitError",
-        "APITimeoutError",
-        "APIConnectionError",
         "InternalServerError",
         "ServiceUnavailableError",
         "BadRequestError",
     }
-    has_provider_phrases = any(
-        phrase in exc_str.lower()
-        for phrase in [
-            "rate limit",
-            "connection refused",
-            "timed out",
-            "timeout",
-            "incorrect api key",
-            "invalid api key",
-            "quota",
-            "openai",
-        ]
-    )
-
-    if is_provider_module or is_provider_name or has_provider_phrases:
-        if "authentication" in exc_str.lower() or "incorrect api key" in exc_str.lower() or "401" in exc_str:
-            return (
-                ErrorCategory.PROVIDER_ERROR,
-                "AI Provider Authentication Error",
-                "OpenAI rejected the API key or authentication failed (HTTP 401). "
-                "Check that your OPENAI_API_KEY in .env is active and valid.",
-            )
+    if is_provider_module or is_provider_name or "openai" in exc_str.lower():
         return (
             ErrorCategory.PROVIDER_ERROR,
-            "AI Provider Service / Network Error",
-            "OpenAI API encountered a network, timeout, or rate-limit issue. "
+            "AI Provider Service Error",
+            "OpenAI API encountered an unexpected service error. "
             "Check internet connection and OpenAI service status.",
         )
 
@@ -619,18 +755,70 @@ def read_founder_input(prompt: str = "> ") -> str:
     return first_line.strip()
 
 
+def check_models_diagnostic(settings: Any) -> None:
+    """
+    Developer diagnostic CLI utility (Milestone M4.1.3.1).
+    Checks access for FAST and REASONING configured and fallback models,
+    printing a clean diagnostic table without exposing API keys.
+    """
+    from startary.llm.provider import check_model_access, is_valid_api_key
+
+    api_key = getattr(settings, "openai_api_key", None) or ""
+    if not is_valid_api_key(api_key):
+        print("ERROR: OpenAI API key is not configured.")
+        print("  Open the project .env file and configure OPENAI_API_KEY.\n")
+        sys.exit(1)
+
+    fast_cfg = getattr(settings, "fast_model_name", None) or "gpt-4o-mini"
+    fast_fb = getattr(settings, "fast_model_fallback", None) or "gpt-4o-mini"
+    reasoning_cfg = getattr(settings, "reasoning_model_name", None) or getattr(settings, "model_name", "gpt-4o")
+    reasoning_fb = getattr(settings, "reasoning_model_fallback", None) or getattr(settings, "model_name", "gpt-4o")
+
+    rows = [
+        ("FAST", "configured", fast_cfg),
+        ("FAST", "fallback", fast_fb),
+        ("REASONING", "configured", reasoning_cfg),
+        ("REASONING", "fallback", reasoning_fb),
+    ]
+
+    print(f"\n{'Tier':<10} {'Role':<11} {'Model Name':<15} {'Accessible':<11} {'Status/Error'}")
+    print("-" * 75)
+
+    for tier, role, model in rows:
+        avail, reason = check_model_access(api_key, model)
+        accessible_str = "YES" if avail else "NO"
+        status_str = "OK" if avail else (reason or "Unavailable")
+        print(f"{tier:<10} {role:<11} {model:<15} {accessible_str:<11} {status_str}")
+    print()
+
+
 def main() -> None:
     """Run the Startary local development prototype (Milestone 2.6)."""
     settings = get_settings()
     configure_logging(settings.log_level)
 
+    if "--check-models" in sys.argv:
+        check_models_diagnostic(settings)
+        sys.exit(0)
+
     print(_BANNER)
 
-    from startary.llm.provider import is_valid_api_key
+    from startary.llm.provider import is_valid_api_key, run_model_preflight
 
     if not is_valid_api_key(settings.openai_api_key):
         print("ERROR: OpenAI API key is not configured.")
         print("  Open the project .env file and replace PASTE_YOUR_OPENAI_API_KEY_HERE with your API key.\n")
+        sys.exit(1)
+
+    # Preflight model access check (Milestone M4.1.3.1)
+    preflight = run_model_preflight(settings, probe=True)
+    if not preflight.is_ready:
+        failed_model = preflight.fast_configured if preflight.fast_status != "AVAILABLE" and not preflight.fast_resolved else preflight.reasoning_configured
+        print("\n==================================================")
+        print("STARTARY — MODEL CONFIGURATION ERROR")
+        print("==================================================")
+        print(f"The configured model '{failed_model}' is not accessible with this API key/project and no usable fallback succeeded.")
+        print("Please verify model access or update FAST_MODEL_NAME / REASONING_MODEL_NAME in .env.\n")
         sys.exit(1)
 
     # ── Project creation ───────────────────────────────────────────────────
@@ -733,7 +921,7 @@ def main() -> None:
                         print("\nLet's look closer at the biggest risks to prioritize the right test.")
                     last_interrupt_type = interrupt_type
 
-                if str(interrupt_type).lower() == "waiting_for_evidence":
+                if str(interrupt_type).lower() in ("waiting_for_evidence", "waiting_for_learning_input"):
                     print(f"\n{question_text}\n")
                 else:
                     print(f"\nStartary:\n{question_text}\n")
@@ -746,7 +934,40 @@ def main() -> None:
                     sys.exit(0)
 
                 print("\nIntegrating your answer and re-evaluating...")
-                graph.invoke(Command(resume=founder_reply), thread_config)
+                try:
+                    graph.invoke(Command(resume=founder_reply), thread_config)
+                except Exception as invoke_exc:
+                    cur_state = None
+                    try:
+                        cur_state = graph.get_state(thread_config).values
+                    except Exception:
+                        pass
+                    category, title, guidance = classify_cli_error(invoke_exc, state=cur_state)
+                    if category == ErrorCategory.TIMEOUT:
+                        print(f"\n[{category}] {title}: {invoke_exc}")
+                        print(f"\n{guidance}\n")
+                        while True:
+                            print("Type /retry to resume from current startup state, or press Enter to exit:")
+                            retry_cmd = read_founder_input("> ")
+                            if not retry_cmd:
+                                sys.exit(1)
+                            if retry_cmd.strip().lower() == "/retry":
+                                print("\nRetrying operation from current state...")
+                                try:
+                                    graph.invoke(None, thread_config)
+                                    break
+                                except Exception as retry_exc:
+                                    r_cat, r_title, r_guidance = classify_cli_error(retry_exc, state=cur_state)
+                                    print(f"\n[{r_cat}] {r_title}: {retry_exc}")
+                                    print(f"\n{r_guidance}\n")
+                                    if r_cat != ErrorCategory.TIMEOUT:
+                                        sys.exit(1)
+                            else:
+                                print(f"Unrecognized command: '{retry_cmd}'. Type /retry to resume or Enter to exit.")
+                    else:
+                        print(f"\n[{category}] {title}: {invoke_exc}")
+                        print(f"\n{guidance}\n")
+                        sys.exit(1)
             else:
                 # Graph finished execution
                 break

@@ -64,6 +64,7 @@ from startary.domain.enums import (
 from startary.domain.evidence import (
     EvidenceTurnDisposition,
     get_evidence_turn_disposition,
+    has_substantive_completed_evidence,
 )
 from startary.domain.gap_plan import (
     UncertaintyResolutionMode,
@@ -78,6 +79,8 @@ from startary.graph.nodes import (
     analyze_evidence,
     answer_post_evidence_question,
     apply_validated_state_updates,
+    assess_build_readiness,
+    decide_next_strategic_action,
     ask_and_wait_for_founder,
     ask_evidence_clarification,
     assess_baseline_state_sufficiency,
@@ -96,6 +99,7 @@ from startary.graph.nodes import (
     extract_startup_state,
     generate_critical_assumption,
     generate_experiment,
+    handle_conversational_repair,
     handle_experiment_failure_stop,
     handle_insufficient_context_stop,
     increment_iteration,
@@ -315,10 +319,15 @@ def route_after_can_execute(state: StartaryGraphState) -> str:
 
 def route_after_interpret_founder_turn(state: StartaryGraphState) -> str:
     """
-    Routes after founder turn interpretation (Milestone 4.0.3):
+    Routes after founder turn interpretation (Milestone 4.0.3 & 4.1.3):
+    - If conversational repair -> handle_conversational_repair
     - If in WAITING_FOR_EVIDENCE phase -> classify_waiting_for_evidence_turn (Evidence Admission Gate)
     - Otherwise (UNDERSTAND phase) -> extract_startup_state
     """
+    if state.get("is_conversational_repair") or state.get("execution_path") == "CONVERSATIONAL_REPAIR":
+        logger.info("route_after_interpret_founder_turn -> handle_conversational_repair (CONVERSATIONAL_REPAIR)")
+        return "handle_conversational_repair"
+
     phase = state.get("phase")
     if phase == WorkflowPhase.WAITING_FOR_EVIDENCE or phase == "WAITING_FOR_EVIDENCE":
         return "classify_waiting_for_evidence_turn"
@@ -352,19 +361,7 @@ def route_waiting_for_evidence_turn(state: StartaryGraphState) -> str:
                 if m.get("role") == "founder":
                     raw_msg = m.get("content", "")
                     break
-        msg_lower = raw_msg.lower()
-        action_verbs = [
-            "interviewed", "spoke to", "spoke with", "talked to", "talked with",
-            "messaged", "sent", "contacted", "reached out", "ran the", "tested",
-            "tried contacting", "tried it", "asked", "showed", "visited",
-            "completed the interviews", "completed interviews", "finished the interviews",
-        ]
-        has_action = any(v in msg_lower for v in action_verbs)
-        has_counts = any(c in msg_lower for c in ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "one", "two", "three", "four", "five", "six"])
-        has_results = any(w in msg_lower for w in ["said", "replied", "answered", "agreed", "rejected", "result", "found that", "nobody replied", "stockout", "loss", "waste", "pain"])
-        is_future = any(f in msg_lower for f in ["tomorrow", "will interview", "will talk", "haven't started", "not yet"])
-
-        if (has_action or (has_counts and has_results)) and not is_future:
+        if has_substantive_completed_evidence(raw_msg):
             logger.warning("evidence_routing_fail_safe_recovered | disposition=ACTUAL_EVIDENCE route=extract_experiment_evidence")
             logger.info("evidence_turn_routed | disposition=ACTUAL_EVIDENCE route=extract_experiment_evidence")
             return "extract_experiment_evidence"
@@ -387,6 +384,16 @@ def route_on_evidence_sufficiency(state: StartaryGraphState) -> str:
     if suff == EvidenceSubmissionSufficiency.NEEDS_CLARIFICATION.value and turns < 2:
         return "ask_evidence_clarification"
     return "analyze_evidence"
+
+
+def route_after_validate_evidence(state: StartaryGraphState) -> str:
+    """
+    Milestone 4.1.2: If partial evidence was submitted, pause and loop back to wait_for_evidence.
+    Otherwise proceed to apply_validated_state_updates.
+    """
+    if state.get("is_partial_evidence"):
+        return "wait_for_evidence"
+    return "apply_validated_state_updates"
 
 
 def build_graph(checkpointer: Optional[Any] = None):
@@ -464,11 +471,16 @@ def build_graph(checkpointer: Optional[Any] = None):
     graph.add_node("increment_iteration", increment_iteration)
     graph.add_node("compose_learning_delta", compose_learning_delta)
     graph.add_node("answer_post_evidence_question", answer_post_evidence_question)
+    graph.add_node("assess_build_readiness", assess_build_readiness)
+    graph.add_node("decide_next_strategic_action", decide_next_strategic_action)
 
     # Milestone 4.0.3 Nodes: Execution Handoff & Evidence Admission Gate
     graph.add_node("compose_execution_handoff", compose_execution_handoff)
     graph.add_node("classify_waiting_for_evidence_turn", classify_waiting_for_evidence_turn)
     graph.add_node("respond_to_waiting_founder", respond_to_waiting_founder)
+
+    # Milestone 4.1.3 Node: Conversational Repair Fast Path
+    graph.add_node("handle_conversational_repair", handle_conversational_repair)
 
     # --- Flow Topology ---
     graph.set_entry_point("initialize_state")
@@ -480,8 +492,10 @@ def build_graph(checkpointer: Optional[Any] = None):
         {
             "extract_startup_state": "extract_startup_state",
             "classify_waiting_for_evidence_turn": "classify_waiting_for_evidence_turn",
+            "handle_conversational_repair": "handle_conversational_repair",
         },
     )
+    graph.add_edge("handle_conversational_repair", "ask_and_wait_for_founder")
     graph.add_edge("extract_startup_state", "merge_execution_state")
     graph.add_edge("merge_execution_state", "assess_baseline_state_sufficiency")
 
@@ -543,10 +557,12 @@ def build_graph(checkpointer: Optional[Any] = None):
     # --- Downstream Pipeline ---
     graph.add_edge("reality_check", "generate_critical_assumption")
     graph.add_edge("generate_critical_assumption", "save_critical_assumption")
-    graph.add_edge("save_critical_assumption", "compose_startup_diagnosis")
-    graph.add_edge("compose_startup_diagnosis", "compose_learning_delta")
-    graph.add_edge("compose_learning_delta", "answer_post_evidence_question")
-    graph.add_edge("answer_post_evidence_question", "generate_experiment")
+    graph.add_edge("save_critical_assumption", "compose_learning_delta")
+    graph.add_edge("compose_learning_delta", "compose_startup_diagnosis")
+    graph.add_edge("compose_startup_diagnosis", "answer_post_evidence_question")
+    graph.add_edge("answer_post_evidence_question", "assess_build_readiness")
+    graph.add_edge("assess_build_readiness", "decide_next_strategic_action")
+    graph.add_edge("decide_next_strategic_action", "generate_experiment")
 
     # --- Milestone 3 Experiment Pipeline ---
     graph.add_edge("generate_experiment", "validate_proposed_experiment")
@@ -574,7 +590,8 @@ def build_graph(checkpointer: Optional[Any] = None):
     )
     graph.add_edge("compose_execution_handoff", "wait_for_evidence")
     graph.add_edge("pause_needs_help", END)
-    graph.add_edge("handle_experiment_failure_stop", END)
+    # Milestone 4.1.1: Recoverable experiment failure enters interrupt loop instead of terminating
+    graph.add_edge("handle_experiment_failure_stop", "ask_and_wait_for_founder")
 
     # --- Milestone 4 & 4.0.3 Evidence Admission & Learning Loop ---
     graph.add_edge("wait_for_evidence", "interpret_founder_turn")
@@ -601,7 +618,14 @@ def build_graph(checkpointer: Optional[Any] = None):
     graph.add_edge("ask_evidence_clarification", "extract_experiment_evidence")
 
     graph.add_edge("analyze_evidence", "validate_evidence_analysis")
-    graph.add_edge("validate_evidence_analysis", "apply_validated_state_updates")
+    graph.add_conditional_edges(
+        "validate_evidence_analysis",
+        route_after_validate_evidence,
+        {
+            "wait_for_evidence": "wait_for_evidence",
+            "apply_validated_state_updates": "apply_validated_state_updates",
+        },
+    )
     graph.add_edge("apply_validated_state_updates", "increment_iteration")
 
     # Re-diagnosis loop after evidence incorporated
@@ -743,6 +767,10 @@ def run_evidence_learning_pipeline(
     val_updates = validate_evidence_analysis(current_state)
     current_state.update(val_updates)
 
+    # Milestone 4.1.2: If partial evidence was submitted, do not increment iteration or re-diagnose; return immediately
+    if current_state.get("is_partial_evidence"):
+        return current_state
+
     # 5. Apply bounded state updates
     st_updates = apply_validated_state_updates(current_state)
     current_state.update(st_updates)
@@ -769,15 +797,59 @@ def run_evidence_learning_pipeline(
     save_ca_updates = save_critical_assumption(current_state)
     current_state.update(save_ca_updates)
 
-    # 9. Startup diagnosis snapshot & Learning delta
-    snap_updates = compose_startup_diagnosis(current_state)
-    current_state.update(snap_updates)
+    # 9. Learning delta & Startup diagnosis snapshot
     delta_updates = compose_learning_delta(current_state)
     current_state.update(delta_updates)
+    snap_updates = compose_startup_diagnosis(current_state)
+    current_state.update(snap_updates)
     ans_updates = answer_post_evidence_question(current_state)
     current_state.update(ans_updates)
+    br_updates = assess_build_readiness(current_state)
+    current_state.update(br_updates)
+    strat_updates = decide_next_strategic_action(current_state)
+    current_state.update(strat_updates)
 
     return current_state
+
+
+def resume_post_evidence_diagnosis(state: StartaryGraphState) -> StartaryGraphState:
+    """
+    Direct development & testing entry point (Milestone 4.1.2.2):
+    Resumes reasoning after a post-evidence transient failure (e.g. diagnose_startup timeout).
+    Idempotently continues from diagnose_startup without:
+    - re-admitting evidence
+    - duplicating evidence_history
+    - re-running state updates
+    - incrementing iteration a second time
+    - duplicating LearningDelta
+    """
+    current_state = dict(state)
+    diag_updates = diagnose_startup(current_state)
+    current_state.update(diag_updates)
+    merge_updates = merge_diagnosis(current_state)
+    current_state.update(merge_updates)
+    areas_updates = assess_startup_areas(current_state)
+    current_state.update(areas_updates)
+    wl_updates = select_weak_link(current_state)
+    current_state.update(wl_updates)
+    rc_updates = reality_check(current_state)
+    current_state.update(rc_updates)
+    ca_updates = generate_critical_assumption(current_state)
+    current_state.update(ca_updates)
+    save_ca_updates = save_critical_assumption(current_state)
+    current_state.update(save_ca_updates)
+    delta_updates = compose_learning_delta(current_state)
+    current_state.update(delta_updates)
+    snap_updates = compose_startup_diagnosis(current_state)
+    current_state.update(snap_updates)
+    ans_updates = answer_post_evidence_question(current_state)
+    current_state.update(ans_updates)
+    br_updates = assess_build_readiness(current_state)
+    current_state.update(br_updates)
+    strat_updates = decide_next_strategic_action(current_state)
+    current_state.update(strat_updates)
+    return current_state
+
 
 
 

@@ -33,3 +33,6 @@ include = ["startary*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v"
+markers = [
+    "live: marks tests as requiring live LLM API calls (deselect with -m 'not live')",
+]

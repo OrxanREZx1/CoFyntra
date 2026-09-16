@@ -83,7 +83,7 @@ def test_compact_handoff_contains_exactly_5_key_sections():
     assert "WHAT SHOULD I DO?" in rendered
     assert "WHAT SHOULD I BRING BACK?" in rendered
     assert "WHAT COUNTS AS A USEFUL SIGNAL?" in rendered
-    assert "WHAT LOOKS PROMISING SO FAR?" in rendered
+    assert "WHAT LOOKS PROMISING SO FAR?" not in rendered
 
     # Target roughly 500-900 chars (allow slight margin, strictly < 1200)
     assert 300 < len(rendered) < 1200

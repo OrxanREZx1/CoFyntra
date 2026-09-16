@@ -802,6 +802,10 @@ class ExperimentGeneratorLLMOutput(BaseModel):
     target_participants_or_scope: str = Field(
         description="Target participant profile, participant count, or channel scope.",
     )
+    target_sample_size: Optional[int] = Field(
+        default=None,
+        description="Explicit target sample size or number of qualifying observations required (Milestone 4.1.2.2).",
+    )
     founder_actions: list[str] = Field(
         min_length=1,
         description="Concrete sequential steps the founder must take.",
@@ -830,10 +834,12 @@ class ExperimentGeneratorLLMOutput(BaseModel):
         min_length=1,
         description="What this experiment CANNOT teach us (epistemic guardrails).",
     )
-    estimated_time: str = Field(
+    estimated_time: Optional[str] = Field(
+        default="2-4 days",
         description="Estimated time to complete (e.g. '2-4 days', '1 week').",
     )
-    estimated_cost: str = Field(
+    estimated_cost: Optional[str] = Field(
+        default="Near-zero / $0",
         description="Estimated financial budget (e.g. 'Near-zero / $0', '$50').",
     )
     required_capabilities: list[str] = Field(
@@ -1305,6 +1311,44 @@ class WaitingForEvidenceAdvisorLLMOutput(BaseModel):
     rationale: str = Field(
         description="Brief reasoning explaining how the response addresses the founder's specific intent.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Milestone 4.1 Schemas: Build Readiness / Experiment Escalation
+# ---------------------------------------------------------------------------
+
+class BuildReadinessAssessmentLLMOutput(BaseModel):
+    """
+    Structured build readiness decision evaluating whether the next learning cycle
+    should remain manual or requires a minimal product-mediated prototype (Milestone 4.1).
+    """
+    decision: str = Field(
+        description="Controlled decision: 'CONTINUE_MANUAL' or 'BUILD_MINIMAL_PROTOTYPE'."
+    )
+    reason: str = Field(
+        description="Concise rationale explaining why manual testing suffices or why software is now required."
+    )
+    manual_learning_sufficient: bool = Field(
+        default=False,
+        description="True if prerequisite uncertainties have been sufficiently reduced with empirical evidence."
+    )
+    next_uncertainty_requires_product: bool = Field(
+        default=False,
+        description="True if the active critical assumption strictly requires unmediated product interaction."
+    )
+    minimum_build_scope: list[str] = Field(
+        default_factory=list,
+        description="Minimal essential capabilities required to test this specific assumption."
+    )
+    must_not_build: list[str] = Field(
+        default_factory=list,
+        description="Explicitly excluded features to protect against feature creep and roadmapping."
+    )
+    evidence_basis: list[str] = Field(
+        default_factory=list,
+        description="Grounded historical evidence citations supporting this decision."
+    )
+
 
 
 

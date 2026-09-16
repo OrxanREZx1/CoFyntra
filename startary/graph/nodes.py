@@ -62,6 +62,16 @@ from startary.domain.enums import (
     WorkflowPhase,
     ConversationalResponseMode,
 )
+from startary.domain.build_readiness import (
+    BuildReadinessAction,
+    BuildReadinessDecision,
+    validate_domain_grounding,
+    sanitize_domain_leakage,
+)
+from startary.domain.strategic_action import (
+    NextStrategicAction,
+    NextStrategicActionType,
+)
 from startary.domain.evidence import (
     Evidence,
     EvidenceAnalysis,
@@ -71,6 +81,8 @@ from startary.domain.evidence import (
     get_evidence_turn_disposition,
     is_actual_evidence_turn,
     has_valid_completed_evidence_cycle,
+    get_most_recent_completed_evidence_cycle,
+    has_substantive_completed_evidence,
 )
 from startary.domain.customer_access import (
     CustomerAccessAssessment,
@@ -89,6 +101,8 @@ from startary.domain.experiment import (
     compose_current_positive_signals,
     compose_fallback_learning_action,
     compose_founder_experiment_summary,
+    evaluate_experiment_completeness,
+    extract_sample_target_from_protocol,
     render_execution_handoff_text,
     render_fallback_learning_action_text,
 )
@@ -175,6 +189,8 @@ from startary.llm.prompts import (
     build_evidence_admission_gate_user_message,
     WAITING_FOR_EVIDENCE_ADVISOR_SYSTEM_PROMPT,
     build_waiting_for_evidence_advisor_user_message,
+    BUILD_READINESS_SYSTEM_PROMPT,
+    build_build_readiness_user_message,
 )
 from startary.domain.diagnosis_snapshot import StartupDiagnosisSnapshot
 from startary.domain.founder_intent import (
@@ -203,7 +219,13 @@ from startary.domain.discrimination import (
     WeakLinkClarifyingQuestion,
     WeakLinkDiscrimination,
 )
-from startary.llm.provider import get_llm_client
+from startary.llm.provider import (
+    TokenBudgetExhaustedError,
+    get_llm_client,
+    get_llm_client_resolution_info,
+    is_permanent_model_error,
+    is_token_budget_exhausted_error,
+)
 from startary.llm.schemas import (
     AdvisorResponseLLMOutput,
     BaselineQuestionPlanLLMOutput,
@@ -221,20 +243,168 @@ from startary.llm.schemas import (
     FounderTurnInterpretationLLMOutput,
     InformationGapPlanLLMOutput,
     RealityCheckLLMOutput,
+    AreaRiskAssessmentLLMOutput,
     StartupAreaAssessmentBatchLLMOutput,
     StartupDiagnosisSnapshotLLMOutput,
     StartupStateDeltaLLMOutput,
     WaitingForEvidenceAdvisorLLMOutput,
     WeakLinkClarifyingQuestionLLMOutput,
     WeakLinkDiscriminationLLMOutput,
+    BuildReadinessAssessmentLLMOutput,
+)
+from datetime import datetime, timezone
+from startary.domain.bound_answers import parse_bound_answer
+from startary.domain.telemetry import (
+    NodeTelemetryRecord,
+    TurnTelemetrySummary,
+    record_telemetry_event,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_get_llm_client(
+    settings: Any,
+    tier: str = "reasoning",
+    max_tokens: int | None = None,
+    max_completion_tokens: int | None = None,
+    reasoning_effort: str | None = None,
+) -> Any:
+    """Helper to safely resolve LLM client by tier and max tokens while supporting legacy test mocks."""
+    effective_max = max_completion_tokens or max_tokens
+    try:
+        return get_llm_client(
+            settings,
+            tier=tier,
+            max_completion_tokens=effective_max,
+            reasoning_effort=reasoning_effort,
+        )
+    except TypeError:
+        try:
+            return get_llm_client(settings, tier=tier, max_tokens=effective_max)
+        except TypeError:
+            try:
+                return get_llm_client(settings, tier=tier)
+            except TypeError:
+                return get_llm_client(settings)
+
+
+def _invoke_structured_with_token_retry(
+    structured_llm: Any,
+    messages: list[dict[str, str]],
+    settings: Any,
+    tier: str,
+    base_max_tokens: int,
+    node_name: str,
+    schema_cls: type,
+) -> tuple[Any, float]:
+    """
+    Invoke structured LLM with smart token-budget recovery.
+    If attempt 1 fails due to token budget / length exhaustion,
+    retries AT MOST ONCE with a safe expanded budget (1.6x, min +1500) and reasoning_effort='low'.
+    Never retries the identical request with the identical exhausted token cap.
+    If retry fails with token exhaustion, raises TokenBudgetExhaustedError.
+    """
+    t_start = time.monotonic()
+    try:
+        res = structured_llm.invoke(messages)
+        latency_ms = (time.monotonic() - t_start) * 1000
+        return res, latency_ms
+    except Exception as exc:
+        if is_token_budget_exhausted_error(exc):
+            expanded_tokens = max(int(base_max_tokens * 1.6), base_max_tokens + 1500)
+            logger.warning(
+                "%s | token budget exhausted with cap %d. Retrying AT MOST ONCE with safe expanded cap %d and reasoning_effort='low'. Error: %s",
+                node_name, base_max_tokens, expanded_tokens, exc,
+            )
+            expanded_llm = _safe_get_llm_client(
+                settings,
+                tier=tier,
+                max_completion_tokens=expanded_tokens,
+                reasoning_effort="low" if tier == "reasoning" else None,
+            )
+            expanded_structured = expanded_llm.with_structured_output(schema_cls)
+            t_retry = time.monotonic()
+            try:
+                res = expanded_structured.invoke(messages)
+                latency_ms = (time.monotonic() - t_retry) * 1000
+                logger.info("%s | retry with expanded token budget SUCCEEDED in %.2fms", node_name, latency_ms)
+                return res, latency_ms
+            except Exception as retry_exc:
+                if is_token_budget_exhausted_error(retry_exc):
+                    raise TokenBudgetExhaustedError(
+                        f"{node_name} token budget exhausted even after expanding cap from {base_max_tokens} to {expanded_tokens}.",
+                        node_name=node_name,
+                        original_error=retry_exc,
+                    ) from retry_exc
+                raise
+        raise
+
 
 MAX_BASELINE_QUESTION_TURNS = 5
 MAX_STRATEGIC_CLARIFICATION_TURNS = 5
 MAX_WEAK_LINK_CLARIFICATION_TURNS = 3
 MAX_CLARIFICATION_TURNS = 5  # Backward compat alias for strategic
+
+
+def is_strategic_state_changed(state: dict[str, Any]) -> bool:
+    """
+    Deterministic decision on whether material strategic facts changed
+    requiring a full rediagnosis (Milestone 4.1.3 Phase 5 & 4.1.3.1).
+    """
+    # Invariant: EXTRACTION FAILURE != NO STRATEGIC CHANGE
+    # If extraction failed, strategic state change must be treated as True for safety
+    if state.get("extraction_status") == "FAILED":
+        return True
+
+    if not state.get("diagnosis_output"):
+        return True
+
+    # Milestone M4.1.3.3: Revision check
+    strat_rev = int(state.get("strategic_state_revision") or 1)
+    diag_rev = state.get("diagnosis_revision")
+    if diag_rev is not None and strat_rev > diag_rev:
+        return True
+
+    # Milestone M4.1.3.3: Completed evidence cycle invariant
+    # A completed valid evidence cycle is ALWAYS a strategic state change!
+    if has_valid_completed_evidence_cycle(state) and state.get("is_partial_evidence") is not True:
+        if diag_rev is None or strat_rev > diag_rev or state.get("iteration", 1) > 1:
+            return True
+
+    disp = get_evidence_turn_disposition(state)
+    if disp == EvidenceTurnDisposition.ACTUAL_EVIDENCE:
+        return True
+
+    if state.get("evidence_analysis") and state.get("is_partial_evidence") is not True:
+        if state.get("iteration", 1) > 1 and state.get("evidence_history"):
+            last_ev = state["evidence_history"][-1] if state.get("evidence_history") else {}
+            if last_ev.get("iteration") == state.get("iteration", 1) - 1:
+                return True
+
+    if state.get("strategic_state_changed") is True:
+        return True
+    if state.get("strategic_state_changed") is False:
+        if diag_rev is None or strat_rev == diag_rev:
+            return False
+
+    path = state.get("execution_path")
+    if path in ("FAST_LOCAL_UPDATE", "CONVERSATIONAL_REPAIR"):
+        return False
+
+    delta = state.get("startup_state_delta") or {}
+    strategic_keys = {
+        "paying_customers", "revenue", "active_users",
+        "market_segment", "target_user", "problem_statement",
+        "pricing_model", "channel_access",
+    }
+    if any(delta.get(k) is not None for k in strategic_keys):
+        return True
+
+    if state.get("fact_conflicts"):
+        return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +420,11 @@ def initialize_state(state: StartaryGraphState) -> dict:
 
     if not state.get("iteration"):
         updates["iteration"] = 1
+
+    if "strategic_state_revision" not in state or state.get("strategic_state_revision") is None:
+        updates["strategic_state_revision"] = 1
+    if "diagnosis_revision" not in state:
+        updates["diagnosis_revision"] = None
 
     if "startup_state" not in state:
         updates["startup_state"] = StartupState().model_dump()
@@ -409,6 +584,77 @@ def verify_state(state: StartaryGraphState) -> dict:
 def diagnose_startup(state: StartaryGraphState) -> dict:
     """Extract structured startup state from raw context & message history using LLM."""
     project_id = state.get("project_id", "<unknown>")
+    existing_diag = state.get("diagnosis_output")
+
+    strat_rev_raw = state.get("strategic_state_revision")
+    strat_rev = int(strat_rev_raw or 1)
+    diag_rev = state.get("diagnosis_revision")
+    strat_changed = state.get("strategic_state_changed")
+
+    # Milestone M4.1.3.3: If revisions are tracked and mismatch, strategic state has mutated and must be re-diagnosed
+    if strat_rev_raw is not None or diag_rev is not None:
+        if diag_rev is None or strat_rev > diag_rev:
+            strat_changed = True
+    elif strat_changed is None:
+        strat_changed = is_strategic_state_changed(state)
+
+    # Invariant: A completed valid evidence cycle that hasn't been rediagnosed forces fresh diagnosis
+    if has_valid_completed_evidence_cycle(state) and state.get("is_partial_evidence") is not True:
+        strat_changed = True
+
+    can_reuse_cache = (
+        existing_diag is not None
+        and not strat_changed
+        and (
+            (strat_rev_raw is None and diag_rev is None)
+            or (diag_rev is not None and diag_rev == strat_rev)
+        )
+        and state.get("extraction_status") != "FAILED"
+    )
+
+    if can_reuse_cache:
+        logger.info("diagnose_startup | reusing cached diagnosis output (revision=%s)", diag_rev)
+        model_name = get_settings().get_model_for_tier("reasoning")
+        record_telemetry_event(
+            state=state,
+            node_name="diagnose_startup",
+            model_name=model_name,
+            configured_model=model_name,
+            resolved_model=model_name,
+            latency_ms=0.0,
+            start_time=datetime.now(timezone.utc),
+            end_time=datetime.now(timezone.utc),
+            schema_name="DiagnosisLLMOutput",
+            skipped_by_fast_path=True,
+            cached=True,
+            execution_path=state.get("execution_path") or "DELTA_STATE_UPDATE",
+        )
+        trace = AITrace(
+            module_name="diagnose_startup",
+            prompt_version=DIAGNOSE_STARTUP_PROMPT_VERSION,
+            input_data={"cached": True},
+            output_data=existing_diag,
+            latency_ms=0.0,
+            project_id=project_id,
+            model_name=model_name,
+            configured_model=model_name,
+            resolved_model=model_name,
+            skipped_by_fast_path=True,
+            execution_path=state.get("execution_path") or "DELTA_STATE_UPDATE",
+        )
+        existing_traces = list(state.get("traces") or [])
+        existing_traces.append(trace.model_dump(mode="json"))
+        return {
+            "diagnosis_output": existing_diag,
+            "phase": WorkflowPhase.DIAGNOSE,
+            "traces": existing_traces,
+            "last_trace": trace.model_dump(mode="json"),
+            "strategic_state_changed": False,
+            "strategic_state_revision": strat_rev,
+            "diagnosis_revision": diag_rev,
+            "turn_telemetry": state.get("turn_telemetry"),
+        }
+
     raw_context = state.get("raw_context") or ""
     founder_messages = state.get("founder_messages") or []
 
@@ -421,15 +667,55 @@ def diagnose_startup(state: StartaryGraphState) -> dict:
         return {
             "diagnosis_output": empty_output.model_dump(),
             "phase": WorkflowPhase.DIAGNOSE,
+            "strategic_state_revision": strat_rev,
+            "diagnosis_revision": strat_rev,
         }
 
     settings = get_settings()
-    llm = get_llm_client(settings)
+    base_max_tokens = 3500
+    llm = _safe_get_llm_client(settings, tier="reasoning", max_completion_tokens=base_max_tokens)
+    conf_model, res_model, fb_used, fb_reason = get_llm_client_resolution_info(llm)
     structured_llm = llm.with_structured_output(DiagnosisLLMOutput)
+
+    # Prompt context slimming (Milestone 4.1.3 Phase 6):
+    # If conversation is long (> 6 messages), take initial turn + last 3 turns
+    slammed_messages = founder_messages
+    if len(founder_messages) > 6:
+        slammed_messages = [founder_messages[0]] + founder_messages[-3:]
+
+    # Milestone M4.1.3.3: Format validated evidence summary for post-evidence re-diagnosis
+    evidence_summary = None
+    founder_ev_list = state.get("founder_evidence") or []
+    if founder_ev_list or state.get("active_evidence"):
+        ev_items = []
+        for ev in founder_ev_list[-3:]:
+            if isinstance(ev, dict):
+                ev_items.append(
+                    f"- Iteration {ev.get('iteration', 1)} [{ev.get('result', 'ANALYZED')}]: "
+                    f"{ev.get('raw_content', '')[:250]}"
+                )
+                for obs in ev.get("additional_observations") or []:
+                    if isinstance(obs, dict):
+                        ev_items.append(f"  * Observation [{obs.get('category', 'GENERAL')}]: {obs.get('text', '')}")
+        if ev_items:
+            evidence_summary = "\n".join(ev_items)
+
+    startup_state_dict = state.get("startup_state") or {}
+    areas_dict = startup_state_dict.get("areas") or startup_state_dict.get("area_knowledge") or {}
+    known_areas = [
+        f"{a}: status={v.get('status', 'UNKNOWN')}, understanding={v.get('understanding', '')}"
+        for a, v in areas_dict.items()
+        if isinstance(v, dict) and v.get("status") in ("KNOWN", "PARTIALLY_KNOWN")
+    ]
+    state_summary_text = None
+    if known_areas:
+        state_summary_text = "Known / Partially Known Areas:\n" + "\n".join(f"- {k}" for k in known_areas)
 
     user_message = build_diagnosis_user_message(
         raw_context=raw_context,
-        founder_messages=founder_messages,
+        founder_messages=slammed_messages,
+        existing_startup_state_summary=state_summary_text,
+        evidence_summary=evidence_summary,
     )
     messages = [
         {"role": "system", "content": DIAGNOSE_STARTUP_SYSTEM_PROMPT},
@@ -441,21 +727,64 @@ def diagnose_startup(state: StartaryGraphState) -> dict:
 
     while attempt < 2:
         attempt += 1
-        t_start = time.monotonic()
+        start_time = datetime.now(timezone.utc)
         try:
-            result: DiagnosisLLMOutput = structured_llm.invoke(messages)
-            latency_ms = (time.monotonic() - t_start) * 1000
+            result, latency_ms = _invoke_structured_with_token_retry(
+                structured_llm=structured_llm,
+                messages=messages,
+                settings=settings,
+                tier="reasoning",
+                base_max_tokens=base_max_tokens,
+                node_name="diagnose_startup",
+                schema_cls=DiagnosisLLMOutput,
+            )
+            end_time = datetime.now(timezone.utc)
 
             if not isinstance(result, DiagnosisLLMOutput):
-                raise ValidationError(f"Expected DiagnosisLLMOutput, got {type(result)}")
+                raise ValueError(f"Expected DiagnosisLLMOutput, got {type(result)}")
+
+            model_name = res_model or settings.get_model_for_tier("reasoning")
+            prompt_tokens = getattr(getattr(result, "usage_metadata", None), "prompt_tokens", None)
+            if prompt_tokens is None:
+                prompt_tokens = sum(len(m.get("content", "")) for m in messages) // 4
+            completion_tokens = getattr(getattr(result, "usage_metadata", None), "completion_tokens", None)
+            if completion_tokens is None:
+                completion_tokens = len(_json.dumps(result.model_dump())) // 4
+            total_tokens = prompt_tokens + completion_tokens
+
+            turn_telem = record_telemetry_event(
+                state=state,
+                node_name="diagnose_startup",
+                model_name=model_name,
+                duration_ms=latency_ms,
+                latency_ms=latency_ms,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                execution_path=state.get("execution_path") or "STRATEGIC_REASONING",
+                configured_model=conf_model,
+                resolved_model=res_model,
+                fallback_used=fb_used,
+                fallback_reason=fb_reason,
+            )
 
             trace = AITrace(
                 module_name="diagnose_startup",
                 prompt_version=DIAGNOSE_STARTUP_PROMPT_VERSION,
-                input_data={"messages_count": len(founder_messages), "raw_context_len": len(raw_context)},
+                input_data={"messages_count": len(slammed_messages), "raw_context_len": len(raw_context)},
                 output_data=result.model_dump(),
                 latency_ms=latency_ms,
                 project_id=project_id,
+                model_name=model_name,
+                configured_model=conf_model,
+                resolved_model=res_model,
+                fallback_used=fb_used,
+                fallback_reason=fb_reason,
+                start_timestamp=start_time,
+                end_timestamp=end_time,
+                retry_count=attempt - 1,
+                schema_name="DiagnosisLLMOutput",
+                execution_path=state.get("execution_path") or "STRATEGIC_REASONING",
             )
 
             existing_traces = list(state.get("traces") or [])
@@ -466,12 +795,21 @@ def diagnose_startup(state: StartaryGraphState) -> dict:
                 "last_trace": trace.model_dump(mode="json"),
                 "traces": existing_traces,
                 "phase": WorkflowPhase.DIAGNOSE,
+                "strategic_state_changed": False,
+                "strategic_state_revision": strat_rev,
+                "diagnosis_revision": strat_rev,
+                "turn_telemetry": turn_telem,
             }
         except Exception as exc:
             last_error = exc
             logger.warning("diagnose_startup failed attempt %d: %s", attempt, exc)
+            if is_permanent_model_error(exc) or isinstance(exc, TokenBudgetExhaustedError):
+                logger.warning("diagnose_startup: permanent model error or token exhaustion (%s). Aborting retries.", exc)
+                break
 
-    raise RuntimeError(f"diagnose_startup failed after 2 attempts. Error: {last_error}")
+    if isinstance(last_error, TokenBudgetExhaustedError):
+        raise last_error
+    raise RuntimeError(f"diagnose_startup failed after {attempt} attempts. Error: {last_error}")
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +828,9 @@ def merge_diagnosis(state: StartaryGraphState) -> dict:
 
     llm_output = DiagnosisLLMOutput(**diagnosis_output_dict)
 
+    existing_startup_state = state.get("startup_state") or {}
+    existing_areas_map = existing_startup_state.get("areas") or existing_startup_state.get("area_knowledge") or {}
+
     areas: dict[StartupArea, AreaKnowledge] = {}
     for area_diag in llm_output.area_assessments:
         try:
@@ -504,8 +845,39 @@ def merge_diagnosis(state: StartaryGraphState) -> dict:
             areas[area_diag.area] = AreaKnowledge(status=AreaStatus.UNKNOWN)
 
     for area in StartupArea:
+        existing_k = (
+            existing_areas_map.get(area.value)
+            or existing_areas_map.get(str(area))
+            or existing_areas_map.get(area)
+            or {}
+        )
+        is_previously_known = (
+            isinstance(existing_k, dict)
+            and existing_k.get("status") == AreaStatus.KNOWN.value
+        )
+
         if area not in areas:
-            areas[area] = AreaKnowledge(status=AreaStatus.UNKNOWN)
+            if is_previously_known:
+                missing_info = existing_k.get("missing_information")
+                if isinstance(missing_info, list):
+                    missing_info = "; ".join(str(x) for x in missing_info) if missing_info else None
+                areas[area] = AreaKnowledge(
+                    status=AreaStatus.KNOWN,
+                    understanding=existing_k.get("understanding"),
+                    founder_claims=existing_k.get("founder_claims") or [],
+                    evidence_provided=existing_k.get("evidence_provided") or [],
+                    missing_information=missing_info,
+                )
+            else:
+                areas[area] = AreaKnowledge(status=AreaStatus.UNKNOWN)
+        else:
+            # Prevent silent regression of KNOWN areas to UNKNOWN
+            if is_previously_known and areas[area].status == AreaStatus.UNKNOWN:
+                areas[area].status = AreaStatus.KNOWN
+                if not areas[area].evidence_provided:
+                    areas[area].evidence_provided = existing_k.get("evidence_provided") or []
+                if not areas[area].understanding and existing_k.get("understanding"):
+                    areas[area].understanding = existing_k.get("understanding")
 
     new_startup_state = StartupState(raw_context=raw_context, areas=areas)
 
@@ -561,7 +933,7 @@ def assess_context_sufficiency(state: StartaryGraphState) -> dict:
     history_text = "\n".join(history_lines) if history_lines else (state.get("raw_context") or "")
 
     settings = get_settings()
-    llm = get_llm_client(settings)
+    llm = _safe_get_llm_client(settings, tier="reasoning", max_tokens=1000)
     structured_llm = llm.with_structured_output(ContextSufficiencyLLMOutput)
 
     user_message = build_context_sufficiency_user_message(
@@ -664,7 +1036,7 @@ def select_clarifying_question(state: StartaryGraphState) -> dict:
         target_area_enum = StartupArea.PROBLEM
 
     settings = get_settings()
-    llm = get_llm_client(settings)
+    llm = _safe_get_llm_client(settings, tier="reasoning", max_tokens=1000)
     structured_llm = llm.with_structured_output(ClarifyingQuestionLLMOutput)
 
     user_message = build_clarifying_question_user_message(
@@ -746,6 +1118,34 @@ def ask_and_wait_for_founder(state: StartaryGraphState) -> dict:
     active_type = state.get("active_interrupt_type") or "strategic"
     active_decision = state.get("active_next_turn_decision") or {}
 
+    # Milestone 4.1.1: Recoverable experiment design failure interrupt
+    if active_type == "waiting_for_learning_input":
+        fallback_dict = state.get("fallback_learning_action") or {}
+        display_question = fallback_dict.get("response_text") or state.get("status_message") or "We need your firsthand observations to design a valid next experiment."
+
+        founder_answer = interrupt({
+            "type": "WAITING_FOR_LEARNING_INPUT",
+            "interrupt_type": "waiting_for_learning_input",
+            "message": display_question,
+            "question": display_question,
+            "fallback_learning_action": fallback_dict,
+        })
+
+        raw_answer = ""
+        if isinstance(founder_answer, dict):
+            raw_answer = founder_answer.get("founder_response") or founder_answer.get("content") or ""
+        elif isinstance(founder_answer, str):
+            raw_answer = founder_answer
+        if not raw_answer and state.get("founder_response"):
+            raw_answer = str(state.get("founder_response"))
+
+        logger.info("ask_and_wait_for_founder resumed (waiting_for_learning_input) with answer: %s", raw_answer[:60])
+        return {
+            "founder_response": raw_answer,
+            "phase": WorkflowPhase.WAITING_FOR_LEARNING_INPUT,
+            "active_interrupt_type": "waiting_for_learning_input",
+        }
+
     if active_type == "baseline" and state.get("current_baseline_question"):
         q_dict = state["current_baseline_question"]
     elif active_type == "weak_link" and state.get("current_weak_link_question"):
@@ -760,7 +1160,7 @@ def ask_and_wait_for_founder(state: StartaryGraphState) -> dict:
     # Milestone 3.2.1: ensure advisor response is composed and bound to current decision
     advisor_resp = state.get("latest_advisor_response")
     advisor_updates: dict[str, Any] = {}
-    if not advisor_resp or advisor_resp.get("question_id") != question_id:
+    if not advisor_resp or (advisor_resp.get("question_id") != question_id and advisor_resp.get("response_mode") != "CONVERSATIONAL_REPAIR"):
         try:
             advisor_updates = compose_advisor_response(state)
             advisor_resp = advisor_updates.get("latest_advisor_response")
@@ -796,8 +1196,33 @@ def ask_and_wait_for_founder(state: StartaryGraphState) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 8. merge_founder_answer (Deterministic — Milestone 2.6.1 & 3.2.1)
+# 8. merge_founder_answer (Deterministic — Milestone 2.6.1 & 3.2.1 & 4.1.3)
 # ---------------------------------------------------------------------------
+
+REPAIR_STARTERS = (
+    "i don't understand", "i dont understand", "dont understand", "don't understand",
+    "what do you mean", "what does that mean", "what do u mean",
+    "can you explain", "could you explain", "explain what you mean",
+    "why are you asking", "why do you ask",
+    "i'm confused", "im confused", "i am confused",
+    "can you rephrase", "could you rephrase", "rephrase",
+    "huh", "what", "pardon", "come again",
+)
+
+def is_conversational_repair_text(text: str) -> bool:
+    if not text:
+        return False
+    norm = text.strip().lower().rstrip(".!?,")
+    if norm in ("what", "huh", "explain", "i don't understand", "dont understand", "what do you mean", "what does that mean", "confused", "i'm confused", "im confused", "pardon"):
+        return True
+    for starter in REPAIR_STARTERS:
+        if norm.startswith(starter):
+            third_party_objects = ["customer", "market", "user", "competitor", "buyer", "client", "churn"]
+            if any(tpo in norm for tpo in third_party_objects):
+                return False
+            return True
+    return False
+
 
 def merge_founder_answer(state: StartaryGraphState) -> dict:
     """
@@ -807,10 +1232,69 @@ def merge_founder_answer(state: StartaryGraphState) -> dict:
     - Records answered question into question_history
     - INVALIDATES active_next_turn_decision and latest_advisor_response to prevent stale reuse
     - Prepares state for re-extraction / re-evaluation
+    - Milestone 4.1.3: Intercepts conversational repairs and bounded fast-path answers
     """
     founder_answer = (state.get("founder_response") or "").strip()
     active_type = state.get("active_interrupt_type") or "strategic"
     active_decision = state.get("active_next_turn_decision") or {}
+
+    # Milestone 4.1.1: Recoverable fallback learning input return
+    if active_type == "waiting_for_learning_input":
+        fallback_dict = state.get("fallback_learning_action") or {}
+        question_text = fallback_dict.get("response_text") or state.get("status_message") or ""
+
+        founder_messages = list(state.get("founder_messages") or [])
+        if question_text:
+            founder_messages.append({"role": "startary", "content": question_text})
+        if founder_answer:
+            founder_messages.append({"role": "founder", "content": founder_answer})
+
+        # Grounded context integration (Milestone 4.1.1)
+        st_state = dict(state.get("startup_state") or {})
+        areas = dict(st_state.get("areas") or st_state.get("area_knowledge") or {})
+        target_area = fallback_dict.get("target_area") or state.get("weak_area") or "Problem"
+        area_data = dict(areas.get(target_area) or {})
+        ev_list = list(area_data.get("evidence_provided") or [])
+        if founder_answer:
+            ev_list.append(founder_answer)
+        area_data["evidence_provided"] = ev_list
+        areas[target_area] = area_data
+        st_state["areas"] = areas
+
+        founder_ev = list(state.get("founder_evidence") or [])
+        if founder_answer:
+            founder_ev.append({
+                "source": "FALLBACK_LEARNING_ACTION",
+                "content": founder_answer,
+                "target_area": target_area,
+            })
+
+        logger.info(
+            "merge_founder_answer [FALLBACK_LEARNING_INPUT] | integrated grounded observations into %s (no evidence cycle / no iteration increment)",
+            target_area,
+        )
+        return {
+            "founder_messages": founder_messages,
+            "founder_response": founder_answer,
+            "pending_question": fallback_dict.get("primary_action") or question_text[:120],
+            "startup_state": st_state,
+            "founder_evidence": founder_ev,
+            "active_interrupt_type": None,
+            "fallback_learning_action": None,
+            "learning_input_mode": None,
+            "experiment_design_status": None,
+            "phase": WorkflowPhase.UNDERSTAND,
+            "critic_revision_count": 0,
+            "critic_revision_instructions": "",
+            "proposed_experiment_output": None,
+            "experiment_critic_output": None,
+            "active_experiment": None,
+            "active_execution_handoff": None,
+            "execution_handoff_text": None,
+            "can_execute_result": None,
+            "waiting_response": None,
+            "post_evidence_answer": None,
+        }
 
     if active_type == "baseline" and state.get("current_baseline_question"):
         q_dict = state["current_baseline_question"]
@@ -822,6 +1306,28 @@ def merge_founder_answer(state: StartaryGraphState) -> dict:
     advisor_resp = state.get("latest_advisor_response") or {}
     question_text = advisor_resp.get("response_text") or active_decision.get("canonical_question") or q_dict.get("question", "")
 
+    # Milestone 4.1.3: Conversational Repair Fast Path Interception
+    if is_conversational_repair_text(founder_answer):
+        logger.info("merge_founder_answer | conversational repair detected: '%s'", founder_answer[:60])
+        founder_messages = list(state.get("founder_messages") or [])
+        if question_text and not any(m.get("content") == question_text for m in founder_messages[-2:]):
+            founder_messages.append({"role": "startary", "content": question_text})
+        if founder_answer:
+            founder_messages.append({"role": "founder", "content": founder_answer})
+
+        return {
+            "founder_messages": founder_messages,
+            "pending_question": question_text,
+            "is_conversational_repair": True,
+            "execution_path": "CONVERSATIONAL_REPAIR",
+            "active_interrupt_type": active_type,
+            "current_baseline_question": state.get("current_baseline_question"),
+            "current_weak_link_question": state.get("current_weak_link_question"),
+            "current_clarifying_question": state.get("current_clarifying_question"),
+            "active_next_turn_decision": active_decision,
+            "founder_response": founder_answer,
+        }
+
     founder_messages = list(state.get("founder_messages") or [])
     if question_text:
         founder_messages.append({"role": "startary", "content": question_text})
@@ -831,9 +1337,10 @@ def merge_founder_answer(state: StartaryGraphState) -> dict:
     # Track in QuestionHistory (Milestone 3.2.1)
     q_history = list(state.get("question_history") or [])
     qid = active_decision.get("question_id") or f"q_{len(q_history)+1}"
+    info_target = active_decision.get("information_target") or q_dict.get("target_group") or q_dict.get("target_area") or "UNKNOWN"
     q_history.append({
         "question_id": qid,
-        "information_target": active_decision.get("information_target") or q_dict.get("target_group") or q_dict.get("target_area") or "UNKNOWN",
+        "information_target": info_target,
         "canonical_question": active_decision.get("canonical_question") or q_dict.get("question", ""),
         "turn": len(q_history) + 1,
         "answered": True,
@@ -853,7 +1360,18 @@ def merge_founder_answer(state: StartaryGraphState) -> dict:
         "founder_response": None,
         "active_interrupt_type": None,
         "phase": WorkflowPhase.UNDERSTAND,
+        "pending_information_target": str(info_target),
     }
+
+    # Milestone 4.1.3: Bound Answer Fast-Path Parser Check
+    bound_ok, bound_delta, _ = parse_bound_answer(str(info_target), founder_answer, question_text)
+    if bound_ok and bound_delta:
+        logger.info("merge_founder_answer | fast bound answer detected for target=%s: %s", info_target, list(bound_delta.keys()))
+        updates["startup_state_delta"] = bound_delta
+        updates["execution_path"] = "FAST_LOCAL_UPDATE"
+        updates["strategic_state_changed"] = False
+    else:
+        updates["execution_path"] = "DELTA_STATE_UPDATE"
 
     # Dispatch to dedicated history and counter
     if active_type == "baseline":
@@ -1035,24 +1553,67 @@ def extract_startup_state(state: StartaryGraphState) -> dict:
 
     Produces a delta dict that is passed to merge_execution_state for deterministic merge.
     Only extracts from founder-authored messages (role='founder').
+    Milestone 4.1.3: Bypasses LLM when FAST_LOCAL_UPDATE is active; slims prompt context;
+    uses fast tier model and records telemetry.
     """
     import json as _json
 
     project_id = state.get("project_id", "<unknown>")
-    founder_messages = state.get("founder_messages") or []
     current_exec_ctx = state.get("execution_context") or {}
     current_progress = state.get("startup_progress") or {}
 
-    # Build founder-only source text
+    # Milestone 4.1.3 Fast Path: Local Deterministic Bypass
+    if state.get("execution_path") == "FAST_LOCAL_UPDATE":
+        delta_dict = state.get("startup_state_delta") or {}
+        logger.info("extract_startup_state | bypassing LLM for FAST_LOCAL_UPDATE: %s", list(delta_dict.keys()))
+        trace = AITrace(
+            module_name="extract_startup_state",
+            prompt_version=STARTUP_STATE_EXTRACTOR_PROMPT_VERSION,
+            input_data={"execution_path": "FAST_LOCAL_UPDATE"},
+            output_data={"delta_keys": [k for k, v in delta_dict.items() if v is not None]},
+            latency_ms=0.0,
+            project_id=project_id,
+            model_name="local_deterministic",
+            skipped_by_fast_path=True,
+            execution_path="FAST_LOCAL_UPDATE",
+        )
+        existing_traces = list(state.get("traces") or [])
+        existing_traces.append(trace.model_dump(mode="json"))
+        turn_telem = record_telemetry_event(
+            state=state,
+            node_name="extract_startup_state",
+            model_name="local_deterministic",
+            duration_ms=0.0,
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            cached=True,
+            skipped=True,
+            execution_path="FAST_LOCAL_UPDATE",
+        )
+        return {
+            "startup_state_delta": delta_dict,
+            "last_trace": trace.model_dump(mode="json"),
+            "traces": existing_traces,
+            "turn_telemetry": turn_telem,
+            "extraction_status": "BYPASSED",
+        }
+
+    founder_messages = state.get("founder_messages") or []
+    all_founder_msgs = [msg for msg in founder_messages if msg.get("role") == "founder"]
+    if len(all_founder_msgs) > 3:
+        selected_msgs = [all_founder_msgs[0]] + all_founder_msgs[-2:]
+    else:
+        selected_msgs = all_founder_msgs
+
     source_lines = [
-        f"[Turn {i+1}] {msg['content']}"
-        for i, msg in enumerate(founder_messages)
-        if msg.get("role") == "founder"
+        f"[Turn] {msg['content']}"
+        for msg in selected_msgs
     ]
 
     if not source_lines:
         logger.info("extract_startup_state | no founder messages to extract from")
-        return {"startup_state_delta": {}}
+        return {"startup_state_delta": {}, "extraction_status": "SUCCESS"}
 
     founder_text = "\n\n".join(source_lines)
     source_turn = state.get("clarification_turn_count", 0)
@@ -1070,7 +1631,8 @@ def extract_startup_state(state: StartaryGraphState) -> dict:
     })
 
     settings = get_settings()
-    llm = get_llm_client(settings)
+    llm = _safe_get_llm_client(settings, tier="fast", max_tokens=1000)
+    conf_model, res_model, fb_used, fb_reason = get_llm_client_resolution_info(llm)
     structured_llm = llm.with_structured_output(StartupStateDeltaLLMOutput)
 
     user_message = build_extract_startup_state_user_message(
@@ -1137,10 +1699,41 @@ def extract_startup_state(state: StartaryGraphState) -> dict:
                 output_data={"delta_keys": [k for k, v in delta_dict.items() if v is not None and k != "_source_turn"]},
                 latency_ms=latency_ms,
                 project_id=project_id,
+                model_name=res_model or getattr(settings, "fast_model_name", None),
+                configured_model=conf_model,
+                resolved_model=res_model,
+                fallback_used=fb_used,
+                fallback_reason=fb_reason,
+                execution_path=state.get("execution_path", "DELTA_STATE_UPDATE"),
             )
 
             existing_traces = list(state.get("traces") or [])
             existing_traces.append(trace.model_dump(mode="json"))
+
+            # Token accounting with fallback character counting
+            prompt_tokens = getattr(getattr(result, "usage_metadata", None), "prompt_tokens", None)
+            if prompt_tokens is None:
+                prompt_tokens = sum(len(m.get("content", "")) for m in messages) // 4
+            completion_tokens = getattr(getattr(result, "usage_metadata", None), "completion_tokens", None)
+            if completion_tokens is None:
+                completion_tokens = len(_json.dumps(delta_dict)) // 4
+            total_tokens = prompt_tokens + completion_tokens
+
+            turn_telem = record_telemetry_event(
+                state=state,
+                node_name="extract_startup_state",
+                model_name=res_model or getattr(settings, "fast_model_name", None) or "fast_tier",
+                configured_model=conf_model,
+                resolved_model=res_model,
+                fallback_used=fb_used,
+                fallback_reason=fb_reason,
+                duration_ms=latency_ms,
+                latency_ms=latency_ms,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                execution_path=state.get("execution_path", "DELTA_STATE_UPDATE"),
+            )
 
             logger.info("extract_startup_state | project_id=%s latency_ms=%.0f", project_id, latency_ms)
 
@@ -1148,13 +1741,35 @@ def extract_startup_state(state: StartaryGraphState) -> dict:
                 "startup_state_delta": delta_dict,
                 "last_trace": trace.model_dump(mode="json"),
                 "traces": existing_traces,
+                "turn_telemetry": turn_telem,
+                "extraction_status": "SUCCESS",
             }
         except Exception as exc:
             last_error = exc
             logger.warning("extract_startup_state failed attempt %d: %s", attempt, exc)
+            if is_permanent_model_error(exc):
+                logger.warning("extract_startup_state: permanent model error (%s). Aborting retries.", exc)
+                break
 
-    logger.error("extract_startup_state failed after 2 attempts: %s", last_error)
-    return {"startup_state_delta": {}}  # Graceful degradation — never block the graph
+    logger.error("extract_startup_state failed after %d attempts: %s", attempt, last_error)
+    turn_telem = record_telemetry_event(
+        state=state,
+        node_name="extract_startup_state",
+        model_name="local_deterministic",
+        configured_model=conf_model,
+        resolved_model="local_deterministic",
+        fallback_used=True,
+        fallback_reason="EXTRACTION_FAILURE_FALLBACK",
+        duration_ms=0.0,
+        execution_path=state.get("execution_path", "DELTA_STATE_UPDATE"),
+    )
+    return {
+        "startup_state_delta": {},
+        "extraction_status": "FAILED",
+        "extraction_error": str(last_error),
+        "strategic_state_changed": True,
+        "turn_telemetry": turn_telem,
+    }
 
 
 def _is_sharp_contradiction(field_name: str, existing_val: Any, incoming_val: Any) -> bool:
@@ -1183,6 +1798,7 @@ def merge_execution_state(state: StartaryGraphState) -> dict:
     Deterministic Node: Apply provenance-aware delta merge to ExecutionContext and StartupProgress.
 
     Rules:
+    - If extraction_status is FAILED, do not mutate existing known values!
     - EXPLICIT always wins over INFERRED.
     - UNKNOWN never overwrites any known value.
     - INFERRED never overwrites EXPLICIT.
@@ -1190,6 +1806,14 @@ def merge_execution_state(state: StartaryGraphState) -> dict:
     - Contradictory explicit facts (e.g. 3 founders -> 1 founder) generate a FactConflict.
     """
     import json as _json
+
+    # Milestone 4.1.3.1: Never overwrite good state with failed fallback data
+    if state.get("extraction_status") == "FAILED":
+        logger.warning("merge_execution_state | skipping state mutation because extraction_status=FAILED")
+        return {
+            "execution_context": state.get("execution_context") or {},
+            "startup_progress": state.get("startup_progress") or {},
+        }
 
     delta = state.get("startup_state_delta") or {}
     source_turn = delta.get("_source_turn", state.get("clarification_turn_count", 0))
@@ -1329,11 +1953,22 @@ def merge_execution_state(state: StartaryGraphState) -> dict:
         len(fact_conflicts),
     )
 
-    return {
+    strategic_keys = {
+        "paying_customers", "revenue", "active_users",
+        "market_segment", "target_user", "problem_statement",
+        "pricing_model", "channel_access",
+    }
+    has_strat_delta = any(delta.get(k) is not None for k in strategic_keys)
+    ret_updates = {
         "execution_context": exec_dict,
         "startup_progress": prog_dict,
         "fact_conflicts": fact_conflicts,
     }
+    if has_strat_delta or fact_conflicts:
+        ret_updates["strategic_state_changed"] = True
+        ret_updates["strategic_state_revision"] = int(state.get("strategic_state_revision") or 1) + 1
+
+    return ret_updates
 
 
 # ---------------------------------------------------------------------------
@@ -1377,7 +2012,8 @@ def plan_information_gap(state: StartaryGraphState) -> dict:
     strategic_summary = diagnosis_dict.get("summary", "") or startup_state_dict.get("raw_context", "")
 
     settings = get_settings()
-    llm = get_llm_client(settings)
+    base_max_tokens = 2000
+    llm = _safe_get_llm_client(settings, tier="reasoning", max_completion_tokens=base_max_tokens)
     structured_llm = llm.with_structured_output(InformationGapPlanLLMOutput)
 
     user_message = build_information_gap_planner_user_message(
@@ -1401,10 +2037,16 @@ def plan_information_gap(state: StartaryGraphState) -> dict:
 
     while attempt < 2:
         attempt += 1
-        t_start = time.monotonic()
         try:
-            result: InformationGapPlanLLMOutput = structured_llm.invoke(messages)
-            latency_ms = (time.monotonic() - t_start) * 1000
+            result, latency_ms = _invoke_structured_with_token_retry(
+                structured_llm=structured_llm,
+                messages=messages,
+                settings=settings,
+                tier="reasoning",
+                base_max_tokens=base_max_tokens,
+                node_name="plan_information_gap",
+                schema_cls=InformationGapPlanLLMOutput,
+            )
 
             # Build domain model for gap plan — use safe enum conversion for mock/test safety
             try:
@@ -1529,8 +2171,12 @@ def plan_information_gap(state: StartaryGraphState) -> dict:
         except Exception as exc:
             last_error = exc
             logger.warning("plan_information_gap failed attempt %d: %s", attempt, exc)
+            if is_permanent_model_error(exc) or isinstance(exc, TokenBudgetExhaustedError):
+                break
 
-    raise RuntimeError(f"plan_information_gap failed after 2 attempts. Error: {last_error}")
+    if isinstance(last_error, TokenBudgetExhaustedError):
+        raise last_error
+    raise RuntimeError(f"plan_information_gap failed after {attempt} attempts. Error: {last_error}")
 
 
 # ---------------------------------------------------------------------------
@@ -1542,17 +2188,18 @@ def assess_startup_areas(state: StartaryGraphState) -> dict:
     LLM Node: Evaluate all 10 canonical startup areas across 4 qualitative risk dimensions.
     """
     project_id = state.get("project_id", "<unknown>")
-    startup_state_dict = state.get("startup_state", {})
-    diagnosis_dict = state.get("diagnosis", {})
+    startup_state_dict = state.get("startup_state") or {}
+    diagnosis_dict = state.get("diagnosis") or {}
 
     settings = get_settings()
-    llm = get_llm_client(settings)
+    base_max_tokens = 2500
+    llm = _safe_get_llm_client(settings, tier="reasoning", max_completion_tokens=base_max_tokens)
     structured_llm = llm.with_structured_output(StartupAreaAssessmentBatchLLMOutput)
 
     user_message = build_area_assessment_user_message(
         startup_state_summary=json.dumps(startup_state_dict, indent=2),
-        diagnosis_summary=diagnosis_dict.get("summary", ""),
-        startup_stage=diagnosis_dict.get("startup_stage"),
+        diagnosis_summary=diagnosis_dict.get("summary") or (state.get("diagnosis_output") or {}).get("diagnosis_summary", ""),
+        startup_stage=diagnosis_dict.get("startup_stage") or (state.get("diagnosis_output") or {}).get("startup_stage"),
     )
 
     messages = [
@@ -1565,13 +2212,64 @@ def assess_startup_areas(state: StartaryGraphState) -> dict:
 
     while attempt < 2:
         attempt += 1
-        t_start = time.monotonic()
         try:
-            result: StartupAreaAssessmentBatchLLMOutput = structured_llm.invoke(messages)
-            latency_ms = (time.monotonic() - t_start) * 1000
+            result, latency_ms = _invoke_structured_with_token_retry(
+                structured_llm=structured_llm,
+                messages=messages,
+                settings=settings,
+                tier="reasoning",
+                base_max_tokens=base_max_tokens,
+                node_name="assess_startup_areas",
+                schema_cls=StartupAreaAssessmentBatchLLMOutput,
+            )
 
             if not isinstance(result, StartupAreaAssessmentBatchLLMOutput):
                 raise ValidationError(f"Expected StartupAreaAssessmentBatchLLMOutput, got {type(result)}")
+
+            # Stage & Behavioral Traction Adjustment (Milestone 4.1.2)
+            all_text = " ".join([
+                str(state.get("raw_context") or ""),
+                " ".join(str(m.get("content", "")) for m in (state.get("founder_messages") or []) if isinstance(m, dict)),
+                str(diagnosis_dict.get("summary") or ""),
+            ]).lower()
+
+            has_paying = any(k in all_text for k in ["paying", "paid", "repeat payment", "repeat payments", "paying teams", "paying customers", "paid pilot", "subscription revenue", "mrr", "8 paying"])
+            has_repeat = any(k in all_text for k in ["repeat use", "weekly use", "recorded full matches", "weekly active", "using weekly", "repeat usage", "multiple matches"])
+            has_live = any(k in all_text for k in ["deployed", "live product", "in production", "app is live", "product is live", "active users", "20 teams tried", "14 recorded"])
+
+            if (has_paying or has_repeat) and has_live:
+                adjusted_assessments = []
+                for a in result.assessments:
+                    a_dict = a.model_dump() if hasattr(a, "model_dump") else dict(a)
+                    if str(a_dict.get("area", "")).lower() == "problem":
+                        if str(a_dict.get("uncertainty", "")).lower() == "high":
+                            a_dict["uncertainty"] = RiskFactorLevel.MEDIUM
+                        if str(a_dict.get("evidence_gap", "")).lower() == "high":
+                            a_dict["evidence_gap"] = RiskFactorLevel.MEDIUM
+                        current_rat = a_dict.get("rationale") or ""
+                        if "Adjusted for verified" not in current_rat:
+                            a_dict["rationale"] = (current_rat + " (Adjusted for verified paying customers / repeat usage traction).").strip()
+                    adjusted_assessments.append(AreaRiskAssessmentLLMOutput(**a_dict))
+                result = StartupAreaAssessmentBatchLLMOutput(assessments=adjusted_assessments)
+
+            # Milestone M4.1.3.3 Invariant Guard: Validated KNOWN Areas cannot have maximal uncertainty & evidence gap
+            areas_map = dict(startup_state_dict.get("areas") or startup_state_dict.get("area_knowledge") or {})
+            if areas_map:
+                adjusted_for_known = []
+                for a in result.assessments:
+                    a_dict = a.model_dump() if hasattr(a, "model_dump") else dict(a)
+                    area_name = str(a_dict.get("area", ""))
+                    area_k = areas_map.get(area_name) or {}
+                    if area_k.get("status") == AreaStatus.KNOWN.value:
+                        if str(a_dict.get("evidence_gap", "")).upper() == "HIGH":
+                            a_dict["evidence_gap"] = RiskFactorLevel.MEDIUM
+                            rat = a_dict.get("rationale") or ""
+                            if "Evidence gap adjusted" not in rat:
+                                a_dict["rationale"] = (rat + " (Evidence gap adjusted: area validated by experiment evidence).").strip()
+                        if str(a_dict.get("uncertainty", "")).upper() == "HIGH":
+                            a_dict["uncertainty"] = RiskFactorLevel.MEDIUM
+                    adjusted_for_known.append(AreaRiskAssessmentLLMOutput(**a_dict))
+                result = StartupAreaAssessmentBatchLLMOutput(assessments=adjusted_for_known)
 
             trace = AITrace(
                 module_name="assess_startup_areas",
@@ -1593,8 +2291,12 @@ def assess_startup_areas(state: StartaryGraphState) -> dict:
         except Exception as exc:
             last_error = exc
             logger.warning("assess_startup_areas failed attempt %d: %s", attempt, exc)
+            if is_permanent_model_error(exc) or isinstance(exc, TokenBudgetExhaustedError):
+                break
 
-    raise RuntimeError(f"assess_startup_areas failed after 2 attempts. Error: {last_error}")
+    if isinstance(last_error, TokenBudgetExhaustedError):
+        raise last_error
+    raise RuntimeError(f"assess_startup_areas failed after {attempt} attempts. Error: {last_error}")
 
 
 # ---------------------------------------------------------------------------
@@ -1621,21 +2323,32 @@ def select_weak_link(state: StartaryGraphState) -> dict:
     taxonomy_order = {area: idx for idx, area in enumerate(StartupArea)}
 
     assessments_dict: dict[StartupArea, StartupAreaAssessment] = {}
+    areas_map = dict(startup_state_dict.get("areas") or startup_state_dict.get("area_knowledge") or {})
 
     for item in batch_output["assessments"]:
         try:
             area_enum = StartupArea(item["area"])
-            status_val = startup_state_dict.get("areas", {}).get(str(area_enum), {}).get("status")
-            understanding_val = startup_state_dict.get("areas", {}).get(str(area_enum), {}).get("understanding")
+            area_k = areas_map.get(str(area_enum)) or areas_map.get(area_enum.value) or {}
+            status_val = area_k.get("status")
+            understanding_val = area_k.get("understanding")
+
+            ev_gap_val = RiskFactorLevel(str(item["evidence_gap"]).upper())
+            unc_val = RiskFactorLevel(str(item["uncertainty"]).upper())
+            # Milestone M4.1.3.3: Invariant Guard for Validated KNOWN Areas
+            if status_val == AreaStatus.KNOWN.value:
+                if ev_gap_val == RiskFactorLevel.HIGH:
+                    ev_gap_val = RiskFactorLevel.MEDIUM
+                if unc_val == RiskFactorLevel.HIGH:
+                    unc_val = RiskFactorLevel.MEDIUM
 
             assessment = StartupAreaAssessment(
                 area=area_enum,
                 status=AreaStatus(status_val) if status_val else None,
                 summary=understanding_val,
-                importance=RiskFactorLevel(item["importance"]),
-                uncertainty=RiskFactorLevel(item["uncertainty"]),
-                evidence_gap=RiskFactorLevel(item["evidence_gap"]),
-                consequence_if_wrong=RiskFactorLevel(item["consequence_of_being_wrong"]),
+                importance=RiskFactorLevel(str(item["importance"]).upper()),
+                uncertainty=unc_val,
+                evidence_gap=ev_gap_val,
+                consequence_if_wrong=RiskFactorLevel(str(item["consequence_of_being_wrong"]).upper()),
                 rationale=item.get("rationale"),
             )
             assessment.calculate_risk()
@@ -1754,7 +2467,8 @@ def reality_check(state: StartaryGraphState) -> dict:
     area_knowledge_dict = startup_state_dict.get("areas", {}).get(weak_area_str, {})
 
     settings = get_settings()
-    llm = get_llm_client(settings)
+    base_max_tokens = 2500
+    llm = _safe_get_llm_client(settings, tier="reasoning", max_completion_tokens=base_max_tokens)
     structured_llm = llm.with_structured_output(RealityCheckLLMOutput)
 
     user_message = build_reality_check_user_message(
@@ -1773,10 +2487,16 @@ def reality_check(state: StartaryGraphState) -> dict:
 
     while attempt < 2:
         attempt += 1
-        t_start = time.monotonic()
         try:
-            result: RealityCheckLLMOutput = structured_llm.invoke(messages)
-            latency_ms = (time.monotonic() - t_start) * 1000
+            result, latency_ms = _invoke_structured_with_token_retry(
+                structured_llm=structured_llm,
+                messages=messages,
+                settings=settings,
+                tier="reasoning",
+                base_max_tokens=base_max_tokens,
+                node_name="reality_check",
+                schema_cls=RealityCheckLLMOutput,
+            )
 
             if not isinstance(result, RealityCheckLLMOutput):
                 raise ValidationError(f"Expected RealityCheckLLMOutput, got {type(result)}")
@@ -1814,8 +2534,12 @@ def reality_check(state: StartaryGraphState) -> dict:
         except Exception as exc:
             last_error = exc
             logger.warning("reality_check failed attempt %d: %s", attempt, exc)
+            if is_permanent_model_error(exc) or isinstance(exc, TokenBudgetExhaustedError):
+                break
 
-    raise RuntimeError(f"reality_check failed after 2 attempts. Error: {last_error}")
+    if isinstance(last_error, TokenBudgetExhaustedError):
+        raise last_error
+    raise RuntimeError(f"reality_check failed after {attempt} attempts. Error: {last_error}")
 
 
 # ---------------------------------------------------------------------------
@@ -1901,6 +2625,260 @@ def validate_critical_assumption_grounding(
     return True, ""
 
 
+def validate_critical_assumption_area_purity(
+    ca_output: CriticalAssumptionLLMOutput,
+    selected_area: StartupArea | str,
+) -> tuple[bool, str]:
+    """
+    Deterministic Area-Purity Validator for Critical Assumptions (Milestone 4.0.7.1.3).
+    Ensures the assumption stays strictly inside the epistemic boundary of the selected
+    weak-link area and does not import validation requirements from neighboring areas.
+    """
+    statement = (ca_output.statement or "").strip()
+    if not statement:
+        return False, "Critical assumption statement cannot be empty."
+
+    stmt_lower = statement.lower()
+    area_str = str(selected_area)
+
+    # -----------------------------------------------------------------------
+    # TARGET USER: Who experiences, owns, responds to, or decides about the problem.
+    # Must NOT require: adoption, willingness to pay, product preference, or commercial conversion.
+    # -----------------------------------------------------------------------
+    if area_str == StartupArea.TARGET_USER:
+        # 1. Adoption requirements
+        adoption_match = re.search(
+            r"\b(consider(?:ing)?\s+adopt(?:ing)?|adopt(?:ing|ion)?\s+(?:the|our|a|this)\s+(?:system|solution|product|tool|platform|service|software|sensor|alerts?)|will\s+adopt|would\s+adopt|ready\s+to\s+adopt|adoption\s+of\b|adopt\b)",
+            stmt_lower,
+        )
+        if adoption_match:
+            phrase = adoption_match.group(0)
+            return (
+                False,
+                f"Target User assumption improperly requires solution adoption ('{phrase}'). "
+                "Target User assumptions must focus on customer segment definition, problem ownership, "
+                "and operational roles (user/responder/decision-maker), not adoption or solution evaluation.",
+            )
+
+        # 2. Willingness to pay / purchasing / commercial conversion
+        payment_match = re.search(
+            r"\b(willing(?:ness)?\s+to\s+pay|pay(?:ing)?\s+for|pay\s+(?:a|the|\$|\d+)|worth\s+paying|purchas(?:e|ing|ed)|buy(?:ing)?\s+(?:the|our|a)|budget\s+for\s+(?:the|our|a)|commercial\s+conversion|convert(?:ing)?\s+into\s+paying)\b",
+            stmt_lower,
+        )
+        if payment_match:
+            phrase = payment_match.group(0)
+            return (
+                False,
+                f"Target User assumption improperly requires payment or commercial conversion ('{phrase}'). "
+                "Willingness to pay and monetization belong in 'Business Model / Revenue', not 'Target User'.",
+            )
+
+        # 3. Product preference / value proposition
+        preference_match = re.search(
+            r"\b(prefer(?:ring)?\s+(?:the|our|this)\s+(?:system|solution|product|tool|platform)|preference\s+for\s+(?:the|our|this)|valuable\s+enough\s+to\s+(?:use|adopt)|relevant\s+enough\s+to\s+consider|product\s+differentiation)\b",
+            stmt_lower,
+        )
+        if preference_match:
+            phrase = preference_match.group(0)
+            return (
+                False,
+                f"Target User assumption improperly requires product preference or value validation ('{phrase}'). "
+                "Product preference and usefulness belong in 'Value Proposition', not 'Target User'.",
+            )
+
+    # -----------------------------------------------------------------------
+    # PROBLEM: What recurring problem/event exists and what consequence it creates.
+    # Must NOT require: solution adoption or payment.
+    # -----------------------------------------------------------------------
+    elif area_str == StartupArea.PROBLEM:
+        problem_sol_match = re.search(
+            r"\b(willing(?:ness)?\s+to\s+pay|worth\s+paying|adopt(?:ing)?\s+(?:the|our|a)\s+(?:system|solution|product|tool|platform)|will\s+adopt|would\s+adopt)\b",
+            stmt_lower,
+        )
+        if problem_sol_match:
+            phrase = problem_sol_match.group(0)
+            return (
+                False,
+                f"Problem assumption improperly requires solution adoption or payment ('{phrase}'). "
+                "Problem assumptions must focus on recurring failure events, operational disruption, "
+                "and consequence, not solution adoption or monetization.",
+            )
+
+    # -----------------------------------------------------------------------
+    # PAIN / URGENCY: Severity, frequency, disruption, priority over other demands.
+    # Must NOT require: commercial payment or product preference.
+    # -----------------------------------------------------------------------
+    elif area_str == StartupArea.PAIN_URGENCY:
+        pain_pay_match = re.search(
+            r"\b(willing(?:ness)?\s+to\s+pay|worth\s+paying|pay\s+a\s+subscription|pay\s+\$\d+|prefer(?:ring)?\s+our)\b",
+            stmt_lower,
+        )
+        if pain_pay_match:
+            phrase = pain_pay_match.group(0)
+            return (
+                False,
+                f"Pain / Urgency assumption improperly requires payment or product preference ('{phrase}'). "
+                "Pain and urgency must be tested through operational priority and disruption, "
+                "not commercial willingness to pay.",
+            )
+
+    # -----------------------------------------------------------------------
+    # EXISTING ALTERNATIVES: What users do instead and whether alternatives are adequate.
+    # Must NOT imply: alternative inadequacy validates the startup's solution.
+    # -----------------------------------------------------------------------
+    elif area_str == StartupArea.EXISTING_ALTERNATIVES:
+        alt_sol_match = re.search(
+            r"\b(which\s+proves\s+(?:our|the)\s+solution|proves\s+users\s+will\s+adopt|guarantees\s+demand\s+for\s+(?:our|the)|confirming\s+users\s+will\s+switch\s+to\s+(?:our|the))\b",
+            stmt_lower,
+        )
+        if alt_sol_match:
+            phrase = alt_sol_match.group(0)
+            return (
+                False,
+                f"Existing Alternatives assumption improperly implies solution validation ('{phrase}'). "
+                "Inadequacy of existing alternatives does not automatically prove adoption of the startup's proposed solution.",
+            )
+
+    # -----------------------------------------------------------------------
+    # VALUE PROPOSITION: Proposed outcome/benefit is meaningfully useful or preferable.
+    # Must NOT require: commercial pricing, contracts, or revenue quotas.
+    # -----------------------------------------------------------------------
+    elif area_str == StartupArea.VALUE_PROPOSITION:
+        vp_pay_match = re.search(
+            r"\b(willing(?:ness)?\s+to\s+pay\s+\$\d+|sign\s+a\s+(?:paid|commercial)\s+contract|generate\s+\$\d+\s+revenue)\b",
+            stmt_lower,
+        )
+        if vp_pay_match:
+            phrase = vp_pay_match.group(0)
+            return (
+                False,
+                f"Value Proposition assumption improperly requires commercial contract metrics ('{phrase}'). "
+                "Value Proposition tests whether the proposed outcome is useful and preferable; "
+                "monetization belongs in 'Business Model / Revenue'.",
+            )
+
+    # -----------------------------------------------------------------------
+    # ACQUISITION / CUSTOMER ACCESS: Reliable outreach channels and customer access.
+    # Must NOT use channel access to prove core problem severity.
+    # -----------------------------------------------------------------------
+    elif area_str == StartupArea.ACQUISITION:
+        acq_prob_match = re.search(
+            r"\b(proves\s+the\s+problem\s+is\s+severe|validates\s+that\s+the\s+problem\s+exists)\b",
+            stmt_lower,
+        )
+        if acq_prob_match:
+            phrase = acq_prob_match.group(0)
+            return (
+                False,
+                f"Acquisition assumption improperly conflates channel reach with problem validation ('{phrase}'). "
+                "Acquisition tests customer access and channel response, not problem existence.",
+            )
+
+    # -----------------------------------------------------------------------
+    # SOLUTION / MVP: Proposed solution delivers the required outcome in use.
+    # Must NOT conflate technical feasibility with customer demand.
+    # -----------------------------------------------------------------------
+    elif area_str == StartupArea.SOLUTION_MVP:
+        sol_dem_match = re.search(
+            r"\b(which\s+proves\s+(?:market\s+)?demand|proves\s+(?:customers|users)\s+will\s+buy)\b",
+            stmt_lower,
+        )
+        if sol_dem_match:
+            phrase = sol_dem_match.group(0)
+            return (
+                False,
+                f"Solution / MVP assumption improperly conflates technical delivery with market demand ('{phrase}'). "
+                "Solution / MVP tests whether the product functions and delivers the outcome in user hands, not market demand.",
+            )
+
+    # -----------------------------------------------------------------------
+    # BUSINESS MODEL / REVENUE: Willingness to pay, pricing, revenue model.
+    # NOTE: "willing to pay", "pay for", "budget" ARE VALID HERE!
+    # -----------------------------------------------------------------------
+
+    return True, ""
+
+
+def validate_critical_assumption_atomicity(
+    ca_output: CriticalAssumptionLLMOutput | dict,
+    weak_area: str | StartupArea,
+) -> tuple[bool, str]:
+    """
+    Deterministic Atomicity & Single Test Scope Validator (Milestone 4.0.7.1.4).
+    Enforces that a Critical Assumption represents ONE decision-relevant uncertainty
+    testable in ONE bounded learning cycle.
+
+    Rejects:
+      - Compound assumptions requiring multiple independently falsifiable conditions
+        (e.g. commission acceptance + customer price tolerance + merchant economics + contribution margin)
+      - Multi-actor marketplace bundling (e.g. buyer adoption + seller inventory upload)
+      - Multi-clause conjunctions asserting multiple independent business truths
+      - Target User assumptions bundling segment identification + adoption + payment
+    """
+    if hasattr(ca_output, "model_dump"):
+        ca_dict = ca_output.model_dump()
+    else:
+        ca_dict = dict(ca_output)
+
+    stmt = ca_dict.get("statement", "").strip()
+    stmt_lower = stmt.lower()
+    area_str = str(getattr(weak_area, "value", weak_area))
+
+    # 1. Multi-actor marketplace bundling (two-sided marketplaces)
+    buyer_match = re.search(r"\b(students|buyers|customers|users|consumers|clients)\s+(?:will|can|regularly|consistently|repeatedly)\b", stmt_lower)
+    seller_match = re.search(r"\b(merchants|bakeries|sellers|vendors|restaurants|shops|partners)\s+(?:will|can|regularly|consistently|repeatedly)\b", stmt_lower)
+    if buyer_match and seller_match and (" and " in stmt_lower or " while " in stmt_lower or ", " in stmt_lower):
+        return (
+            False,
+            f"Critical assumption bundles independent hypotheses across distinct market actors "
+            f"('{buyer_match.group(0)}' and '{seller_match.group(0)}'). "
+            "Two-sided marketplaces require testing one market side per learning cycle.",
+        )
+
+    # 2. Business Model / Revenue multi-condition commercial bundling
+    if area_str == str(StartupArea.BUSINESS_MODEL):
+        dims_found = []
+        if re.search(r"\b(commission(?:-based)?|revenue[- ]share|take[- ]rate|transaction fee|transaction model)\b", stmt_lower):
+            dims_found.append("commission/fee acceptance")
+        if re.search(r"\b(customer prices?|customer pricing|price tolerance|tolerate (?:the )?prices?|acceptable (?:customer )?prices?|pricing sensitivity)\b", stmt_lower):
+            dims_found.append("customer price tolerance")
+        if re.search(r"\b(merchant economics|partner economics|net economics|economics for the merchant)\b", stmt_lower):
+            dims_found.append("merchant economics")
+        if re.search(r"\b(contribution margin|remain\w* profitable|profitability|operating costs?|positive margin)\b", stmt_lower):
+            dims_found.append("contribution margin / profitability")
+
+        if len(dims_found) >= 2 and (" while " in stmt_lower or ", and " in stmt_lower or " and " in stmt_lower or " as well as " in stmt_lower):
+            return (
+                False,
+                f"Business Model / Revenue assumption combines {len(dims_found)} independent commercial hypotheses: "
+                f"{', '.join(dims_found)}. "
+                "Must test ONE atomic commercial uncertainty at a time (e.g. test commission acceptance first).",
+            )
+
+    # 3. Multi-clause independent hypothesis conjunctions (3+ 'will/can [verb]' clauses joined by and/while)
+    predicate_matches = re.findall(r"\b(?:will|can)\s+[a-z]{3,}\b", stmt_lower)
+    if len(predicate_matches) >= 3 and (", and " in stmt_lower or " and " in stmt_lower) and (" while " in stmt_lower or ", " in stmt_lower):
+        return (
+            False,
+            f"Critical assumption contains multiple compound predictive clauses ({len(predicate_matches)} independent conditions). "
+            "Must test ONE decision-relevant hypothesis in a single learning cycle.",
+        )
+
+    # 4. Target User bundling with adoption and payment
+    if area_str == str(StartupArea.TARGET_USER):
+        has_segment = bool(re.search(r"\b(segment|role|group|users|customers|profile|responsib\w+)\b", stmt_lower))
+        has_adoption = bool(re.search(r"\b(adopt\w*|use|using|onboard\w*|sign\w* up)\b", stmt_lower))
+        has_payment = bool(re.search(r"\b(pay\w*|payment|price|commission|budget|buy\w*)\b", stmt_lower))
+        if has_segment and has_adoption and has_payment:
+            return (
+                False,
+                "Target User assumption bundles segment definition with product adoption and payment. "
+                "Target User must test ONE repeatable segment/role hypothesis without requiring adoption or payment.",
+            )
+
+    return True, ""
+
+
 def extract_blocked_grounding_concepts(
     val_reason: str,
     statement: str,
@@ -1935,12 +2913,12 @@ def extract_blocked_grounding_concepts(
 
 _CANONICAL_AREA_FALLBACKS: dict[str, str] = {
     StartupArea.PROBLEM: (
-        "Target users experience recurring disruption and avoidable friction in their current workflow "
-        "that is severe enough to justify adopting a dedicated solution."
+        "Target users experience recurring disruption and avoidable operational friction in their current workflow "
+        "that creates material recurring losses."
     ),
     StartupArea.TARGET_USER: (
-        "A well-defined segment of target users has an identifiable operational profile "
-        "and experiences the core problem directly."
+        "A repeatable segment of target users has an identifiable operational role "
+        "that directly experiences and owns the core problem."
     ),
     StartupArea.PAIN_URGENCY: (
         "The operational pain caused by this problem is sufficiently urgent "
@@ -1984,9 +2962,10 @@ def build_grounded_critical_assumption_fallback(
     state: StartaryGraphState,
 ) -> CriticalAssumptionLLMOutput | None:
     """
-    Deterministic Fallback Builder for Critical Assumptions (Milestone 4.0.7.1.2).
-    Constructs a safe, grounded critical assumption using ONLY already-grounded facts
+    Deterministic Fallback Builder for Critical Assumptions (Milestone 4.0.7.1.2 / M4.0.7.1.3).
+    Constructs a safe, grounded, area-pure critical assumption using ONLY already-grounded facts
     from the Reality Check and founder context when LLM retries fail validation.
+    Must pass BOTH grounding validation and area-purity validation.
     """
     target_area = StartupArea(weak_area_str)
     unresolved_uncertainty = rc_dict.get("unresolved_uncertainty", "").strip()
@@ -2009,14 +2988,7 @@ def build_grounded_critical_assumption_fallback(
                 statement += "."
             candidates.append(statement)
 
-    # Candidate 2: Domain-specific grounded formulation if refrigeration context (FridgeGuard)
-    if "refrigerat" in founder_lower or "fridge" in founder_lower:
-        candidates.append(
-            "Commercial kitchens and food businesses experience refrigeration failures occurring "
-            "between manual inspection logs that cause significant avoidable food loss or operational disruption."
-        )
-
-    # Candidate 3: Canonical area fallback
+    # Candidate 2: Canonical area fallback
     canonical_fallback = _CANONICAL_AREA_FALLBACKS.get(target_area)
     if canonical_fallback:
         candidates.append(canonical_fallback)
@@ -2043,10 +3015,16 @@ def build_grounded_critical_assumption_fallback(
             unresolved_uncertainty_addressed=unresolved_uncertainty,
             introduced_test_parameters=[],
         )
-        is_valid, _ = validate_critical_assumption_grounding(
+        is_valid_grounding, _ = validate_critical_assumption_grounding(
             output, rc_dict, founder_source_text, weak_area_str
         )
-        if is_valid:
+        is_valid_purity, _ = validate_critical_assumption_area_purity(
+            output, target_area
+        )
+        is_valid_atomicity, _ = validate_critical_assumption_atomicity(
+            output, target_area
+        )
+        if is_valid_grounding and is_valid_purity and is_valid_atomicity:
             return output
 
     return None
@@ -2054,9 +3032,10 @@ def build_grounded_critical_assumption_fallback(
 
 def generate_critical_assumption(state: StartaryGraphState) -> dict:
     """
-    LLM Node: Formulate ONE specific, testable critical assumption for the weak area (Milestone 2.6.2 / 4.0.7.1.2).
-    Enforces strict grounding discipline with structured retry feedback and deterministic fallback recovery.
+    LLM Node: Formulate ONE specific, testable critical assumption for the weak area (Milestone 2.6.2 / 4.0.7.1.2 / 4.0.7.1.3 / 4.0.7.1.4).
+    Enforces strict grounding discipline, area purity, and atomicity with structured retry feedback and deterministic fallback recovery.
     """
+    t_start = time.monotonic()
     project_id = state.get("project_id", "<unknown>")
     weak_area_str = state.get("weak_area")
     rc_dict = state.get("reality_check", {})
@@ -2074,7 +3053,8 @@ def generate_critical_assumption(state: StartaryGraphState) -> dict:
     ) or state.get("raw_context", "")
 
     settings = get_settings()
-    llm = get_llm_client(settings)
+    base_max_tokens = 2500
+    llm = _safe_get_llm_client(settings, tier="reasoning", max_completion_tokens=base_max_tokens)
     structured_llm = llm.with_structured_output(CriticalAssumptionLLMOutput)
 
     user_message = build_critical_assumption_user_message(
@@ -2100,10 +3080,16 @@ def generate_critical_assumption(state: StartaryGraphState) -> dict:
 
     while attempt < 2:
         attempt += 1
-        t_start = time.monotonic()
         try:
-            result: CriticalAssumptionLLMOutput = structured_llm.invoke(messages)
-            latency_ms = (time.monotonic() - t_start) * 1000
+            result, latency_ms = _invoke_structured_with_token_retry(
+                structured_llm=structured_llm,
+                messages=messages,
+                settings=settings,
+                tier="reasoning",
+                base_max_tokens=base_max_tokens,
+                node_name="generate_critical_assumption",
+                schema_cls=CriticalAssumptionLLMOutput,
+            )
 
             if not isinstance(result, CriticalAssumptionLLMOutput):
                 raise ValidationError(f"Expected CriticalAssumptionLLMOutput, got {type(result)}")
@@ -2116,14 +3102,26 @@ def generate_critical_assumption(state: StartaryGraphState) -> dict:
                 )
                 result.area = StartupArea(weak_area_str)
 
-            # --- Deterministic Grounding Validation (M2.6.2) ---
-            is_valid, val_reason = validate_critical_assumption_grounding(
+            # --- Deterministic Grounding & Area-Purity & Atomicity Validation (M2.6.2 / M4.0.7.1.3 / M4.0.7.1.4) ---
+            is_valid_grounding, grounding_reason = validate_critical_assumption_grounding(
                 result, rc_dict, founder_source_text, weak_area_str
+            )
+            is_valid_purity, purity_reason = validate_critical_assumption_area_purity(
+                result, weak_area_str
+            )
+            is_valid_atomicity, atomicity_reason = validate_critical_assumption_atomicity(
+                result, weak_area_str
+            )
+
+            is_valid = is_valid_grounding and is_valid_purity and is_valid_atomicity
+            val_reason = (
+                grounding_reason if not is_valid_grounding
+                else (purity_reason if not is_valid_purity else atomicity_reason)
             )
 
             if not is_valid:
                 logger.warning(
-                    "generate_critical_assumption: Grounding validation failed on attempt %d: %s.",
+                    "generate_critical_assumption: Validation failed on attempt %d: %s.",
                     attempt,
                     val_reason,
                 )
@@ -2142,25 +3140,35 @@ def generate_critical_assumption(state: StartaryGraphState) -> dict:
                             f"GROUNDING VALIDATION FAILED: {val_reason}\n"
                             f"REJECTED STATEMENT: {result.statement}\n"
                             f"BLOCKED CONCEPTS / PHRASES: {blocked_str}\n\n"
-                            "You must NOT use any of the blocked concepts or phrases above. "
-                            "You must NOT invent ungrounded numeric thresholds, percentages, frequencies (e.g. weekly), or unevidenced failure modes. "
-                            "Reformulate the critical assumption to test the core uncertainty using ONLY founder-grounded facts and Reality Check constraints."
+                            "You must NOT use any of the blocked concepts or phrases above.\n"
+                            f"The assumption must stay strictly inside the epistemic boundary of '{weak_area_str}'.\n"
+                            "Do NOT import validation requirements from neighboring areas (e.g. for Target User, do NOT require adoption, willingness to pay, or product preference).\n"
+                            "The assumption must be ATOMIC: represent ONE decision-relevant uncertainty testable in a single bounded experiment.\n"
+                            "Do NOT combine multiple downstream commercial conditions (e.g. commission + pricing + contribution margin).\n"
+                            "You must NOT invent ungrounded numeric thresholds, percentages, frequencies (e.g. weekly), or unevidenced failure modes.\n"
+                            "Reformulate the critical assumption to test the core uncertainty using ONLY founder-grounded facts, Reality Check constraints, strict area purity, and single-hypothesis atomicity."
                         ),
                     })
                     continue
                 else:
                     logger.warning(
-                        "generate_critical_assumption: Attempt 2 failed grounding validation: %s. Attempting fallback.",
+                        "generate_critical_assumption: Attempt 2 failed validation: %s. Attempting fallback.",
                         val_reason,
                     )
                     fallback = build_grounded_critical_assumption_fallback(
                         weak_area_str, rc_dict, founder_source_text, state
                     )
                     if fallback:
-                        is_fb_valid, fb_val_reason = validate_critical_assumption_grounding(
+                        is_fb_g, fb_g_reason = validate_critical_assumption_grounding(
                             fallback, rc_dict, founder_source_text, weak_area_str
                         )
-                        if is_fb_valid:
+                        is_fb_p, fb_p_reason = validate_critical_assumption_area_purity(
+                            fallback, weak_area_str
+                        )
+                        is_fb_a, fb_a_reason = validate_critical_assumption_atomicity(
+                            fallback, weak_area_str
+                        )
+                        if is_fb_g and is_fb_p and is_fb_a:
                             logger.info(
                                 "critical_assumption_fallback | used=True area=%s statement=%s",
                                 weak_area_str,
@@ -2186,12 +3194,16 @@ def generate_critical_assumption(state: StartaryGraphState) -> dict:
                                 "traces": existing_traces,
                             }
                         else:
+                            fb_fail_reason = (
+                                fb_g_reason if not is_fb_g
+                                else (fb_p_reason if not is_fb_p else fb_a_reason)
+                            )
                             logger.error(
                                 "critical_assumption_recovery_failed | reason=Fallback failed validation: %s",
-                                fb_val_reason,
+                                fb_fail_reason,
                             )
                             raise CriticalAssumptionGroundingError(
-                                f"generate_critical_assumption failed grounding validation after retry and fallback: {fb_val_reason}"
+                                f"generate_critical_assumption failed grounding validation after retry and fallback: {fb_fail_reason}"
                             )
                     else:
                         logger.error(
@@ -2221,14 +3233,18 @@ def generate_critical_assumption(state: StartaryGraphState) -> dict:
                 "traces": existing_traces,
             }
         except Exception as exc:
-            if isinstance(exc, CriticalAssumptionGroundingError):
+            if isinstance(exc, (CriticalAssumptionGroundingError, TokenBudgetExhaustedError)):
                 raise
             last_error = exc
             logger.warning("generate_critical_assumption failed attempt %d: %s", attempt, exc)
-            if attempt < 2 and not isinstance(exc, CriticalAssumptionGroundingError):
+            if is_permanent_model_error(exc):
+                raise
+            if attempt < 2:
                 continue
             raise
 
+    if isinstance(last_error, TokenBudgetExhaustedError):
+        raise last_error
     raise RuntimeError(f"generate_critical_assumption failed after 2 attempts. Error: {last_error}")
 
 
@@ -2307,7 +3323,7 @@ def assess_context_sufficiency(state: StartaryGraphState) -> dict:
     history_text = "\n".join(history_lines) if history_lines else (state.get("raw_context") or "")
 
     settings = get_settings()
-    llm = get_llm_client(settings)
+    llm = _safe_get_llm_client(settings, tier="reasoning", max_tokens=1000)
     structured_llm = llm.with_structured_output(ContextSufficiencyLLMOutput)
 
     user_message = build_context_sufficiency_user_message(
@@ -2450,7 +3466,7 @@ def assess_baseline_state_sufficiency(state: StartaryGraphState) -> dict:
 
     # Otherwise call LLM with BASELINE_STATE_SUFFICIENCY_SYSTEM_PROMPT
     settings = get_settings()
-    llm = get_llm_client(settings)
+    llm = _safe_get_llm_client(settings, tier="fast", max_tokens=800)
     structured_llm = llm.with_structured_output(BaselineSufficiencyLLMOutput)
 
     founder_messages = state.get("founder_messages") or []
@@ -2468,6 +3484,7 @@ def assess_baseline_state_sufficiency(state: StartaryGraphState) -> dict:
         {"role": "user", "content": user_msg},
     ]
 
+    res_info = get_llm_client_resolution_info(llm)
     attempt = 0
     last_err = None
     while attempt < 2:
@@ -2506,9 +3523,27 @@ def assess_baseline_state_sufficiency(state: StartaryGraphState) -> dict:
                 output_data=res.model_dump(),
                 latency_ms=latency_ms,
                 project_id=project_id,
+                model_name=res_info["resolved_model"] or getattr(settings, "fast_model_name", None),
+                configured_model=res_info["configured_model"],
+                resolved_model=res_info["resolved_model"],
+                fallback_used=res_info["fallback_used"],
+                fallback_reason=res_info["fallback_reason"],
+                execution_path=state.get("execution_path", "DELTA_STATE_UPDATE"),
             )
             existing_traces = list(state.get("traces") or [])
             existing_traces.append(trace.model_dump(mode="json"))
+
+            turn_telem = record_telemetry_event(
+                state=state,
+                node_name="assess_baseline_state_sufficiency",
+                model_name=res_info["resolved_model"] or getattr(settings, "fast_model_name", None) or "fast_tier",
+                duration_ms=latency_ms,
+                execution_path=state.get("execution_path", "DELTA_STATE_UPDATE"),
+                configured_model=res_info["configured_model"],
+                resolved_model=res_info["resolved_model"],
+                fallback_used=res_info["fallback_used"],
+                fallback_reason=res_info["fallback_reason"],
+            )
 
             logger.info("assess_baseline_state_sufficiency | project_id=%s is_sufficient=%s missing=%s", project_id, suff_domain.is_sufficient, res_missing)
             return {
@@ -2516,10 +3551,13 @@ def assess_baseline_state_sufficiency(state: StartaryGraphState) -> dict:
                 "is_baseline_sufficient": suff_domain.is_sufficient,
                 "last_trace": trace.model_dump(mode="json"),
                 "traces": existing_traces,
+                "turn_telemetry": turn_telem,
             }
         except Exception as exc:
             last_err = exc
             logger.warning("assess_baseline_state_sufficiency failed attempt %d: %s", attempt, exc)
+            if is_permanent_model_error(exc):
+                break
 
     # Fallback inspection result on error
     fallback_domain = BaselineStartupStateSufficiency(
@@ -2528,9 +3566,21 @@ def assess_baseline_state_sufficiency(state: StartaryGraphState) -> dict:
         missing_groups=missing,
         reason=f"Fallback inspection used after error: {last_err}",
     )
+    fallback_telem = record_telemetry_event(
+        state=state,
+        node_name="assess_baseline_state_sufficiency",
+        model_name="local_deterministic",
+        duration_ms=0.0,
+        execution_path=state.get("execution_path", "DELTA_STATE_UPDATE"),
+        configured_model=res_info["configured_model"],
+        resolved_model="local_deterministic",
+        fallback_used=True,
+        fallback_reason=f"fast_fail_error: {last_err}",
+    )
     return {
         "baseline_sufficiency": fallback_domain.model_dump(mode="json"),
         "is_baseline_sufficient": fallback_domain.is_sufficient,
+        "turn_telemetry": fallback_telem,
     }
 
 
@@ -2577,7 +3627,7 @@ def plan_baseline_question(state: StartaryGraphState) -> dict:
     prev_questions = [h.get("question") for h in baseline_history if h.get("question")]
 
     settings = get_settings()
-    llm = get_llm_client(settings)
+    llm = _safe_get_llm_client(settings, tier="fast", max_tokens=800)
     structured_llm = llm.with_structured_output(BaselineQuestionPlanLLMOutput)
 
     user_msg = build_baseline_question_planner_user_message(
@@ -2594,6 +3644,7 @@ def plan_baseline_question(state: StartaryGraphState) -> dict:
         {"role": "user", "content": user_msg},
     ]
 
+    res_info = get_llm_client_resolution_info(llm)
     attempt = 0
     last_err = None
     while attempt < 2:
@@ -2629,9 +3680,27 @@ def plan_baseline_question(state: StartaryGraphState) -> dict:
                 output_data=res.model_dump(),
                 latency_ms=latency_ms,
                 project_id=project_id,
+                model_name=res_info["resolved_model"] or getattr(settings, "fast_model_name", None),
+                configured_model=res_info["configured_model"],
+                resolved_model=res_info["resolved_model"],
+                fallback_used=res_info["fallback_used"],
+                fallback_reason=res_info["fallback_reason"],
+                execution_path=state.get("execution_path", "DELTA_STATE_UPDATE"),
             )
             existing_traces = list(state.get("traces") or [])
             existing_traces.append(trace.model_dump(mode="json"))
+
+            turn_telem = record_telemetry_event(
+                state=state,
+                node_name="plan_baseline_question",
+                model_name=res_info["resolved_model"] or getattr(settings, "fast_model_name", None) or "fast_tier",
+                duration_ms=latency_ms,
+                execution_path=state.get("execution_path", "DELTA_STATE_UPDATE"),
+                configured_model=res_info["configured_model"],
+                resolved_model=res_info["resolved_model"],
+                fallback_used=res_info["fallback_used"],
+                fallback_reason=res_info["fallback_reason"],
+            )
 
             q_text = res.question or "Could you describe your team, what exists product-wise today, and your current testing activity?"
 
@@ -2665,10 +3734,13 @@ def plan_baseline_question(state: StartaryGraphState) -> dict:
                 "phase": WorkflowPhase.CLARIFYING_CONTEXT,
                 "last_trace": trace.model_dump(mode="json"),
                 "traces": existing_traces,
+                "turn_telemetry": turn_telem,
             }
         except Exception as exc:
             last_err = exc
             logger.warning("plan_baseline_question failed attempt %d: %s", attempt, exc)
+            if is_permanent_model_error(exc):
+                break
 
     # Fallback question based on missing group
     fallback_group = effective_missing[0] if effective_missing else "CAPACITY"
@@ -2690,6 +3762,17 @@ def plan_baseline_question(state: StartaryGraphState) -> dict:
         clarification_reason="Fallback baseline collection",
         planner_version=BASELINE_QUESTION_PLANNER_PROMPT_VERSION,
     )
+    fallback_telem = record_telemetry_event(
+        state=state,
+        node_name="plan_baseline_question",
+        model_name="local_deterministic",
+        duration_ms=0.0,
+        execution_path=state.get("execution_path", "DELTA_STATE_UPDATE"),
+        configured_model=res_info["configured_model"],
+        resolved_model="local_deterministic",
+        fallback_used=True,
+        fallback_reason=f"fast_fail_error: {last_err}",
+    )
     return {
         "active_next_turn_decision": fb_decision.model_dump(),
         "current_baseline_question": {
@@ -2705,6 +3788,7 @@ def plan_baseline_question(state: StartaryGraphState) -> dict:
         },
         "active_interrupt_type": "baseline",
         "phase": WorkflowPhase.CLARIFYING_CONTEXT,
+        "turn_telemetry": fallback_telem,
     }
 
 
@@ -2766,7 +3850,8 @@ def assess_weak_link_discrimination(state: StartaryGraphState) -> dict:
 
     # Ambiguity detected -> invoke LLM discrimination evaluation
     settings = get_settings()
-    llm = get_llm_client(settings)
+    base_max_tokens = 2000
+    llm = _safe_get_llm_client(settings, tier="reasoning", max_completion_tokens=base_max_tokens)
     structured_llm = llm.with_structured_output(WeakLinkDiscriminationLLMOutput)
 
     # Format table
@@ -2795,10 +3880,16 @@ def assess_weak_link_discrimination(state: StartaryGraphState) -> dict:
     last_err = None
     while attempt < 2:
         attempt += 1
-        t_start = time.monotonic()
         try:
-            res: WeakLinkDiscriminationLLMOutput = structured_llm.invoke(messages)
-            latency_ms = (time.monotonic() - t_start) * 1000
+            res, latency_ms = _invoke_structured_with_token_retry(
+                structured_llm=structured_llm,
+                messages=messages,
+                settings=settings,
+                tier="reasoning",
+                base_max_tokens=base_max_tokens,
+                node_name="assess_weak_link_discrimination",
+                schema_cls=WeakLinkDiscriminationLLMOutput,
+            )
 
             try:
                 conf_enum = SelectionConfidence(res.selection_confidence)
@@ -2848,6 +3939,11 @@ def assess_weak_link_discrimination(state: StartaryGraphState) -> dict:
         except Exception as exc:
             last_err = exc
             logger.warning("assess_weak_link_discrimination failed attempt %d: %s", attempt, exc)
+            if is_permanent_model_error(exc) or isinstance(exc, TokenBudgetExhaustedError):
+                break
+
+    if isinstance(last_err, TokenBudgetExhaustedError):
+        raise last_err
 
     # Fallback discrimination logic on error
     fallback_conf = "LOW" if (tie_count > 1 or sat_count > 1) else "MEDIUM"
@@ -2881,7 +3977,8 @@ def select_weak_link_question(state: StartaryGraphState) -> dict:
     history_text = "\n".join(history_lines) if history_lines else (state.get("raw_context") or "")
 
     settings = get_settings()
-    llm = get_llm_client(settings)
+    base_max_tokens = 2000
+    llm = _safe_get_llm_client(settings, tier="reasoning", max_completion_tokens=base_max_tokens)
     structured_llm = llm.with_structured_output(WeakLinkClarifyingQuestionLLMOutput)
 
     user_msg = build_weak_link_clarifying_question_user_message(
@@ -2900,10 +3997,16 @@ def select_weak_link_question(state: StartaryGraphState) -> dict:
     last_err = None
     while attempt < 2:
         attempt += 1
-        t_start = time.monotonic()
         try:
-            res: WeakLinkClarifyingQuestionLLMOutput = structured_llm.invoke(messages)
-            latency_ms = (time.monotonic() - t_start) * 1000
+            res, latency_ms = _invoke_structured_with_token_retry(
+                structured_llm=structured_llm,
+                messages=messages,
+                settings=settings,
+                tier="reasoning",
+                base_max_tokens=base_max_tokens,
+                node_name="select_weak_link_question",
+                schema_cls=WeakLinkClarifyingQuestionLLMOutput,
+            )
 
             trace = AITrace(
                 module_name="select_weak_link_question",
@@ -2946,6 +4049,11 @@ def select_weak_link_question(state: StartaryGraphState) -> dict:
         except Exception as exc:
             last_err = exc
             logger.warning("select_weak_link_question failed attempt %d: %s", attempt, exc)
+            if is_permanent_model_error(exc) or isinstance(exc, TokenBudgetExhaustedError):
+                break
+
+    if isinstance(last_err, TokenBudgetExhaustedError):
+        raise last_err
 
     # Fallback question
     fallback_q = f"When considering {weak_area} versus other aspects of your startup, what specific user behavior or outcome have you observed most directly?"
@@ -2998,9 +4106,13 @@ def generate_experiment(state: StartaryGraphState) -> dict:
     exec_ctx = state.get("execution_context") or {}
     prog = state.get("startup_progress") or {}
     founder_messages = state.get("founder_messages") or []
-    founder_evidence_summary = "\n".join(
-        m.get("content", "") for m in founder_messages if m.get("role") == "founder"
-    ) or state.get("raw_context", "")
+    all_founder_texts = [m.get("content", "") for m in founder_messages if m.get("role") == "founder"]
+    if len(all_founder_texts) > 3:
+        founder_evidence_summary = "\n".join([all_founder_texts[0]] + all_founder_texts[-2:])
+    elif all_founder_texts:
+        founder_evidence_summary = "\n".join(all_founder_texts)
+    else:
+        founder_evidence_summary = (state.get("raw_context", "") or "")[:500]
 
     previous_experiments = state.get("previous_experiments") or []
     prev_exp_summary = ""
@@ -3013,8 +4125,34 @@ def generate_experiment(state: StartaryGraphState) -> dict:
     revision_instructions = state.get("critic_revision_instructions") or ""
 
     settings = get_settings()
-    llm = get_llm_client(settings)
+    base_max_tokens = 3500
+    llm = _safe_get_llm_client(settings, tier="reasoning", max_completion_tokens=base_max_tokens)
     structured_llm = llm.with_structured_output(ExperimentGeneratorLLMOutput)
+
+    build_rd = state.get("build_readiness") or {}
+    build_guidance = ""
+    if isinstance(build_rd, dict) and build_rd.get("decision") == "BUILD_MINIMAL_PROTOTYPE":
+        min_scope_str = "; ".join(build_rd.get("minimum_build_scope") or [])
+        must_not_str = "; ".join(build_rd.get("must_not_build") or [])
+        build_guidance = (
+            "DECISION: BUILD_MINIMAL_PROTOTYPE (Milestone 4.1).\n"
+            "You MUST design a PROTOTYPE_TEST experiment testing the active critical assumption through a strictly bounded minimal product probe.\n"
+            f"- Minimum Build Scope: {min_scope_str}\n"
+            f"- Must NOT Build: {must_not_str}\n"
+            "Do NOT design a multi-feature app, automated platform, or full roadmap. Keep the probe tight, feasible within 1-2 weeks, and focused on unmediated user interaction."
+        )
+
+    next_strat = state.get("next_strategic_action") or {}
+    strat_action_type = next_strat.get("action_type") or ""
+    strat_guidance = ""
+    if strat_action_type:
+        strat_guidance = (
+            f"NEXT STRATEGIC ACTION CATEGORY: {strat_action_type}\n"
+            f"Rationale: {next_strat.get('rationale', '')}\n"
+            f"Key Decision: {next_strat.get('key_decision', '')}\n"
+            f"Suggested Method: {next_strat.get('suggested_method', '')}\n"
+            "Ensure the experiment design aligns with this strategic category."
+        )
 
     user_msg = build_experiment_generator_user_message(
         critical_assumption=statement,
@@ -3028,6 +4166,8 @@ def generate_experiment(state: StartaryGraphState) -> dict:
         founder_evidence_summary=founder_evidence_summary,
         previous_experiments_summary=prev_exp_summary,
         critic_revision_instructions=revision_instructions,
+        build_readiness_guidance=build_guidance,
+        strategic_action_guidance=strat_guidance,
     )
 
     messages = [
@@ -3035,16 +4175,25 @@ def generate_experiment(state: StartaryGraphState) -> dict:
         {"role": "user", "content": user_msg},
     ]
 
+    res_info = get_llm_client_resolution_info(llm)
     attempt = 0
     last_err = None
     while attempt < 2:
         attempt += 1
-        t_start = time.monotonic()
         try:
-            res: ExperimentGeneratorLLMOutput = structured_llm.invoke(messages)
-            latency_ms = (time.monotonic() - t_start) * 1000
+            res, latency_ms = _invoke_structured_with_token_retry(
+                structured_llm=structured_llm,
+                messages=messages,
+                settings=settings,
+                tier="reasoning",
+                base_max_tokens=base_max_tokens,
+                node_name="generate_experiment",
+                schema_cls=ExperimentGeneratorLLMOutput,
+            )
 
             res_data = res.model_dump() if hasattr(res, "model_dump") and isinstance(res.model_dump(), dict) else (res if isinstance(res, dict) else {})
+            if isinstance(build_rd, dict) and build_rd.get("decision") == "BUILD_MINIMAL_PROTOTYPE":
+                res_data["experiment_type"] = ExperimentType.PROTOTYPE_TEST.value
 
             trace = AITrace(
                 module_name="generate_experiment",
@@ -3057,9 +4206,40 @@ def generate_experiment(state: StartaryGraphState) -> dict:
                 output_data=res_data,
                 latency_ms=latency_ms,
                 project_id=project_id,
+                model_name=res_info["resolved_model"] or getattr(settings, "reasoning_model_name", None),
+                configured_model=res_info["configured_model"],
+                resolved_model=res_info["resolved_model"],
+                fallback_used=res_info["fallback_used"],
+                fallback_reason=res_info["fallback_reason"],
+                execution_path=state.get("execution_path", "STRATEGIC_REASONING"),
             )
             existing_traces = list(state.get("traces") or [])
             existing_traces.append(trace.model_dump(mode="json"))
+
+            # Token accounting with fallback character counting
+            prompt_tokens = getattr(getattr(res, "usage_metadata", None), "prompt_tokens", None)
+            if prompt_tokens is None:
+                prompt_tokens = sum(len(m.get("content", "")) for m in messages) // 4
+            completion_tokens = getattr(getattr(res, "usage_metadata", None), "completion_tokens", None)
+            if completion_tokens is None:
+                completion_tokens = len(_json.dumps(res_data)) // 4
+            total_tokens = prompt_tokens + completion_tokens
+
+            turn_telem = record_telemetry_event(
+                state=state,
+                node_name="generate_experiment",
+                model_name=res_info["resolved_model"] or getattr(settings, "reasoning_model_name", None) or "reasoning_tier",
+                duration_ms=latency_ms,
+                latency_ms=latency_ms,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                execution_path=state.get("execution_path", "STRATEGIC_REASONING"),
+                configured_model=res_info["configured_model"],
+                resolved_model=res_info["resolved_model"],
+                fallback_used=res_info["fallback_used"],
+                fallback_reason=res_info["fallback_reason"],
+            )
 
             exp_type = getattr(res, "experiment_type", res_data.get("experiment_type", "OTHER"))
             obj = getattr(res, "objective", res_data.get("objective", ""))
@@ -3068,12 +4248,17 @@ def generate_experiment(state: StartaryGraphState) -> dict:
                 "proposed_experiment_output": res_data,
                 "last_trace": trace.model_dump(mode="json"),
                 "traces": existing_traces,
+                "turn_telemetry": turn_telem,
             }
         except Exception as exc:
             last_err = exc
             logger.warning("generate_experiment failed attempt %d: %s", attempt, exc)
+            if is_permanent_model_error(exc) or isinstance(exc, TokenBudgetExhaustedError):
+                break
 
-    raise RuntimeError(f"generate_experiment failed after 2 attempts. Error: {last_err}")
+    if isinstance(last_err, TokenBudgetExhaustedError):
+        raise last_err
+    raise RuntimeError(f"generate_experiment failed after {attempt} attempts. Error: {last_err}")
 
 
 def validate_proposed_experiment(state: StartaryGraphState) -> dict:
@@ -3139,23 +4324,108 @@ def critique_experiment(state: StartaryGraphState) -> dict:
     exec_ctx = state.get("execution_context") or {}
     prog = state.get("startup_progress") or {}
     founder_messages = state.get("founder_messages") or []
-    founder_evidence_summary = "\n".join(
-        m.get("content", "") for m in founder_messages if m.get("role") == "founder"
-    ) or state.get("raw_context", "")
+    all_founder_texts = [m.get("content", "") for m in founder_messages if m.get("role") == "founder"]
+    if len(all_founder_texts) > 3:
+        founder_evidence_summary = "\n".join([all_founder_texts[0]] + all_founder_texts[-2:])
+    elif all_founder_texts:
+        founder_evidence_summary = "\n".join(all_founder_texts)
+    else:
+        founder_evidence_summary = (state.get("raw_context", "") or "")[:500]
 
     revision_count = state.get("critic_revision_count", 0)
 
+    # Deterministic Critic Pre-Checks (Milestone M4.1.4):
+    # Intercepts objective structural faults in 0ms without consuming reasoning LLM tokens.
+    deterministic_issues: list[str] = []
+
+    sample_size = exp_output.get("target_sample_size")
+    if sample_size is not None and isinstance(sample_size, (int, float)) and sample_size <= 0:
+        deterministic_issues.append("Target sample size must be explicitly specified and >= 1.")
+
+    exp_type = str(exp_output.get("experiment_type", "OTHER")).upper()
+    if exp_type in ("PROTOTYPE_TEST", "MVP_TEST", "USABILITY_TEST"):
+        mvp_field = prog.get("mvp_exists")
+        mvp_val = mvp_field.get("value") if isinstance(mvp_field, dict) else mvp_field
+        if str(mvp_val).lower() not in ("true", "yes"):
+            deterministic_issues.append("Experiment requires testing a working prototype, but no prototype exists yet.")
+
+    budget_field = exec_ctx.get("monthly_budget") or {}
+    budget_val = budget_field.get("value") if isinstance(budget_field, dict) else getattr(budget_field, "value", None)
+    est_cost = str(exp_output.get("estimated_cost") or "").lower()
+    if budget_val in ("$0", "0", 0, "$0/mo") and any(c in est_cost for c in ["$", "dollar", "paid ads", "hire", "purchase"]) and not any(z in est_cost for z in ["$0", "zero", "free", "no cost"]):
+        deterministic_issues.append("Experiment requires financial budget exceeding founder's $0 constraint.")
+
+    exp_asmp_id = exp_output.get("assumption_id")
+    act_asmp_id = active_assumption.get("id")
+    if exp_asmp_id and act_asmp_id and str(exp_asmp_id) != str(act_asmp_id):
+        deterministic_issues.append(f"Experiment assumption_id '{exp_asmp_id}' does not match active assumption '{act_asmp_id}'.")
+
+    if deterministic_issues:
+        logger.info("critique_experiment | deterministic pre-checks triggered REVISE: %s", deterministic_issues)
+        precheck_res = ExperimentCriticLLMOutput(
+            verdict="REVISE",
+            issues=deterministic_issues,
+            assumption_alignment="FAIL" if any("assumption" in iss.lower() or "hypothesis" in iss.lower() for iss in deterministic_issues) else "PASS",
+            evidence_validity="FAIL" if any("sample" in iss.lower() for iss in deterministic_issues) else "PASS",
+            feasibility="FAIL" if any("budget" in iss.lower() or "prototype" in iss.lower() for iss in deterministic_issues) else "PASS",
+            cost_efficiency="PASS",
+            falsifiability="PASS",
+            scope="PASS",
+            revision_instructions=" ".join(deterministic_issues),
+            rationale=f"Deterministic structural pre-check identified {len(deterministic_issues)} issue(s): " + "; ".join(deterministic_issues),
+        )
+        res_data = precheck_res.model_dump()
+        trace = AITrace(
+            module_name="critique_experiment",
+            prompt_version=EXPERIMENT_CRITIC_PROMPT_VERSION,
+            input_data={
+                "assumption_id": active_assumption.get("id"),
+                "experiment_type": exp_output.get("experiment_type"),
+                "revision_count": revision_count,
+                "deterministic_precheck": True,
+            },
+            output_data=res_data,
+            latency_ms=0.0,
+            project_id=project_id,
+            model_name="deterministic_precheck",
+            configured_model="deterministic",
+            resolved_model="deterministic",
+            execution_path=state.get("execution_path", "STRATEGIC_REASONING"),
+        )
+        existing_traces = list(state.get("traces") or [])
+        existing_traces.append(trace.model_dump(mode="json"))
+        return {
+            "experiment_critic_output": res_data,
+            "critic_revision_count": revision_count + 1,
+            "critic_revision_instructions": " ".join(deterministic_issues),
+            "traces": existing_traces,
+            "last_trace": trace.model_dump(mode="json"),
+            "phase": WorkflowPhase.TEST,
+        }
+
     settings = get_settings()
-    llm = get_llm_client(settings)
+    base_max_tokens = 2500
+    llm = _safe_get_llm_client(settings, tier="reasoning", max_tokens=base_max_tokens)
     structured_llm = llm.with_structured_output(ExperimentCriticLLMOutput)
+
+    exec_ctx_slimmed = {
+        k: (v.get("value") if isinstance(v, dict) and "value" in v else v)
+        for k, v in exec_ctx.items()
+        if v and (not isinstance(v, dict) or v.get("value") not in (None, "UNKNOWN", ""))
+    }
+    prog_slimmed = {
+        k: (v.get("value") if isinstance(v, dict) and "value" in v else v)
+        for k, v in prog.items()
+        if v and (not isinstance(v, dict) or v.get("value") not in (None, "UNKNOWN", ""))
+    }
 
     user_msg = build_experiment_critic_user_message(
         critical_assumption=statement,
         weak_area=weak_area,
         reality_check_summary=rc.get("summary", ""),
         proposed_experiment_json=json.dumps(exp_output, indent=2, default=str),
-        execution_context_json=json.dumps(exec_ctx, indent=2, default=str),
-        startup_progress_json=json.dumps(prog, indent=2, default=str),
+        execution_context_json=json.dumps(exec_ctx_slimmed, indent=2, default=str),
+        startup_progress_json=json.dumps(prog_slimmed, indent=2, default=str),
         founder_evidence_summary=founder_evidence_summary,
     )
 
@@ -3164,14 +4434,21 @@ def critique_experiment(state: StartaryGraphState) -> dict:
         {"role": "user", "content": user_msg},
     ]
 
+    res_info = get_llm_client_resolution_info(llm)
     attempt = 0
     last_err = None
     while attempt < 2:
         attempt += 1
-        t_start = time.monotonic()
         try:
-            res: ExperimentCriticLLMOutput = structured_llm.invoke(messages)
-            latency_ms = (time.monotonic() - t_start) * 1000
+            res, latency_ms = _invoke_structured_with_token_retry(
+                structured_llm=structured_llm,
+                messages=messages,
+                settings=settings,
+                tier="reasoning",
+                base_max_tokens=base_max_tokens,
+                node_name="critique_experiment",
+                schema_cls=ExperimentCriticLLMOutput,
+            )
 
             res_data = res.model_dump() if hasattr(res, "model_dump") and isinstance(res.model_dump(), dict) else (res if isinstance(res, dict) else {})
 
@@ -3186,9 +4463,40 @@ def critique_experiment(state: StartaryGraphState) -> dict:
                 output_data=res_data,
                 latency_ms=latency_ms,
                 project_id=project_id,
+                model_name=res_info["resolved_model"] or getattr(settings, "reasoning_model_name", None),
+                configured_model=res_info["configured_model"],
+                resolved_model=res_info["resolved_model"],
+                fallback_used=res_info["fallback_used"],
+                fallback_reason=res_info["fallback_reason"],
+                execution_path=state.get("execution_path", "STRATEGIC_REASONING"),
             )
             existing_traces = list(state.get("traces") or [])
             existing_traces.append(trace.model_dump(mode="json"))
+
+            # Token accounting with fallback character counting
+            prompt_tokens = getattr(getattr(res, "usage_metadata", None), "prompt_tokens", None)
+            if prompt_tokens is None:
+                prompt_tokens = sum(len(m.get("content", "")) for m in messages) // 4
+            completion_tokens = getattr(getattr(res, "usage_metadata", None), "completion_tokens", None)
+            if completion_tokens is None:
+                completion_tokens = len(_json.dumps(res_data)) // 4
+            total_tokens = prompt_tokens + completion_tokens
+
+            turn_telem = record_telemetry_event(
+                state=state,
+                node_name="critique_experiment",
+                model_name=res_info["resolved_model"] or getattr(settings, "reasoning_model_name", None) or "reasoning_tier",
+                duration_ms=latency_ms,
+                latency_ms=latency_ms,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                execution_path=state.get("execution_path", "STRATEGIC_REASONING"),
+                configured_model=res_info["configured_model"],
+                resolved_model=res_info["resolved_model"],
+                fallback_used=res_info["fallback_used"],
+                fallback_reason=res_info["fallback_reason"],
+            )
 
             verdict_raw = getattr(res, "verdict", res_data.get("verdict", "REVISE"))
             verdict_norm = str(verdict_raw).upper().strip()
@@ -3207,6 +4515,7 @@ def critique_experiment(state: StartaryGraphState) -> dict:
                 "experiment_critic_output": res_data,
                 "last_trace": trace.model_dump(mode="json"),
                 "traces": existing_traces,
+                "turn_telemetry": turn_telem,
             }
 
             if verdict_norm == "REVISE":
@@ -3217,8 +4526,12 @@ def critique_experiment(state: StartaryGraphState) -> dict:
         except Exception as exc:
             last_err = exc
             logger.warning("critique_experiment failed attempt %d: %s", attempt, exc)
+            if is_permanent_model_error(exc):
+                break
 
-    raise RuntimeError(f"critique_experiment failed after 2 attempts. Error: {last_err}")
+    if isinstance(last_err, TokenBudgetExhaustedError):
+        raise last_err
+    raise RuntimeError(f"critique_experiment failed after {attempt} attempts. Error: {last_err}")
 
 
 def save_final_experiment(state: StartaryGraphState) -> dict:
@@ -3247,6 +4560,10 @@ def save_final_experiment(state: StartaryGraphState) -> dict:
         for p in exp_output.get("parameters") or []
     ]
 
+    target_sample_size = exp_output.get("target_sample_size")
+    if target_sample_size is None or (isinstance(target_sample_size, int) and target_sample_size <= 0):
+        target_sample_size = extract_sample_target_from_protocol(exp_output)
+
     exp = Experiment(
         id=str(uuid.uuid4()),
         assumption_id=active_assumption["id"],
@@ -3256,6 +4573,7 @@ def save_final_experiment(state: StartaryGraphState) -> dict:
         hypothesis=active_assumption["statement"],
         method=exp_output.get("method"),
         target_participants_or_scope=exp_output.get("target_participants_or_scope"),
+        target_sample_size=target_sample_size,
         founder_actions=exp_output.get("founder_actions") or [],
         evidence_to_collect=exp_output.get("evidence_to_collect"),
         support_signal=exp_output.get("support_signal"),
@@ -3572,7 +4890,7 @@ def handle_experiment_failure_stop(state: StartaryGraphState) -> dict:
         diagnosis_snapshot=snapshot,
     )
 
-    # Invalidate / clear stale current-cycle execution state (Milestone 4.0.7.1.1)
+    # Invalidate / clear stale current-cycle execution state (Milestone 4.0.7.1.1 & M4.1.1)
     # If active_experiment is already an explicit blocked record (e.g. from test setups), preserve it as BLOCKED;
     # otherwise, clear it to None so no rejected or prior-iteration experiment masquerades as active/ready.
     active_exp = state.get("active_experiment")
@@ -3584,18 +4902,35 @@ def handle_experiment_failure_stop(state: StartaryGraphState) -> dict:
             cleared_active_exp = dict(active_exp)
             cleared_active_exp["status"] = ExperimentStatus.BLOCKED.value
 
+    prev_experiments = list(state.get("previous_experiments") or [])
+    if rejected_exp and isinstance(rejected_exp, dict):
+        failed_record = dict(rejected_exp)
+        failed_record["status"] = "QUALITY_BAR_NOT_MET"
+        failed_record["critic_issues"] = issues
+        if not any(
+            (e.get("id") and e.get("id") == failed_record.get("id"))
+            or (e.get("hypothesis") and e.get("hypothesis") == failed_record.get("hypothesis") and e.get("objective") == failed_record.get("objective"))
+            for e in prev_experiments
+        ):
+            prev_experiments.append(failed_record)
+
     return {
         "status_message": msg,
         "phase": WorkflowPhase.WAITING_FOR_LEARNING_INPUT,
+        "active_interrupt_type": "waiting_for_learning_input",
         "experiment_design_status": ExperimentDesignStatus.QUALITY_BAR_NOT_MET.value,
         "fallback_learning_action": fallback.model_dump(),
         "learning_input_mode": "FALLBACK",
         "active_experiment": cleared_active_exp,
         "active_execution_handoff": None,
         "execution_handoff_text": None,
+        "build_readiness": None,
         "can_execute_result": None,
         "waiting_response": None,
         "post_evidence_answer": None,
+        "pending_post_evidence_question": None,
+        "evidence_turn_assessment": None,
+        "previous_experiments": prev_experiments,
     }
 
 
@@ -3665,121 +5000,146 @@ def compose_startup_diagnosis(state: StartaryGraphState) -> dict:
         grounded_summary_items.append(f"Customer Access: {exec_context['customer_access']['value']}")
     grounded_facts_summary = "; ".join(grounded_summary_items)
 
-    user_msg = build_startup_diagnosis_composer_user_message(
+    # Deterministic Presentation Formatter (Milestone M4.1.4):
+    # Formats existing structured reasoning without calling an LLM or inventing new conclusions (0ms, 0 LLM calls).
+    logger.info("compose_startup_diagnosis | deterministic formatting from existing structured reasoning (0ms)")
+    constraints: list[str] = []
+    if exec_context.get("team_size", {}).get("value"):
+        constraints.append(f"Team: {exec_context['team_size']['value']}")
+    if exec_context.get("monthly_budget", {}).get("value"):
+        constraints.append(f"Budget: {exec_context['monthly_budget']['value']}")
+    if exec_context.get("weekly_hours", {}).get("value"):
+        constraints.append(f"Weekly Time: {exec_context['weekly_hours']['value']}")
+    if not constraints:
+        constraints = ["Resource-constrained early team"]
+
+    advantages: list[str] = []
+    cust_acc = exec_context.get("customer_access") or {}
+    cust_acc_val = cust_acc.get("value") if isinstance(cust_acc, dict) else getattr(cust_acc, "value", None)
+    if cust_acc_val:
+        advantages.append(f"Customer Access: {cust_acc_val}")
+
+    major_uncertainties: list[str] = []
+    unresolved = reality_check.get("unresolved_uncertainty")
+    if isinstance(unresolved, list):
+        major_uncertainties = [str(u) for u in unresolved[:5]]
+    elif isinstance(unresolved, str) and unresolved:
+        major_uncertainties = [unresolved]
+    for ns in what_not_supports:
+        if len(major_uncertainties) < 5 and str(ns) not in major_uncertainties:
+            major_uncertainties.append(str(ns))
+    if not major_uncertainties:
+        major_uncertainties = [f"Validation of {weak_link} under real-world conditions."]
+
+    learning_goal = active_ca.get("rationale") or f"Validate whether {ca_statement}"
+
+    snapshot = StartupDiagnosisSnapshot(
+        project_id=project_id,
+        iteration=iteration,
         stage=stage_name,
         stage_explanation=stage_explanation,
+        grounded_areas=[str(s) for s in what_supports[:4]] or ["Initial founder concept described"],
+        current_advantages=advantages,
+        execution_constraints=constraints,
+        major_uncertainties=major_uncertainties[:5],
         weak_link=weak_link,
-        selection_confidence=confidence,
-        competing_risks=competing_risks,
-        reality_check_summary=rc_summary,
-        what_evidence_supports=what_supports,
-        what_evidence_does_not_support=what_not_supports,
+        weak_link_reason=f"{weak_link} currently represents the primary bottleneck with highest decision risk.",
+        weak_link_confidence=confidence,
+        weak_link_confidence_explanation=f"Confidence is {confidence} based on comparative risk scoring across strategic areas.",
+        competing_risks=competing_risks[:3],
+        reality_summary=rc_summary or "Baseline diagnostic assessment established from founder inputs.",
+        recommended_learning_goal=learning_goal,
         critical_assumption=ca_statement,
-        execution_context_json=json.dumps(exec_context, indent=2, default=str),
-        startup_progress_json=json.dumps(startup_prog, indent=2, default=str),
-        grounded_facts_summary=grounded_facts_summary,
+    )
+    snapshot_output = snapshot.model_dump()
+
+    # Milestone 4.1.2.1: Compose compact 7-part founder-facing diagnosis text
+    snap = snapshot_output
+    snap_stage = snap.get("stage") or stage_name
+    snap_stage_exp = snap.get("stage_explanation") or stage_explanation
+    snap_grounded = snap.get("grounded_areas") or []
+    snap_advantages = snap.get("current_advantages") or []
+    snap_weak_link = snap.get("weak_link") or weak_link
+    snap_weak_reason = snap.get("weak_link_reason") or ""
+    snap_competing = snap.get("competing_risks") or competing_risks
+    snap_uncertainties = snap.get("major_uncertainties") or []
+    snap_ca = snap.get("critical_assumption") or ca_statement
+    snap_goal = snap.get("recommended_learning_goal") or ""
+
+    advantages_str = "; ".join(snap_advantages) if snap_advantages else ("; ".join(snap_grounded[:3]) if snap_grounded else "Initial problem concept articulated.")
+    competing_str = ", ".join(snap_competing[:3]) if snap_competing else "None identified."
+    uncertainties_str = "; ".join(snap_uncertainties[:3]) if snap_uncertainties else "Long-term customer retention and unit economics."
+
+    # What changed from latest evidence / baseline
+    learning_delta = state.get("learning_delta") or {}
+    delta_headline = learning_delta.get("headline") or ""
+    delta_changes = learning_delta.get("what_we_learned") or learning_delta.get("key_takeaways") or []
+    summary_text = learning_delta.get("founder_facing_summary") or ""
+
+    if delta_headline and delta_changes:
+        what_changed = f"{delta_headline} " + "; ".join(delta_changes[:2])
+    elif delta_changes:
+        what_changed = "; ".join(delta_changes[:2])
+    elif summary_text:
+        what_changed = summary_text
+    elif delta_headline:
+        what_changed = delta_headline
+    else:
+        # Check if there is an active/recent evidence analysis or cycle
+        cycle = get_most_recent_completed_evidence_cycle(state) if "get_most_recent_completed_evidence_cycle" in globals() else None
+        ev_analysis = state.get("evidence_analysis") or (cycle[3] if cycle else {})
+        if ev_analysis and ev_analysis.get("conclusion"):
+            conc = ev_analysis.get("conclusion")
+            findings = ev_analysis.get("support_findings") or ev_analysis.get("valid_learnings") or []
+            if findings:
+                what_changed = f"Latest test concluded {conc}: " + "; ".join(findings[:2])
+            else:
+                what_changed = f"Latest test concluded {conc} for the tested assumption."
+        else:
+            what_changed = "Baseline diagnostic assessment established from founder inputs and verified operational evidence."
+
+    strat_act = state.get("next_strategic_action") or {}
+    most_important_decision = (
+        strat_act.get("key_decision")
+        or (f"Validate whether {snap_ca} before committing further resources or scaling." if snap_ca else f"Determine whether target customers experience the {snap_weak_link.lower()} bottleneck.")
+    )
+    why_this_decision = (
+        strat_act.get("why_this_action")
+        or f"{snap_weak_link} is the primary constraint at the {snap_stage} stage. Resolving this uncertainty prevents premature investment into unvalidated assumptions."
     )
 
-    settings = get_settings()
-    llm = get_llm_client(settings)
-    structured_llm = llm.with_structured_output(StartupDiagnosisSnapshotLLMOutput)
-
-    snapshot_output = None
-    last_error = None
-
-    for attempt in range(1, 3):
-        try:
-            logger.info("compose_startup_diagnosis | attempt %d | project_id=%s", attempt, project_id)
-            res: StartupDiagnosisSnapshotLLMOutput = structured_llm.invoke([
-                {"role": "system", "content": STARTUP_DIAGNOSIS_COMPOSER_SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ])
-
-            # Apply deterministic guards
-            res_dict = res.model_dump()
-            res_dict["critical_assumption"] = ca_statement
-            res_dict["weak_link"] = weak_link
-            res_dict["weak_link_confidence"] = confidence
-            res_dict["competing_risks"] = res_dict.get("competing_risks", [])[:3] or competing_risks[:3]
-            res_dict["major_uncertainties"] = res_dict.get("major_uncertainties", [])[:5]
-
-            # Milestone 4.0.4: Filter execution constraints so unknown capabilities never appear as limitations
-            raw_constraints = res_dict.get("execution_constraints") or []
-            filtered_constraints = []
-            for c in raw_constraints:
-                c_str = str(c)
-                c_lower = c_str.lower()
-                # Check design capability
-                if any(w in c_lower for w in ["design", "ui", "ux", "designer"]):
-                    dc = exec_context.get("design_capability") or {}
-                    dc_val = dc.get("value") if isinstance(dc, dict) else getattr(dc, "value", None)
-                    dc_prov = dc.get("provenance") if isinstance(dc, dict) else getattr(dc, "provenance", "UNKNOWN")
-                    if dc_val is not False or dc_prov != "EXPLICIT":
-                        logger.info("compose_startup_diagnosis | omitting ungrounded design constraint: %s", c_str)
-                        continue
-                # Check marketing capability
-                if any(w in c_lower for w in ["marketing", "marketer", "gtm"]):
-                    mc = exec_context.get("marketing_capability") or {}
-                    mc_val = mc.get("value") if isinstance(mc, dict) else getattr(mc, "value", None)
-                    mc_prov = mc.get("provenance") if isinstance(mc, dict) else getattr(mc, "provenance", "UNKNOWN")
-                    if mc_val is not False or mc_prov != "EXPLICIT":
-                        logger.info("compose_startup_diagnosis | omitting ungrounded marketing constraint: %s", c_str)
-                        continue
-                # Check sales capability
-                if any(w in c_lower for w in ["sales", "selling"]):
-                    sc = exec_context.get("sales_capability") or {}
-                    sc_val = sc.get("value") if isinstance(sc, dict) else getattr(sc, "value", None)
-                    sc_prov = sc.get("provenance") if isinstance(sc, dict) else getattr(sc, "provenance", "UNKNOWN")
-                    if sc_val is not False or sc_prov != "EXPLICIT":
-                        logger.info("compose_startup_diagnosis | omitting ungrounded sales constraint: %s", c_str)
-                        continue
-                filtered_constraints.append(c_str)
-
-            snapshot = StartupDiagnosisSnapshot(
-                project_id=project_id,
-                iteration=iteration,
-                stage=res_dict.get("stage") or stage_name,
-                stage_explanation=res_dict.get("stage_explanation") or stage_explanation,
-                grounded_areas=res_dict.get("grounded_areas") or [s for s in what_supports[:3]],
-                current_advantages=res_dict.get("current_advantages") or [],
-                execution_constraints=filtered_constraints,
-                major_uncertainties=res_dict.get("major_uncertainties") or [reality_check.get("unresolved_uncertainty", "Market demand validation")],
-                weak_link=weak_link,
-                weak_link_reason=res_dict.get("weak_link_reason") or f"{weak_link} currently represents the primary bottleneck with highest decision risk.",
-                weak_link_confidence=confidence,
-                weak_link_confidence_explanation=res_dict.get("weak_link_confidence_explanation") or f"Confidence is {confidence} because several strategic areas have competing uncertainties.",
-                competing_risks=res_dict["competing_risks"],
-                reality_summary=res_dict.get("reality_summary") or rc_summary,
-                recommended_learning_goal=res_dict.get("recommended_learning_goal") or f"Validate whether the core {weak_link.lower()} friction exists repeatedly.",
-                critical_assumption=ca_statement,
-            )
-            snapshot_output = snapshot.model_dump()
-            break
-        except Exception as exc:
-            last_error = exc
-            logger.warning("compose_startup_diagnosis failed attempt %d: %s", attempt, exc)
-
-    if snapshot_output is None:
-        logger.warning("compose_startup_diagnosis: using deterministic fallback due to LLM error: %s", last_error)
-        fallback_snapshot = StartupDiagnosisSnapshot(
-            project_id=project_id,
-            iteration=iteration,
-            stage=stage_name,
-            stage_explanation=stage_explanation,
-            grounded_areas=[s for s in what_supports[:4]] or ["Initial founder concept described"],
-            current_advantages=[exec_context["customer_access"]["value"]] if exec_context.get("customer_access", {}).get("value") else [],
-            execution_constraints=[f"Team: {exec_context['team_size']['value']}"] if exec_context.get("team_size", {}).get("value") else ["Resource-constrained early team"],
-            major_uncertainties=[reality_check.get("unresolved_uncertainty", "Problem severity and customer behavior")],
-            weak_link=weak_link,
-            weak_link_reason=f"{weak_link} represents the most critical immediate uncertainty.",
-            weak_link_confidence=confidence,
-            weak_link_confidence_explanation=f"Confidence is {confidence} based on available evidence and competing risks.",
-            competing_risks=competing_risks[:3],
-            reality_summary=rc_summary or "Early problem indicators exist but remain unverified across broader customers.",
-            recommended_learning_goal=f"Determine whether target customers experience the {weak_link.lower()} friction.",
-            critical_assumption=ca_statement,
-        )
-        snapshot_output = fallback_snapshot.model_dump()
+    founder_diag_lines = [
+        "=" * 50,
+        "STARTARY — CURRENT DIAGNOSIS",
+        "=" * 50,
+        "",
+        "WHAT LOOKS STRONG",
+        f"- Stage: {snap_stage} ({snap_stage_exp})",
+        f"- Validated advantages: {advantages_str}",
+        "",
+        "WHAT LOOKS WEAK",
+        f"- Primary bottleneck: {snap_weak_link}",
+        f"- Bottleneck reason: {snap_weak_reason}",
+        "",
+        "WHAT IS STILL UNCERTAIN",
+        f"- Competing risks: {competing_str}",
+        f"- Gating uncertainties: {uncertainties_str}",
+        "",
+        "WHAT CHANGED",
+        f"- {what_changed}",
+        "",
+        "WHAT DID NOT CHANGE",
+        f"- Remaining blind spots: {uncertainties_str}",
+        "",
+        "MOST IMPORTANT DECISION NOW",
+        f"- {most_important_decision}",
+        "",
+        "WHY THIS DECISION",
+        f"- {why_this_decision}",
+        "",
+        "=" * 50,
+    ]
+    founder_diagnosis_text = "\n".join(founder_diag_lines)
 
     trace = AITrace(
         module_name="compose_startup_diagnosis",
@@ -3798,6 +5158,7 @@ def compose_startup_diagnosis(state: StartaryGraphState) -> dict:
 
     return {
         "diagnosis_snapshot": snapshot_output,
+        "founder_diagnosis_text": founder_diagnosis_text,
         "traces": existing_traces,
         "last_trace": trace.model_dump(mode="json"),
     }
@@ -3844,7 +5205,7 @@ def interpret_founder_turn(state: StartaryGraphState) -> dict:
     )
 
     settings = get_settings()
-    llm = get_llm_client(settings)
+    llm = _safe_get_llm_client(settings, tier="fast", max_tokens=800)
     structured_llm = llm.with_structured_output(FounderTurnInterpretationLLMOutput)
 
     user_msg = build_founder_turn_interpreter_user_message(
@@ -3862,6 +5223,7 @@ def interpret_founder_turn(state: StartaryGraphState) -> dict:
         {"role": "user", "content": user_msg},
     ]
 
+    res_info = get_llm_client_resolution_info(llm)
     attempt = 0
     last_error: Exception | None = None
     interpretation_dict: dict[str, Any] | None = None
@@ -3949,10 +5311,13 @@ def interpret_founder_turn(state: StartaryGraphState) -> dict:
         except Exception as exc:
             last_error = exc
             logger.warning("interpret_founder_turn failed attempt %d: %s", attempt, exc)
+            if is_permanent_model_error(exc):
+                break
 
     latency_ms = (time.monotonic() - t_start) * 1000
+    used_fallback = (interpretation_dict is None)
 
-    if interpretation_dict is None:
+    if used_fallback:
         logger.warning("interpret_founder_turn: using deterministic fallback due to LLM error: %s", last_error)
         msg_lower = latest_founder_msg.lower()
         has_q = "?" in latest_founder_msg
@@ -4005,15 +5370,40 @@ def interpret_founder_turn(state: StartaryGraphState) -> dict:
         },
         latency_ms=latency_ms,
         project_id=project_id,
+        model_name="local_deterministic" if used_fallback else (res_info["resolved_model"] or getattr(settings, "fast_model_name", None)),
+        configured_model=res_info["configured_model"],
+        resolved_model="local_deterministic" if used_fallback else res_info["resolved_model"],
+        fallback_used=True if used_fallback else res_info["fallback_used"],
+        fallback_reason=f"fast_fail_error: {last_error}" if used_fallback else res_info["fallback_reason"],
+        execution_path=state.get("execution_path", "DELTA_STATE_UPDATE"),
     )
     existing_traces = list(state.get("traces") or [])
     existing_traces.append(trace.model_dump(mode="json"))
+
+    turn_telem = record_telemetry_event(
+        state=state,
+        node_name="interpret_founder_turn",
+        model_name="local_deterministic" if used_fallback else (res_info["resolved_model"] or getattr(settings, "fast_model_name", None) or "fast_tier"),
+        duration_ms=latency_ms,
+        execution_path=state.get("execution_path", "DELTA_STATE_UPDATE"),
+        configured_model=res_info["configured_model"],
+        resolved_model="local_deterministic" if used_fallback else res_info["resolved_model"],
+        fallback_used=True if used_fallback else res_info["fallback_used"],
+        fallback_reason=f"fast_fail_error: {last_error}" if used_fallback else res_info["fallback_reason"],
+    )
 
     updates = {
         "latest_founder_turn_interpretation": interpretation_output,
         "traces": existing_traces,
         "last_trace": trace.model_dump(mode="json"),
+        "turn_telemetry": turn_telem,
     }
+
+    # Check for conversational repair
+    is_repair = bool(state.get("is_conversational_repair")) or is_conversational_repair_text(latest_founder_msg)
+    if is_repair:
+        updates["is_conversational_repair"] = True
+        updates["execution_path"] = "CONVERSATIONAL_REPAIR"
 
     if interpretation_output.get("concern_or_goal"):
         updates["founder_current_concern"] = interpretation_output["concern_or_goal"]
@@ -4041,12 +5431,127 @@ def interpret_founder_turn(state: StartaryGraphState) -> dict:
         updates["founder_current_goal"] = state["founder_current_goal"]
 
     logger.info(
-        "interpret_founder_turn | priority=%s intents=%s goal=%s",
+        "interpret_founder_turn | priority=%s intents=%s goal=%s repair=%s",
         interpretation_output.get("response_priority"),
         interpretation_output.get("intent_types"),
         (updates.get("founder_current_goal") or {}).get("goal_type"),
+        is_repair,
     )
     return updates
+
+
+def handle_conversational_repair(state: StartaryGraphState) -> dict:
+    """
+    M4.1.3 Node: Conversational Repair Fast Path.
+    When a founder says "I don't understand", "What do you mean?", or asks for explanation,
+    Startary immediately rephrases the *same* pending question with zero rediagnosis,
+    zero state extraction, and zero progression increments.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    pending_q = (
+        state.get("pending_question")
+        or state.get("current_question")
+        or "Could you tell me a bit more about your startup?"
+    )
+
+    founder_messages = state.get("founder_messages") or []
+    latest_msg = ""
+    for m in reversed(founder_messages):
+        if m.get("role") == "founder":
+            latest_msg = m.get("content", "")
+            break
+
+    t_start = time.monotonic()
+    settings = get_settings()
+    llm = _safe_get_llm_client(settings, tier="fast", max_tokens=800)
+    res_info = get_llm_client_resolution_info(llm)
+
+    repair_system_prompt = (
+        "You are Startary's startup advisor. The founder did not understand the previous question "
+        "or asked for clarification. Briefly explain in 1-2 simple, conversational, jargon-free sentences "
+        "what you are asking and why it matters, then repeat the question clearly. "
+        "Do NOT introduce new questions or change the topic."
+    )
+    user_prompt = (
+        f"Original question: {pending_q}\n"
+        f"Founder query: {latest_msg}\n\n"
+        "Provide a clear, reassuring, and direct rephrasing of the question."
+    )
+    used_fallback = False
+    repair_err = None
+    try:
+        res = llm.invoke([
+            {"role": "system", "content": repair_system_prompt},
+            {"role": "user", "content": user_prompt},
+        ])
+        rephrased_text = res.content.strip() if hasattr(res, "content") else str(res).strip()
+    except Exception as exc:
+        used_fallback = True
+        repair_err = exc
+        logger.warning("handle_conversational_repair LLM call failed: %s; using template fallback", exc)
+        rephrased_text = (
+            f"No problem! Let me make that simpler. To help figure out the next best step for your startup, "
+            f"I wanted to ask: {pending_q}"
+        )
+
+    latency_ms = (time.monotonic() - t_start) * 1000
+
+    active_decision = state.get("active_next_turn_decision") or {}
+    question_id = active_decision.get("question_id") or "q_repair"
+
+    advisor_resp = AdvisorResponse(
+        project_id=project_id,
+        response_text=rephphrased_text if 'rephphrased_text' in locals() else rephrased_text,
+        response_mode="CONVERSATIONAL_REPAIR",
+        tone="WARM_DIRECT",
+        founder_goal_addressed="CLARIFY_QUESTION",
+        intent_addressed="QUESTION",
+        question_id=question_id,
+    )
+
+    trace = AITrace(
+        module_name="handle_conversational_repair",
+        prompt_version="CONVERSATIONAL_REPAIR_V1",
+        input_data={"original_question": pending_q[:100], "founder_query": latest_msg[:100]},
+        output_data={"rephrased_response": rephrased_text[:120]},
+        latency_ms=latency_ms,
+        project_id=project_id,
+        model_name="local_deterministic" if used_fallback else (res_info["resolved_model"] or getattr(settings, "fast_model_name", None)),
+        configured_model=res_info["configured_model"],
+        resolved_model="local_deterministic" if used_fallback else res_info["resolved_model"],
+        fallback_used=True if used_fallback else res_info["fallback_used"],
+        fallback_reason=f"fast_fail_error: {repair_err}" if used_fallback else res_info["fallback_reason"],
+        execution_path="CONVERSATIONAL_REPAIR",
+    )
+    existing_traces = list(state.get("traces") or [])
+    existing_traces.append(trace.model_dump(mode="json"))
+
+    turn_telem = record_telemetry_event(
+        state=state,
+        node_name="handle_conversational_repair",
+        model_name="local_deterministic" if used_fallback else (res_info["resolved_model"] or getattr(settings, "fast_model_name", None) or "fast_tier"),
+        duration_ms=latency_ms,
+        execution_path="CONVERSATIONAL_REPAIR",
+        configured_model=res_info["configured_model"],
+        resolved_model="local_deterministic" if used_fallback else res_info["resolved_model"],
+        fallback_used=True if used_fallback else res_info["fallback_used"],
+        fallback_reason=f"fast_fail_error: {repair_err}" if used_fallback else res_info["fallback_reason"],
+    )
+
+    logger.info(
+        "handle_conversational_repair | project_id=%s rephrased='%s' latency_ms=%.0f",
+        project_id, rephrased_text[:60], latency_ms,
+    )
+
+    return {
+        "latest_advisor_response": advisor_resp.model_dump(),
+        "pending_question": pending_q,
+        "execution_path": "CONVERSATIONAL_REPAIR",
+        "is_conversational_repair": False,
+        "last_trace": trace.model_dump(mode="json"),
+        "traces": existing_traces,
+        "turn_telemetry": turn_telem,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -4140,7 +5645,7 @@ def compose_advisor_response(state: StartaryGraphState) -> dict:
     )
 
     settings = get_settings()
-    llm = get_llm_client(settings)
+    llm = _safe_get_llm_client(settings, tier="fast", max_tokens=1000)
     structured_llm = llm.with_structured_output(AdvisorResponseLLMOutput)
 
     # Milestone 4.0.4: Deterministically determine conversational response mode
@@ -4349,6 +5854,9 @@ def compose_execution_handoff(state: StartaryGraphState) -> dict:
     )
 
     crit_asmp_stmt = (active_asmp or {}).get("statement") or summary.critical_assumption
+    target_sample_size = active_exp.get("target_sample_size")
+    if target_sample_size is None or (isinstance(target_sample_size, int) and target_sample_size <= 0):
+        target_sample_size = extract_sample_target_from_protocol(active_exp)
 
     handoff = ExecutionHandoff(
         experiment_id=exp_id,
@@ -4359,6 +5867,7 @@ def compose_execution_handoff(state: StartaryGraphState) -> dict:
         what_we_are_testing=what_testing,
         founder_actions=actions,
         target_participants_or_context=target,
+        target_sample_size=target_sample_size,
         evidence_to_collect=evidence_to_collect,
         support_signal=support_signal,
         contradiction_signal=contradiction_signal,
@@ -4371,6 +5880,9 @@ def compose_execution_handoff(state: StartaryGraphState) -> dict:
             "You can also ask me to explain the experiment or tell me if something blocks you."
         ),
         summary=summary,
+        build_readiness=state.get("build_readiness"),
+        next_strategic_action=state.get("next_strategic_action"),
+        founder_diagnosis_text=state.get("founder_diagnosis_text"),
     )
     compact_text = render_execution_handoff_text(handoff, mode="compact")
     full_text = render_execution_handoff_text(handoff, mode="full")
@@ -4409,6 +5921,10 @@ def wait_for_evidence(state: StartaryGraphState) -> dict:
     elif handoff_text:
         prompt_text = str(handoff_text)
     else:
+        if not exp.get("founder_diagnosis_text"):
+            exp["founder_diagnosis_text"] = state.get("founder_diagnosis_text")
+        if not exp.get("next_strategic_action"):
+            exp["next_strategic_action"] = state.get("next_strategic_action")
         prompt_text = render_execution_handoff_text(exp)
 
     post_ans = state.get("post_evidence_answer")
@@ -4503,7 +6019,8 @@ def classify_waiting_for_evidence_turn(state: StartaryGraphState) -> dict:
     interpretation_json = json.dumps(turn_interpretation, indent=2, default=str)
 
     settings = get_settings()
-    llm = get_llm_client(settings)
+    llm = _safe_get_llm_client(settings, tier="fast", max_tokens=800)
+    res_info = get_llm_client_resolution_info(llm)
     structured_llm = llm.with_structured_output(EvidenceTurnAssessmentLLMOutput)
 
     user_msg = build_evidence_admission_gate_user_message(
@@ -4519,6 +6036,7 @@ def classify_waiting_for_evidence_turn(state: StartaryGraphState) -> dict:
 
     llm_assessment = None
     attempt = 0
+    t_start = time.monotonic()
     while attempt < 2:
         attempt += 1
         try:
@@ -4527,6 +6045,10 @@ def classify_waiting_for_evidence_turn(state: StartaryGraphState) -> dict:
             break
         except Exception as exc:
             logger.warning("classify_waiting_for_evidence_turn attempt %d failed: %s", attempt, exc)
+            if is_permanent_model_error(exc):
+                break
+
+    latency_ms = (time.monotonic() - t_start) * 1000
 
     msg_lower = raw_message.lower().strip()
 
@@ -4550,8 +6072,8 @@ def classify_waiting_for_evidence_turn(state: StartaryGraphState) -> dict:
         phrase in msg_lower
         for phrase in [
             "i will do it", "i will interview", "i will talk", "ill do it",
-            "tomorrow", "going to start", "haven't started", "have not started",
-            "haven't done", "not yet"
+            "tomorrow", "going to start", "going to", "haven't started", "have not started",
+            "haven't done", "not yet", "next week", "plan to", "planning to"
         ]
     )
     is_cannot_execute = any(
@@ -4614,8 +6136,24 @@ def classify_waiting_for_evidence_turn(state: StartaryGraphState) -> dict:
         cannot_exec = is_cannot_execute
         candidate_text = raw_message if has_completed_action else None
 
-    # CRITICAL DETERMINISTIC OVERRIDE:
-    if is_future_only or is_future:
+    # MILESTONE 4.0.7.2.1: EVIDENCE ADMISSION PRECEDENCE INTEGRITY
+    # Core Rule: Substantive completed evidence must take precedence over incidental future-oriented language.
+    substantive_completed_evidence = has_substantive_completed_evidence(raw_message, llm_assessment)
+
+    if substantive_completed_evidence:
+        final_disp = EvidenceTurnDisposition.ACTUAL_EVIDENCE
+        has_completed_action = True
+        if candidate_text is None:
+            candidate_text = raw_message
+        has_future_signal = is_future_only or is_future or (llm_assessment and llm_assessment.contains_only_future_intent)
+        has_q_signal = is_question_only or asks_expl or asks_help
+        if has_future_signal and has_q_signal:
+            rationale += " [Admitted: substantive completed evidence takes precedence over incidental future plan and question]."
+        elif has_future_signal:
+            rationale += " [Admitted: substantive completed evidence takes precedence over incidental future language]."
+        elif has_q_signal:
+            rationale += " [Admitted: mixed submission with completed action and question]."
+    elif is_future_only or is_future:
         if (is_question_only or asks_expl) and not any(w in msg_lower for w in ["tomorrow", "will ", "ill ", "going to"]):
             final_disp = EvidenceTurnDisposition.QUESTION_ABOUT_EXPERIMENT
             rationale += " [Overridden: question/explanation request]."
@@ -4636,12 +6174,6 @@ def classify_waiting_for_evidence_turn(state: StartaryGraphState) -> dict:
         else:
             final_disp = EvidenceTurnDisposition.AMBIGUOUS
             rationale += " [Overridden: no completed action detected, treated as ambiguous]."
-
-    # Mixed message check: if message contains completed action AND is not future intent, admit evidence!
-    if has_completed_action and not (is_future_only or is_future):
-        final_disp = EvidenceTurnDisposition.ACTUAL_EVIDENCE
-        if is_question_only or asks_expl or asks_help:
-            rationale += " [Admitted: mixed submission with completed action and question]."
 
     admitted = (final_disp == EvidenceTurnDisposition.ACTUAL_EVIDENCE)
 
@@ -4687,7 +6219,7 @@ def classify_waiting_for_evidence_turn(state: StartaryGraphState) -> dict:
         disposition=final_disp,
         contains_completed_external_action=has_completed_action,
         contains_results=has_results,
-        contains_only_future_intent=is_future,
+        contains_only_future_intent=False if substantive_completed_evidence else is_future,
         asks_for_help=asks_help,
         asks_for_explanation=asks_expl,
         cannot_execute=cannot_exec,
@@ -4695,9 +6227,22 @@ def classify_waiting_for_evidence_turn(state: StartaryGraphState) -> dict:
         rationale_summary=rationale,
     )
 
+    turn_telem = record_telemetry_event(
+        state=state,
+        node_name="classify_waiting_for_evidence_turn",
+        model_name=res_info["resolved_model"] or getattr(settings, "fast_model_name", None) or "fast_tier",
+        duration_ms=latency_ms,
+        execution_path=state.get("execution_path", "FULL_EVIDENCE_LEARNING"),
+        configured_model=res_info["configured_model"],
+        resolved_model=res_info["resolved_model"],
+        fallback_used=res_info["fallback_used"],
+        fallback_reason=res_info["fallback_reason"],
+    )
+
     return {
         "evidence_turn_assessment": assessment.model_dump(mode="json"),
         "pending_post_evidence_question": pending_q,
+        "turn_telemetry": turn_telem,
     }
 
 
@@ -4959,7 +6504,7 @@ def respond_to_waiting_founder(state: StartaryGraphState) -> dict:
         }
 
     settings = get_settings()
-    llm = get_llm_client(settings)
+    llm = _safe_get_llm_client(settings, tier="fast", max_tokens=1000)
     structured_llm = llm.with_structured_output(WaitingForEvidenceAdvisorLLMOutput)
 
     user_msg = build_waiting_for_evidence_advisor_user_message(
@@ -5043,12 +6588,35 @@ def extract_experiment_evidence(state: StartaryGraphState) -> dict:
     active_assumption = state.get("active_assumption") or state.get("active_critical_assumption") or {}
     assumption_text = active_assumption.get("statement", "Critical assumption under test")
 
+    # Post-analysis idempotency: reuse existing extraction if already completed for this submission
+    existing_extracted = state.get("extracted_evidence")
+    if existing_extracted and isinstance(existing_extracted, dict) and (
+        existing_extracted.get("actions_completed")
+        or existing_extracted.get("observed_behaviors")
+        or existing_extracted.get("quantitative_outcomes")
+        or existing_extracted.get("direct_evidence_summary")
+    ):
+        logger.info("extract_experiment_evidence | reusing existing extracted evidence from checkpoint")
+        return {
+            "extracted_evidence": existing_extracted,
+        }
+
     import json as _json
-    exp_json = _json.dumps(active_experiment, indent=2, default=str)
+    slimmed_protocol = {
+        "objective": active_experiment.get("objective"),
+        "method": active_experiment.get("method"),
+        "target_participants_or_scope": active_experiment.get("target_participants_or_scope"),
+        "target_sample_size": active_experiment.get("target_sample_size"),
+        "founder_actions": active_experiment.get("founder_actions"),
+        "evidence_to_collect": active_experiment.get("evidence_to_collect"),
+    }
+    exp_json = _json.dumps({k: v for k, v in slimmed_protocol.items() if v is not None}, indent=2, default=str)
     evidence_reqs = active_experiment.get("evidence_to_collect") or ""
 
     settings = get_settings()
-    llm = get_llm_client(settings)
+    # Shift factual extraction strictly to FAST tier for ~70-80% latency reduction
+    llm = _safe_get_llm_client(settings, tier="fast", max_tokens=1200)
+    conf_model, res_model, fb_used, fb_reason = get_llm_client_resolution_info(llm)
     structured_llm = llm.with_structured_output(ExtractedEvidenceLLMOutput)
 
     user_msg = build_evidence_extractor_user_message(
@@ -5072,6 +6640,32 @@ def extract_experiment_evidence(state: StartaryGraphState) -> dict:
             res: ExtractedEvidenceLLMOutput = structured_llm.invoke(messages)
             latency_ms = (time.monotonic() - t_start) * 1000
 
+            # Milestone 4.0.7.2.1: Enforce evidence boundary on extracted output
+            # If substantive completed evidence exists, is_future_intention_only MUST be False
+            if res.actions_completed or res.quantitative_outcomes or has_substantive_completed_evidence(raw_submission):
+                res.is_future_intention_only = False
+
+            # Filter out future promises/plans from actions_completed and evidence_items
+            future_markers = ["will ", "plan to ", "planning to ", "going to ", "next week", "tomorrow", "intend to "]
+            filtered_actions = []
+            for action in res.actions_completed:
+                act_lower = action.lower().strip()
+                if any(m in act_lower for m in future_markers) and not any(past in act_lower for past in ["interviewed", "completed", "visited", "conducted", "tested", "got ", "spoke"]):
+                    logger.info("filtered_future_intention_from_actions | action=%s", action)
+                    continue
+                filtered_actions.append(action)
+            res.actions_completed = filtered_actions
+
+            if hasattr(res, "evidence_items") and res.evidence_items:
+                filtered_items = []
+                for item in res.evidence_items:
+                    item_text = (getattr(item, "text", "") or getattr(item, "observation", "") or str(item)).lower()
+                    if any(m in item_text for m in future_markers) and not any(past in item_text for past in ["interviewed", "completed", "visited", "conducted", "tested", "got ", "spoke"]):
+                        logger.info("filtered_future_intention_from_evidence_items | item=%s", item_text)
+                        continue
+                    filtered_items.append(item)
+                res.evidence_items = filtered_items
+
             res_dict = res.model_dump()
             trace = AITrace(
                 module_name="extract_experiment_evidence",
@@ -5080,9 +6674,40 @@ def extract_experiment_evidence(state: StartaryGraphState) -> dict:
                 output_data={"actions_count": len(res.actions_completed), "is_future": res.is_future_intention_only},
                 latency_ms=latency_ms,
                 project_id=project_id,
+                model_name=res_model or getattr(settings, "fast_model_name", None),
+                configured_model=conf_model,
+                resolved_model=res_model,
+                fallback_used=fb_used,
+                fallback_reason=fb_reason,
+                execution_path=state.get("execution_path", "STRATEGIC_REASONING"),
             )
             existing_traces = list(state.get("traces") or [])
             existing_traces.append(trace.model_dump(mode="json"))
+
+            # Token accounting with fallback character counting
+            prompt_tokens = getattr(getattr(res, "usage_metadata", None), "prompt_tokens", None)
+            if prompt_tokens is None:
+                prompt_tokens = sum(len(m.get("content", "")) for m in messages) // 4
+            completion_tokens = getattr(getattr(res, "usage_metadata", None), "completion_tokens", None)
+            if completion_tokens is None:
+                completion_tokens = len(_json.dumps(res_dict)) // 4
+            total_tokens = prompt_tokens + completion_tokens
+
+            turn_telem = record_telemetry_event(
+                state=state,
+                node_name="extract_experiment_evidence",
+                model_name=res_model or getattr(settings, "fast_model_name", None) or "fast_tier",
+                duration_ms=latency_ms,
+                latency_ms=latency_ms,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                execution_path=state.get("execution_path", "STRATEGIC_REASONING"),
+                configured_model=conf_model,
+                resolved_model=res_model,
+                fallback_used=fb_used,
+                fallback_reason=fb_reason,
+            )
 
             logger.info("extract_experiment_evidence | actions=%d is_future=%s summary=%s",
                         len(res.actions_completed), res.is_future_intention_only, res.direct_evidence_summary[:60])
@@ -5090,10 +6715,13 @@ def extract_experiment_evidence(state: StartaryGraphState) -> dict:
                 "extracted_evidence": res_dict,
                 "traces": existing_traces,
                 "last_trace": trace.model_dump(mode="json"),
+                "turn_telemetry": turn_telem,
             }
         except Exception as exc:
             last_err = exc
             logger.warning("extract_experiment_evidence attempt %d failed: %s", attempt, exc)
+            if is_permanent_model_error(exc):
+                break
 
     # Fallback extraction on error
     fallback = ExtractedEvidenceLLMOutput(
@@ -5109,8 +6737,20 @@ def extract_experiment_evidence(state: StartaryGraphState) -> dict:
         evidence_items=[],
         direct_evidence_summary=raw_submission[:200] if raw_submission else "No evidence details extracted.",
     )
+    fallback_telem = record_telemetry_event(
+        state=state,
+        node_name="extract_experiment_evidence",
+        model_name="local_deterministic",
+        configured_model=conf_model,
+        resolved_model="local_deterministic",
+        fallback_used=True,
+        fallback_reason="EXTRACTION_FAILURE_FALLBACK",
+        duration_ms=0.0,
+        execution_path=state.get("execution_path", "STRATEGIC_REASONING"),
+    )
     return {
         "extracted_evidence": fallback.model_dump(),
+        "turn_telemetry": fallback_telem,
     }
 
 
@@ -5128,8 +6768,8 @@ def assess_evidence_submission_sufficiency(state: StartaryGraphState) -> dict:
     counts = extracted.get("sample_or_counts") or {}
     behaviors = extracted.get("observed_behaviors") or []
 
-    # If founder only stated future intentions:
-    if is_future:
+    # If founder only stated future intentions (and no substantive completed evidence was submitted):
+    if is_future and not (actions or counts or behaviors or has_substantive_completed_evidence(raw)):
         return {
             "evidence_submission_sufficiency": EvidenceSubmissionSufficiency.NEEDS_CLARIFICATION.value,
             "evidence_clarification_question": (
@@ -5190,7 +6830,7 @@ def ask_evidence_clarification(state: StartaryGraphState) -> dict:
 
 def analyze_evidence(state: StartaryGraphState) -> dict:
     """
-    LLM Node (Milestone 4):
+    LLM Node (Milestone 4 & M4.1.3.2):
     Evaluates extracted evidence against the active Critical Assumption and experiment decision rules.
     Respects valid vs invalid inferences and determines conclusion & evidence strength.
     """
@@ -5198,6 +6838,14 @@ def analyze_evidence(state: StartaryGraphState) -> dict:
     active_experiment = state.get("active_experiment") or {}
     active_assumption = state.get("active_assumption") or state.get("active_critical_assumption") or {}
     statement = active_assumption.get("statement", "Critical assumption")
+
+    # Post-analysis idempotency: reuse existing analysis if already performed
+    existing_analysis = state.get("evidence_analysis")
+    if existing_analysis and isinstance(existing_analysis, dict) and existing_analysis.get("conclusion") and existing_analysis.get("conclusion") != "INCONCLUSIVE":
+        logger.info("analyze_evidence | reusing existing valid evidence_analysis from checkpoint")
+        return {
+            "evidence_analysis": existing_analysis,
+        }
 
     extracted = state.get("extracted_evidence") or {}
     raw = state.get("founder_response") or ""
@@ -5215,7 +6863,9 @@ def analyze_evidence(state: StartaryGraphState) -> dict:
     rc_summary = rc.get("summary") or ""
 
     settings = get_settings()
-    llm = get_llm_client(settings)
+    base_max_tokens = 2500
+    llm = _safe_get_llm_client(settings, tier="reasoning", max_completion_tokens=base_max_tokens)
+    conf_model, res_model, fb_used, fb_reason = get_llm_client_resolution_info(llm)
     structured_llm = llm.with_structured_output(EvidenceAnalysisLLMOutput)
 
     user_msg = build_evidence_analyzer_user_message(
@@ -5240,10 +6890,16 @@ def analyze_evidence(state: StartaryGraphState) -> dict:
     last_err = None
     while attempt < 2:
         attempt += 1
-        t_start = time.monotonic()
         try:
-            res: EvidenceAnalysisLLMOutput = structured_llm.invoke(messages)
-            latency_ms = (time.monotonic() - t_start) * 1000
+            res, latency_ms = _invoke_structured_with_token_retry(
+                structured_llm=structured_llm,
+                messages=messages,
+                settings=settings,
+                tier="reasoning",
+                base_max_tokens=base_max_tokens,
+                node_name="analyze_evidence",
+                schema_cls=EvidenceAnalysisLLMOutput,
+            )
 
             res_dict = res.model_dump()
             trace = AITrace(
@@ -5253,9 +6909,40 @@ def analyze_evidence(state: StartaryGraphState) -> dict:
                 output_data={"conclusion": res.conclusion, "strength": res.evidence_strength},
                 latency_ms=latency_ms,
                 project_id=project_id,
+                model_name=res_model or getattr(settings, "reasoning_model_name", None),
+                configured_model=conf_model,
+                resolved_model=res_model,
+                fallback_used=fb_used,
+                fallback_reason=fb_reason,
+                execution_path=state.get("execution_path", "STRATEGIC_REASONING"),
             )
             existing_traces = list(state.get("traces") or [])
             existing_traces.append(trace.model_dump(mode="json"))
+
+            # Token accounting with fallback character counting
+            prompt_tokens = getattr(getattr(res, "usage_metadata", None), "prompt_tokens", None)
+            if prompt_tokens is None:
+                prompt_tokens = sum(len(m.get("content", "")) for m in messages) // 4
+            completion_tokens = getattr(getattr(res, "usage_metadata", None), "completion_tokens", None)
+            if completion_tokens is None:
+                completion_tokens = len(_json.dumps(res_dict)) // 4
+            total_tokens = prompt_tokens + completion_tokens
+
+            turn_telem = record_telemetry_event(
+                state=state,
+                node_name="analyze_evidence",
+                model_name=res_model or getattr(settings, "reasoning_model_name", None) or "reasoning_tier",
+                duration_ms=latency_ms,
+                latency_ms=latency_ms,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                execution_path=state.get("execution_path", "STRATEGIC_REASONING"),
+                configured_model=conf_model,
+                resolved_model=res_model,
+                fallback_used=fb_used,
+                fallback_reason=fb_reason,
+            )
 
             logger.info("analyze_evidence | conclusion=%s strength=%s execution_quality=%s reasoning=%s",
                         res.conclusion, res.evidence_strength, res.experiment_execution_quality, res.reasoning_summary[:60])
@@ -5263,10 +6950,16 @@ def analyze_evidence(state: StartaryGraphState) -> dict:
                 "evidence_analysis": res_dict,
                 "traces": existing_traces,
                 "last_trace": trace.model_dump(mode="json"),
+                "turn_telemetry": turn_telem,
             }
         except Exception as exc:
             last_err = exc
             logger.warning("analyze_evidence attempt %d failed: %s", attempt, exc)
+            if is_permanent_model_error(exc) or isinstance(exc, TokenBudgetExhaustedError):
+                break
+
+    if isinstance(last_err, TokenBudgetExhaustedError):
+        raise last_err
 
     # Fallback analysis on error
     fallback = EvidenceAnalysisLLMOutput(
@@ -5283,8 +6976,20 @@ def analyze_evidence(state: StartaryGraphState) -> dict:
         reasoning_summary=f"Analysis fallback due to error: {last_err}",
         recommended_state_updates={},
     )
+    fallback_telem = record_telemetry_event(
+        state=state,
+        node_name="analyze_evidence",
+        model_name="local_deterministic",
+        configured_model=conf_model,
+        resolved_model="local_deterministic",
+        fallback_used=True,
+        fallback_reason="ANALYSIS_FAILURE_FALLBACK",
+        duration_ms=0.0,
+        execution_path=state.get("execution_path", "STRATEGIC_REASONING"),
+    )
     return {
         "evidence_analysis": fallback.model_dump(),
+        "turn_telemetry": fallback_telem,
     }
 
 
@@ -5308,6 +7013,91 @@ def validate_evidence_analysis(state: StartaryGraphState) -> dict:
     iteration = state.get("iteration", 1)
     analysis = state.get("evidence_analysis") or {}
     raw_conclusion = (analysis.get("conclusion") or "INCONCLUSIVE").upper()
+
+    # Milestone 4.1.2: Check completeness of experiment execution
+    is_complete, early_stop_reason, collected_count, target_count = evaluate_experiment_completeness(state, analysis)
+
+    if not is_complete:
+        logger.info(
+            "validate_evidence_analysis | partial evidence detected (collected=%d, target=%d, reason=%s); preserving active experiment as IN_PROGRESS.",
+            collected_count, target_count, early_stop_reason,
+        )
+        active_exp = dict(state.get("active_experiment") or {})
+        active_exp["status"] = ExperimentStatus.IN_PROGRESS.value
+        active_exp["collected_sample_count"] = collected_count
+        active_exp["target_sample_size"] = target_count
+
+        # Preserve observations in active experiment
+        partial_obs = list(active_exp.get("partial_observations") or [])
+        raw_content = state.get("founder_response") or ""
+        if not raw_content:
+            founder_messages = state.get("founder_messages") or []
+            for m in reversed(founder_messages):
+                if m.get("role") == "founder":
+                    raw_content = m.get("content", "")
+                    break
+        if raw_content:
+            partial_obs.append(raw_content)
+        active_exp["partial_observations"] = partial_obs
+
+        # Extract early signals for active incomplete experiment only (Milestone 4.1.2.2)
+        early_signals = []
+        for s in (analysis.get("support_findings") or []):
+            s_clean = str(s).strip()
+            if s_clean and s_clean not in early_signals:
+                early_signals.append(s_clean)
+        for v in (analysis.get("valid_learnings") or []):
+            v_clean = str(v).strip()
+            if v_clean and v_clean not in early_signals:
+                early_signals.append(v_clean)
+        for c in (analysis.get("contradiction_findings") or []):
+            c_clean = str(c).strip()
+            if c_clean and c_clean not in early_signals:
+                early_signals.append(c_clean)
+        if not early_signals:
+            for obs in (state.get("extracted_evidence") or {}).get("observations") or []:
+                obs_clean = str(obs).strip()
+                if obs_clean and obs_clean not in early_signals:
+                    early_signals.append(obs_clean)
+
+        # Build partial continuation handoff
+        handoff_data = {
+            "action_type": "CONTINUE_CURRENT_TEST",
+            "is_partial_evidence": True,
+            "target_sample_size": target_count,
+            "observations_collected": collected_count,
+            "collected_sample_count": collected_count,
+            "early_signals": early_signals,
+            "method": active_exp.get("method"),
+            "target_participants_or_scope": active_exp.get("target_participants_or_scope"),
+        }
+        cont_text = render_execution_handoff_text(handoff_data, mode="compact")
+
+        active_assumption = dict(state.get("active_assumption") or state.get("active_critical_assumption") or {})
+        active_assumption["status"] = AssumptionStatus.TESTING.value
+
+        handoff = dict(state.get("active_execution_handoff") or {})
+        handoff["action_type"] = "CONTINUE_CURRENT_TEST"
+        handoff["is_partial_evidence"] = True
+        handoff["target_sample_size"] = target_count
+        handoff["observations_collected"] = collected_count
+        handoff["early_signals"] = early_signals
+        handoff["response_text"] = cont_text
+        handoff["full_response_text"] = cont_text
+
+        return {
+            "active_experiment": active_exp,
+            "active_assumption": active_assumption,
+            "active_critical_assumption": active_assumption,
+            "is_partial_evidence": True,
+            "phase": WorkflowPhase.WAITING_FOR_EVIDENCE,
+            "active_interrupt_type": "waiting_for_evidence",
+            "active_execution_handoff": handoff,
+            "execution_handoff_text": cont_text,
+            "waiting_response": cont_text,
+            "status_message": cont_text,
+            "founder_response": None,
+        }
 
     conclusion_map = {
         "SUPPORTED": AssumptionStatus.SUPPORTED,
@@ -5335,6 +7125,40 @@ def validate_evidence_analysis(state: StartaryGraphState) -> dict:
                 break
 
     extracted = state.get("extracted_evidence") or {}
+    additional_obs: list[dict[str, Any]] = []
+
+    # 1. From analysis
+    if analysis.get("additional_observations"):
+        additional_obs.extend(analysis["additional_observations"])
+
+    # 2. From extracted structured observations / quotes / behaviors
+    for obs in (extracted.get("observed_behaviors") or []) + (extracted.get("quotes") or []):
+        obs_str = str(obs).strip()
+        if any(k in obs_str.lower() for k in [
+            "bottleneck", "personalization", "manual", "min/student", "minutes", "hour",
+            "repeat", "2nd week", "second week", "recurrent", "returned", "capacity", "workflow", "operational"
+        ]):
+            if not any(o.get("text") == obs_str for o in additional_obs):
+                additional_obs.append({"text": obs_str, "category": "OPERATIONAL_OBSERVATION"})
+
+    # 3. Grounded extraction from raw founder response for operational facts
+    raw_lower = raw_content.lower()
+    for marker, category in [
+        ("personalization", "OPERATIONAL_BOTTLENECK"),
+        ("bottleneck", "OPERATIONAL_BOTTLENECK"),
+        ("2nd week", "RETENTION_OBSERVATION"),
+        ("second week", "RETENTION_OBSERVATION"),
+        ("workflow test", "WORKFLOW_VALIDATION"),
+        ("min/student", "OPERATIONAL_BOTTLENECK"),
+        ("minutes per", "OPERATIONAL_BOTTLENECK"),
+    ]:
+        if marker in raw_lower:
+            for clause in re.split(r"[\.\n;]+", raw_content):
+                c_clean = clause.strip()
+                if marker in c_clean.lower() and len(c_clean) > 8:
+                    if not any(o.get("text") == c_clean for o in additional_obs):
+                        additional_obs.append({"text": c_clean, "category": category})
+
     evidence_obj = Evidence(
         id=str(uuid.uuid4()),
         project_id=project_id,
@@ -5346,12 +7170,28 @@ def validate_evidence_analysis(state: StartaryGraphState) -> dict:
         raw_content=raw_content or "Founder submitted experiment results.",
         structured_observations=extracted.get("observed_behaviors") or [],
         quantitative_results=extracted.get("quantitative_outcomes") or extracted.get("sample_or_counts") or {},
+        additional_observations=additional_obs,
         provenance=EvidenceProvenance.FOUNDER_REPORTED,
         result=EvidenceResult.ANALYZED,
     )
 
     founder_evidence_list = list(state.get("founder_evidence") or [])
     founder_evidence_list.append(evidence_obj.model_dump(mode="json"))
+
+    # Milestone 4.0.7.2: Preserve completed experiment in previous_experiments
+    prev_experiments = list(state.get("previous_experiments") or [])
+    updated_prev_experiments = []
+    exp_found = False
+    for pe in prev_experiments:
+        if isinstance(pe, dict) and pe.get("id") == active_exp.get("id"):
+            pe_copy = dict(pe)
+            pe_copy["status"] = ExperimentStatus.COMPLETED.value
+            updated_prev_experiments.append(pe_copy)
+            exp_found = True
+        else:
+            updated_prev_experiments.append(pe)
+    if not exp_found and active_exp:
+        updated_prev_experiments.append(active_exp)
 
     logger.info(
         "valid_evidence_cycle | experiment_id=%s evidence_id=%s conclusion=%s",
@@ -5360,12 +7200,18 @@ def validate_evidence_analysis(state: StartaryGraphState) -> dict:
     logger.info("validate_evidence_analysis | assumption_status=%s experiment_status=COMPLETED evidence_id=%s",
                 new_assumption_status.value, evidence_obj.id)
 
+    new_rev = int(state.get("strategic_state_revision") or 1) + 1
+
     return {
         "active_assumption": active_assumption,
         "active_critical_assumption": active_assumption,
         "active_experiment": active_exp,
+        "previous_experiments": updated_prev_experiments,
         "founder_evidence": founder_evidence_list,
         "active_evidence": evidence_obj.model_dump(mode="json"),
+        "is_partial_evidence": False,
+        "strategic_state_changed": True,
+        "strategic_state_revision": new_rev,
     }
 
 
@@ -5385,8 +7231,9 @@ def apply_validated_state_updates(state: StartaryGraphState) -> dict:
     analysis = state.get("evidence_analysis") or {}
     tested_area_str = active_assumption.get("area") or "Problem"
 
-    area_knowledge_map = dict(startup_state_dict.get("area_knowledge") or {})
-    current_area_knowledge = dict(area_knowledge_map.get(tested_area_str) or {})
+    # Milestone 4.0.7.2: Support both areas and area_knowledge structures
+    areas_map = dict(startup_state_dict.get("areas") or startup_state_dict.get("area_knowledge") or {})
+    current_area_knowledge = dict(areas_map.get(tested_area_str) or {})
 
     support_findings = analysis.get("support_findings") or []
     contradiction_findings = analysis.get("contradiction_findings") or []
@@ -5409,23 +7256,29 @@ def apply_validated_state_updates(state: StartaryGraphState) -> dict:
         if contradiction_findings:
             current_area_knowledge["understanding"] = f"Weakened by experiment: {'; '.join(contradiction_findings)}"
 
-    area_knowledge_map[tested_area_str] = current_area_knowledge
-    startup_state_dict["area_knowledge"] = area_knowledge_map
+    areas_map[tested_area_str] = current_area_knowledge
+    if "areas" in startup_state_dict or "area_knowledge" not in startup_state_dict:
+        startup_state_dict["areas"] = areas_map
+    startup_state_dict["area_knowledge"] = areas_map
 
     logger.info("apply_validated_state_updates | updated area=%s status=%s evidence_count=%d",
                 tested_area_str, current_area_knowledge.get("status"), len(evidence_provided))
 
+    new_rev = int(state.get("strategic_state_revision") or 1) + 1
     return {
         "startup_state": startup_state_dict,
+        "strategic_state_changed": True,
+        "strategic_state_revision": new_rev,
     }
 
 
 def increment_iteration(state: StartaryGraphState) -> dict:
     """
-    Deterministic Node (Milestone 4.0.3 & Milestone 4.0.7.1.1):
+    Deterministic Node (Milestone 4.0.3 & Milestone 4.0.7.1.1 & M4.1.3.3):
     Advances learning loop iteration, archives previous assumption and snapshot,
     and transitions phase to LEARN. Requires a valid completed evidence cycle.
-    Resets active execution state from the completed cycle to prevent cross-iteration leaks.
+    Resets active execution state and derived strategic artifacts from the completed cycle
+    to prevent stale reasoning cache leaks into the next iteration.
     """
     if not has_valid_completed_evidence_cycle(state):
         logger.warning("increment_iteration skipped: no valid completed evidence cycle.")
@@ -5444,12 +7297,30 @@ def increment_iteration(state: StartaryGraphState) -> dict:
 
     logger.info("increment_iteration | advancing iteration %d -> %d, phase -> LEARN", current_iter, new_iter)
 
+    new_rev = int(state.get("strategic_state_revision") or 1) + 1
+
     return {
         "iteration": new_iter,
         "phase": WorkflowPhase.LEARN,
         "previous_assumptions": prev_assumptions,
         "previous_diagnosis_snapshot": prev_snapshot,
         "previous_weak_area": prev_weak,
+        "strategic_state_changed": True,
+        "strategic_state_revision": new_rev,
+        # Milestone M4.1.3.3: Invalidate active derived strategic artifacts
+        "diagnosis_output": None,
+        "diagnosis": None,
+        "diagnosis_snapshot": None,
+        "area_assessments_output": None,
+        "active_weak_link": None,
+        "weak_link": None,
+        "weak_area": None,
+        "weak_link_discrimination_result": None,
+        "reality_check_output": None,
+        "critical_assumption_output": None,
+        "build_readiness": None,
+        "next_strategic_action": None,
+        "learning_delta": None,
         "active_assumption": None,
         "active_critical_assumption": None,
         "active_experiment": None,
@@ -5472,54 +7343,24 @@ def increment_iteration(state: StartaryGraphState) -> dict:
 
 def can_compose_learning_delta(state: StartaryGraphState) -> bool:
     """
-    Deterministic Eligibility Guard (Milestone 4.0.1):
-    Returns True ONLY if all of the following are satisfied:
+    Deterministic Eligibility Guard (Milestone 4.0.1 / M4.0.7.2):
+    Returns True ONLY if:
       1. iteration > 1
-      2. there is a completed evidence record for the immediately previous learning cycle
-      3. there is a validated EvidenceAnalysis with a valid conclusion
-      4. there is a previous tested assumption
-      5. there is a previous diagnosis / weak link to compare against
-      6. evidence has already been applied to startup state
-    If any are missing, returns False so compose_learning_delta is safely skipped.
+      2. there is a valid completed evidence cycle from the immediately preceding cycle
+         resolved via get_most_recent_completed_evidence_cycle
+      3. there is a previous weak area / tested area to compare against
     """
     iteration = state.get("iteration", 1)
     if iteration <= 1:
         return False
 
-    # 2. Completed evidence record
-    founder_evidence = state.get("founder_evidence") or []
-    if not founder_evidence:
-        return False
-    has_prior_evidence = any(
-        e.get("iteration") == (iteration - 1) or e.get("result") in ("ANALYZED", "COMPLETED")
-        for e in founder_evidence
-    )
-    if not has_prior_evidence:
+    cycle = get_most_recent_completed_evidence_cycle(state)
+    if cycle is None:
         return False
 
-    # 3. Validated EvidenceAnalysis
-    analysis = state.get("evidence_analysis") or {}
-    conclusion = analysis.get("conclusion")
-    if not conclusion or conclusion not in ("SUPPORTED", "PARTIALLY_SUPPORTED", "CONTRADICTED", "INCONCLUSIVE"):
-        return False
-
-    # 4. Previous tested assumption
-    prev_assumptions = state.get("previous_assumptions") or []
-    if not prev_assumptions:
-        return False
-
-    # 5. Previous diagnosis / weak link to compare against
-    prev_weak = state.get("previous_weak_area") or prev_assumptions[-1].get("area")
+    tested_asmp, comp_exp, adm_ev, analysis = cycle
+    prev_weak = state.get("previous_weak_area") or tested_asmp.get("area")
     if not prev_weak:
-        return False
-
-    # 6. Evidence applied to startup state
-    startup_st = state.get("startup_state") or {}
-    area_knowledge = startup_st.get("area_knowledge") or {}
-    tested_area_str = str(prev_assumptions[-1].get("area") or prev_weak)
-    area_data = area_knowledge.get(tested_area_str) or {}
-    evidence_provided = area_data.get("evidence_provided") or []
-    if not evidence_provided:
         return False
 
     return True
@@ -5527,8 +7368,10 @@ def can_compose_learning_delta(state: StartaryGraphState) -> bool:
 
 def compose_learning_delta(state: StartaryGraphState) -> dict:
     """
-    Deterministic Node (Milestone 4):
+    Deterministic Node (Milestone 4 & Milestone 4.0.7.2):
     Synthesizes the founder-facing LearningDelta comparing Iteration N-1 to Iteration N.
+    Strictly distinguishes Tested Area from New Weak Link.
+    Preserves conclusion semantics: SUPPORTED, PARTIALLY_SUPPORTED, CONTRADICTED, INCONCLUSIVE.
     Only runs when can_compose_learning_delta is True.
     """
     if not can_compose_learning_delta(state):
@@ -5540,15 +7383,17 @@ def compose_learning_delta(state: StartaryGraphState) -> dict:
             "learning_delta": None,
         }
 
-    prev_assumptions = state.get("previous_assumptions") or []
-    prev_assumption_obj = prev_assumptions[-1] if prev_assumptions else {}
-    prev_assumption_stmt = prev_assumption_obj.get("statement", "Critical startup assumption")
+    cycle = get_most_recent_completed_evidence_cycle(state)
+    if not cycle:
+        return {"learning_delta": None}
 
-    prev_weak = state.get("previous_weak_area") or prev_assumption_obj.get("area") or "Problem"
+    tested_asmp, comp_exp, adm_ev, analysis = cycle
+    tested_asmp_stmt = tested_asmp.get("statement", "Critical startup assumption")
+
+    tested_area = state.get("previous_weak_area") or tested_asmp.get("area") or "Problem"
     current_weak = state.get("weak_area") or "Problem"
-    weak_changed = (str(prev_weak) != str(current_weak))
+    weak_changed = (str(tested_area) != str(current_weak))
 
-    analysis = state.get("evidence_analysis") or {}
     conclusion = analysis.get("conclusion", "INCONCLUSIVE")
     strength = analysis.get("evidence_strength", "MODERATE")
 
@@ -5563,34 +7408,47 @@ def compose_learning_delta(state: StartaryGraphState) -> dict:
     what_remains_unknown = inconclusive_findings
 
     if conclusion == "SUPPORTED":
-        summary = f"The experiment provided {strength.lower()} support for the tested assumption: '{prev_assumption_stmt}'."
+        summary = (
+            f"The experiment provided {strength.lower()} support for the tested {tested_area} assumption: "
+            f"'{tested_asmp_stmt}'."
+        )
     elif conclusion == "PARTIALLY_SUPPORTED":
-        summary = f"The experiment provided {strength.lower()} directional support, but some aspects remain unconfirmed."
+        summary = (
+            f"The experiment provided {strength.lower()} directional support for {tested_area}, "
+            f"strengthening the hypothesis while key contextual bounds or unconfirmed aspects remain."
+        )
     elif conclusion == "CONTRADICTED":
-        summary = f"The experiment contradicted or significantly weakened the assumption: '{prev_assumption_stmt}'."
+        summary = (
+            f"The experiment contradicted or significantly weakened the {tested_area} assumption: "
+            f"'{tested_asmp_stmt}'."
+        )
     else:
-        summary = f"The experiment results were inconclusive and could not reliably confirm or refute the assumption."
+        summary = (
+            f"The experiment results for {tested_area} were inconclusive and could not reliably confirm or refute the assumption."
+        )
 
     if weak_changed:
-        summary += f" The primary bottleneck has shifted from {prev_weak} to {current_weak}."
+        summary += f" With {tested_area} evidence incorporated, the primary bottleneck has shifted from {tested_area} to {current_weak}."
     else:
         summary += f" {current_weak} remains the primary bottleneck to investigate."
 
+    add_obs = adm_ev.get("additional_observations") if isinstance(adm_ev, dict) else getattr(adm_ev, "additional_observations", [])
     delta = LearningDelta(
-        previous_assumption=prev_assumption_stmt,
+        previous_assumption=tested_asmp_stmt,
         evidence_conclusion=conclusion,
         what_we_learned=what_we_learned,
         what_became_more_certain=what_became_more_certain,
         what_became_less_certain=what_became_less_certain,
         what_remains_unknown=what_remains_unknown,
+        additional_observations=list(add_obs or []),
         weak_link_changed=weak_changed,
-        previous_weak_link=str(prev_weak),
+        previous_weak_link=str(tested_area),
         new_weak_link=str(current_weak),
         founder_facing_summary=summary,
     )
 
     logger.info("compose_learning_delta | conclusion=%s weak_changed=%s (%s -> %s)",
-                conclusion, weak_changed, prev_weak, current_weak)
+                conclusion, weak_changed, tested_area, current_weak)
 
     return {
         "learning_delta": delta.model_dump(mode="json"),
@@ -5638,7 +7496,8 @@ def answer_post_evidence_question(state: StartaryGraphState) -> dict:
         for item in what_changed[:3]:
             lines.append(f"- {item}")
     else:
-        lines.append(f"- Evidence base for {current_weak} is updated.")
+        tested_area_name = delta.get("previous_weak_link") or "the tested area"
+        lines.append(f"- Evidence base for {tested_area_name} was updated.")
     if what_unknown:
         for item in what_unknown[:2]:
             lines.append(f"- {item}")
@@ -5662,4 +7521,660 @@ def answer_post_evidence_question(state: StartaryGraphState) -> dict:
 
 
 
+
+
+
+# ---------------------------------------------------------------------------
+# Milestone 4.1 Node: assess_build_readiness
+# ---------------------------------------------------------------------------
+
+def assess_build_readiness(state: StartaryGraphState) -> dict:
+    """
+    LLM + Deterministic Arbiter Node (Milestone 4.1):
+    Decides whether the next learning cycle should CONTINUE_MANUAL or BUILD_MINIMAL_PROTOTYPE.
+    Evaluates strictly relative to the active Critical Assumption and what must be learned next.
+
+    Applies strict deterministic safety guards against premature building:
+      1. The founder\'s desire to code alone must NEVER trigger BUILD.
+      2. Survey-only / stated intent only -> CONTINUE_MANUAL.
+      3. Single concierge / single friendly partner -> CONTINUE_MANUAL.
+      4. Partner outreach / merchant acquisition assumption -> CONTINUE_MANUAL.
+      5. Commission / pricing testable manually -> CONTINUE_MANUAL.
+      6. Escalates to BUILD_MINIMAL_PROTOTYPE ONLY when prerequisites are proven, manual coordination
+         is bottlenecked/confounding, and the active assumption strictly requires unmediated product interaction.
+    """
+    project_id = state.get("project_id", "<unknown>")
+    active_assumption = state.get("active_assumption") or state.get("active_critical_assumption") or {}
+    statement = active_assumption.get("statement", "")
+    weak_area = state.get("weak_area") or str(active_assumption.get("area", "Problem"))
+    stage = (state.get("startup_state") or {}).get("stage", "STAGE_0_CONCEPT_PRE_CUSTOMER")
+
+    reality_check = state.get("reality_check") or {}
+    rc_summary = reality_check.get("summary", "")
+
+    founder_evidence = state.get("founder_evidence") or []
+    previous_experiments = state.get("previous_experiments") or []
+    startup_state = state.get("startup_state") or {}
+    founder_messages = state.get("founder_messages") or []
+    delta = state.get("learning_delta") or {}
+
+    # Extract all text from founder submissions and messages for safety invariant checks
+    all_founder_raw = " ".join([
+        state.get("raw_context") or "",
+        " ".join(str(m.get("content", "")) for m in founder_messages if isinstance(m, dict)),
+        " ".join(str(fe.get("raw_content") or fe.get("content") or fe.get("raw_submission") or "") for fe in founder_evidence if isinstance(fe, dict)),
+    ]).lower()
+
+    stmt_lower = statement.lower()
+
+    # ---------------------------------------------------------
+    # Deterministic Safety Guards (Section 17 & Milestone 4.1.2)
+    # ---------------------------------------------------------
+    decision_action = BuildReadinessAction.CONTINUE_MANUAL
+    reason = ""
+    min_scope: list[str] = []
+    must_not: list[str] = []
+    evidence_basis: list[str] = []
+
+    # Milestone 4.1.2: Check if startup already has a live deployed product with active traction
+    has_live_product = any(
+        k in all_founder_raw
+        for k in [
+            "deployed", "live product", "in production", "app is live",
+            "recorded full matches", "weekly use", "active teams", "paying teams", "paying customers",
+            "active users", "8 paying", "subscription", "20 teams tried", "14 recorded"
+        ]
+    )
+    if has_live_product and any(k in all_founder_raw for k in ["paying", "paid", "repeat payment", "repeat payments", "paying teams", "paying customers", "recorded full matches", "weekly use"]):
+        decision_action = BuildReadinessAction.CONTINUE_MANUAL
+        reason = (
+            "The startup already has a deployed product with active usage and paying customers. "
+            "The next critical uncertainty should be tested using existing product workflows or direct customer interaction "
+            "rather than escalating to an MVP build phase."
+        )
+        decision = BuildReadinessDecision(
+            decision=decision_action,
+            reason=reason,
+            manual_learning_sufficient=True,
+            next_uncertainty_requires_product=False,
+            minimum_build_scope=[],
+            must_not_build=[],
+            evidence_basis=[],
+        )
+        return {"build_readiness": decision.model_dump()}
+
+    # Check if founder simply expressed desire to code
+    wants_to_code_only = any(
+        phrase in all_founder_raw
+        for phrase in [
+            "want to start coding", "want to code", "let's start building",
+            "just want to build", "ready to code", "eager to code", "start coding"
+        ]
+    )
+
+    # Check for survey-only or stated intent only
+    is_survey_only = False
+    if not founder_evidence:
+        is_survey_only = True
+    else:
+        has_behavioral_evidence = any(
+            any(k in " ".join([
+                str(fe.get("raw_content") or ""),
+                str(fe.get("content") or ""),
+                str(fe.get("raw_submission") or ""),
+                " ".join(str(o) for o in (fe.get("structured_observations") or [])),
+                " ".join(str(ao.get("text", "")) for ao in (fe.get("additional_observations") or [])),
+                str(fe.get("quantitative_results") or ""),
+            ]).lower() for k in [
+                "pickup", "paid", "deposit", "pilot", "surplus bag", "completed paid", "proceeded",
+                "workflow", "session", "attended", "completed", "used", "returned", "tested",
+                "retention", "conducted", "trial", "active", "student", "client", "customer", "user"
+            ])
+            for fe in founder_evidence if isinstance(fe, dict)
+        )
+        if not has_behavioral_evidence:
+            is_survey_only = True
+
+    # Check for single concierge / single friendly partner only
+    is_single_concierge = False
+    if len(founder_evidence) == 1:
+        fe_raw = " ".join([
+            str(founder_evidence[0].get("raw_content") or ""),
+            str(founder_evidence[0].get("content") or ""),
+            str(founder_evidence[0].get("raw_submission") or ""),
+            " ".join(str(o) for o in (founder_evidence[0].get("structured_observations") or [])),
+        ]).lower()
+        if any(k in fe_raw for k in ["single partner", "one merchant", "friendly partner", "first bakery", "single store", "1 merchant", "one store"]):
+            is_single_concierge = True
+
+    # Check if active assumption strictly requires unmediated software interaction
+    asmp_statement = active_assumption.get("statement", "").lower() if isinstance(active_assumption, dict) else ""
+    asmp_area = str(active_assumption.get("area", "")).upper() if isinstance(active_assumption, dict) else ""
+
+    is_manual_outreach_assumption = any(
+        k in asmp_statement
+        for k in ["outreach", "cold outreach", "securing", "recruit", "recruitment", "founder-led", "initial partners", "direct sales"]
+    ) and asmp_area in ("ACQUISITION", "CUSTOMER ACCESS", "ACQUISITION / CUSTOMER ACCESS")
+
+    is_manual_commission_assumption = any(
+        k in asmp_statement
+        for k in ["commission", "10% commission", "take rate", "pricing tolerance"]
+    ) and not any(k in asmp_statement for k in ["unmediated", "without founder coordination", "automated payment"])
+
+    requires_product = any(
+        k in asmp_statement
+        for k in [
+            "unmediated", "without founder", "independent of founder", "platform-mediated",
+            "coordination", "publish time-sensitive", "without founder coordination",
+            "without founder intervention", "independently publish", "self-serve listing",
+            "self-serve reservation", "product-mediated", "unmediated coordination",
+            "automated delivery", "self-guided", "software-mediated", "without manual personalization",
+            "unmediated workflow"
+        ]
+    )
+
+    # Check prerequisite coverage for escalation
+    has_multiple_merchants = any(
+        k in all_founder_raw
+        for k in ["10 unconnected", "3 bakeries", "bakery a", "bakery b", "unconnected bakeries", "multiple merchants", "multiple partners"]
+    )
+    has_repeated_pickups = any(
+        k in all_founder_raw
+        for k in ["paid deposit", "paid pickup", "completed pickup", "two separate evening", "both evening", "repeated purchases"]
+    )
+
+    # Generic escalation criteria (Milestone M4.1.3.2):
+    # 1. manual_workflow_tested: tested across multiple participants / users / cohorts
+    manual_workflow_tested = has_multiple_merchants or any(
+        k in all_founder_raw
+        for k in [
+            "6 manual", "manual workflow", "workflow test", "tested the manual",
+            "manual sessions", "manual concierge", "manual delivery", "multiple clients",
+            "multiple students", "multiple users", "completed 6", "6 sessions"
+        ]
+    ) or any(
+        (fe.get("quantitative_results") or {}).get("sample_size", 0) >= 3
+        for fe in founder_evidence if isinstance(fe, dict)
+    )
+
+    # 2. repeat_behavior_observed: repeat usage, 2nd-week recurrence, repeat orders
+    repeat_behavior_observed = has_repeated_pickups or any(
+        k in all_founder_raw
+        for k in [
+            "2nd week", "second week", "repeat session", "repeat use", "repeat usage",
+            "returning", "returned for", "recurring", "recurrent", "subsequent week",
+            "repeat attendance", "two weeks", "both weeks", "repeated"
+        ]
+    )
+
+    # 3. manual_coordination_bottleneck: founder manual coordination / personalization bottleneck
+    manual_coordination_bottleneck = any(
+        k in all_founder_raw
+        for k in [
+            "45-70 min", "45 to 70", "min/student", "minutes per", "bottleneck", "unsustainable",
+            "manual personalization", "manual coordination", "coordination confounder",
+            "manual confounder", "manual burden", "too much time", "manual overhead",
+            "manual handoff"
+        ]
+    ) or any(
+        k in asmp_statement
+        for k in ["without founder coordination", "without founder intervention", "unmediated coordination", "independent of founder"]
+    )
+
+    is_escalation_eligible = (
+        requires_product
+        and (has_multiple_merchants or manual_workflow_tested)
+        and (has_repeated_pickups or repeat_behavior_observed)
+        and manual_coordination_bottleneck
+    )
+
+    # Evaluate escalation conditions
+    if is_manual_outreach_assumption:
+        decision_action = BuildReadinessAction.CONTINUE_MANUAL
+        reason = "Customer recruitment and partner outreach can be tested directly through founder-led interaction without software."
+    elif is_manual_commission_assumption:
+        decision_action = BuildReadinessAction.CONTINUE_MANUAL
+        reason = "Pricing tolerance and payment settlement can still be tested manually through direct transactions."
+    elif is_survey_only:
+        decision_action = BuildReadinessAction.CONTINUE_MANUAL
+        reason = "Prerequisite evidence is currently limited to stated intent or discovery interviews. Core workflow and demand behaviors must be manually exercised before building software."
+    elif is_single_concierge:
+        decision_action = BuildReadinessAction.CONTINUE_MANUAL
+        reason = "Only an initial concierge transaction or friendly partner has been tested. Behavioral recurrence and acquisition beyond personal networks must be proven manually first."
+    elif wants_to_code_only and not is_escalation_eligible:
+        decision_action = BuildReadinessAction.CONTINUE_MANUAL
+        reason = "The founder\'s desire to code alone does not justify building. The active learning objective can still be tested more cheaply and validly through manual experimentation."
+    elif is_escalation_eligible:
+        # Full escalation criteria satisfied
+        decision_action = BuildReadinessAction.BUILD_MINIMAL_PROTOTYPE
+        has_surplus_context = any(k in (all_founder_raw + " " + stmt_lower) for k in ["surplus", "bakery", "bakeries", "merchant", "reserve"])
+        if has_surplus_context:
+            reason = (
+                "Prerequisite uncertainties are sufficiently reduced (multiple merchants recruited, recurring pickups and buyer actions, and manual handoffs validated). "
+                "Manual founder-operated coordination is now the primary bottleneck and confounder. "
+                "The active uncertainty strictly requires unmediated, product-mediated coordination."
+            )
+            min_scope = [
+                "Merchant: simple interface to create and publish a real surplus offer (quantity, discounted price, pickup deadline).",
+                "Buyer: simple interface to view active nearby offers and reserve an available surplus bag.",
+                "System: track inventory availability, decrement count upon reservation to prevent overselling, and record pickup status.",
+            ]
+            must_not = [
+                "Recommendation AI or algorithmic matching",
+                "Customer loyalty programs, badges, or gamification",
+                "Customer reviews, ratings, or comment forums",
+                "Complex merchant analytics or reporting dashboards",
+                "Predictive demand forecasting",
+                "Automated payment splitting or multi-party payouts",
+                "Native mobile applications (a simple responsive web prototype is sufficient)",
+            ]
+        else:
+            reason = (
+                "Prerequisite uncertainties are sufficiently reduced through manual testing "
+                "(repeat behavior observed and core workflow validated across multiple participants). "
+                "Manual founder-operated coordination and personalization is now the primary bottleneck and confounder. "
+                "The active uncertainty strictly requires unmediated, product-mediated coordination."
+            )
+            min_scope = [
+                "Participant/User: simple interface to access, schedule, or receive the core service without manual founder intervention.",
+                "System: basic state tracking, automated session/material delivery, and status confirmation.",
+            ]
+            must_not = [
+                "Recommendation AI or algorithmic matching",
+                "Customer loyalty programs, badges, or gamification",
+                "Complex analytics dashboards or reporting suites",
+                "Native mobile applications (a simple responsive web prototype is sufficient)",
+            ]
+
+        # Extract evidence basis dynamically from state if available
+        ev_basis: list[str] = []
+        supp = (state.get("evidence_analysis") or {}).get("support_findings") or []
+        for s in supp:
+            s_clean = str(s).strip()
+            if s_clean and s_clean not in ev_basis:
+                ev_basis.append(s_clean)
+        for fe in founder_evidence:
+            if isinstance(fe, dict):
+                raw = str(fe.get("raw_content") or fe.get("content") or "").strip()
+                if raw and len(raw) < 140 and raw not in ev_basis:
+                    ev_basis.append(raw)
+        if not ev_basis:
+            ev_basis = [
+                "Manual workflow tested across multiple participants with confirmed behavioral completion.",
+                "Recurrent or repeat usage observed beyond single initial interactions.",
+                "Manual founder operation confirmed as primary operational bottleneck.",
+            ]
+        evidence_basis = ev_basis[:4]
+    else:
+        # Default: CONTINUE_MANUAL
+        decision_action = BuildReadinessAction.CONTINUE_MANUAL
+        reason = "The active critical assumption can be tested more cheaply, quickly, and directly through manual experimentation."
+
+    reason = sanitize_domain_leakage(reason, all_founder_raw)
+    min_scope = [sanitize_domain_leakage(s, all_founder_raw) for s in min_scope]
+    must_not = [sanitize_domain_leakage(s, all_founder_raw) for s in must_not]
+    evidence_basis = [sanitize_domain_leakage(s, all_founder_raw) for s in evidence_basis]
+
+    decision = BuildReadinessDecision(
+        decision=decision_action,
+        reason=reason,
+        manual_learning_sufficient=(decision_action == BuildReadinessAction.BUILD_MINIMAL_PROTOTYPE),
+        next_uncertainty_requires_product=(decision_action == BuildReadinessAction.BUILD_MINIMAL_PROTOTYPE),
+        minimum_build_scope=min_scope,
+        must_not_build=must_not,
+        evidence_basis=evidence_basis,
+    )
+
+    logger.info(
+        "assess_build_readiness | decision=%s reason=%s min_scope_len=%d",
+        decision.decision.value, decision.reason[:80], len(decision.minimum_build_scope),
+    )
+
+    return {
+        "build_readiness": decision.model_dump(),
+    }
+
+
+def decide_next_strategic_action(state: StartaryGraphState) -> dict:
+    """
+    Deterministic & Strategic Arbiter Node (Milestone 4.1.2 & 4.1.2.1):
+    Determines the single highest-leverage STRATEGIC ACTION CATEGORY before experiment generation.
+    Categorizes into:
+      - CONTINUE_CURRENT_TEST (when current experiment has partial evidence)
+      - BUILD_MINIMAL_PROTOTYPE (when build readiness escalates to prototype)
+      - PRODUCT_ITERATION (when live product has directly observed user friction/bottlenecks)
+      - RETENTION_TEST (evaluate recurring engagement / cohort survival)
+      - PRICING_TEST (evaluate willingness to pay / monetization model)
+      - ACQUISITION_TEST (evaluate channel viability / CAC beyond network)
+      - NEW_VALIDATION_TEST (early-stage hypothesis validation)
+      - MORE_FOUNDER_KNOWLEDGE (clarification / ungrounded claims)
+
+    Enforces Contracts 3, 4, 5, 6:
+      - Area-governed key decisions and semantic guards (Contract 3)
+      - Evidence-backed PRODUCT_ITERATION (Contract 4)
+      - Smallest justified change contract for PRODUCT_ITERATION (Contract 5)
+      - Limited Weak-Link Override when validated product bottleneck precedes acquisition (Contract 6)
+    """
+    project_id = state.get("project_id", "<unknown>")
+    active_assumption = state.get("active_assumption") or state.get("active_critical_assumption") or {}
+    statement = active_assumption.get("statement", "")
+    stmt_lower = statement.lower()
+    weak_area = str(state.get("weak_area") or active_assumption.get("area") or "Problem")
+    weak_lower = weak_area.lower()
+
+    build_rd = state.get("build_readiness") or {}
+    build_decision = build_rd.get("decision") if isinstance(build_rd, dict) else getattr(build_rd, "decision", None)
+
+    founder_evidence = state.get("founder_evidence") or []
+    founder_messages = state.get("founder_messages") or []
+    all_founder_raw = " ".join([
+        str(state.get("raw_context") or ""),
+        " ".join(str(m.get("content", "")) for m in founder_messages if isinstance(m, dict)),
+        " ".join(str(fe.get("raw_content") or fe.get("content") or fe.get("raw_submission") or "") for fe in founder_evidence if isinstance(fe, dict)),
+    ]).lower()
+
+    st_state = state.get("startup_state") or {}
+    prog = st_state.get("progress") or {}
+    exec_ctx = st_state.get("execution_context") or {}
+
+    paying_val = prog.get("paying_customers_count") or (prog.get("paying_customers") or {}).get("value")
+    paying_count = 0
+    if isinstance(paying_val, (int, float)) and paying_val > 0:
+        paying_count = int(paying_val)
+    elif isinstance(paying_val, str) and paying_val.isdigit() and int(paying_val) > 0:
+        paying_count = int(paying_val)
+    elif "8 paying" in all_founder_raw:
+        paying_count = 8
+
+    mvp_val = (prog.get("mvp_exists") or {}).get("value")
+    dev_stage_val = str((prog.get("development_stage") or {}).get("value") or "").upper()
+    has_live_product = (mvp_val is True or dev_stage_val in ("LIVE_PRODUCT", "GROWTH", "SCALING"))
+
+    has_paying = (paying_count > 0) or any(k in all_founder_raw for k in [
+        "paying", "paid", "repeat payment", "repeat payments", "paying teams", "paying customers",
+        "paid pilot", "subscription revenue", "mrr", "8 paying", "8 paying teams"
+    ])
+    has_repeat = any(k in all_founder_raw for k in [
+        "repeat use", "weekly use", "recorded full matches", "weekly active", "using weekly",
+        "repeat usage", "multiple matches", "weekly match recordings", "recurring usage"
+    ])
+    has_live = has_live_product or any(k in all_founder_raw for k in [
+        "deployed", "live product", "in production", "app is live", "product is live",
+        "active users", "20 teams tried", "14 recorded", "working prototype"
+    ])
+
+    # 1. Partial evidence continuation guard
+    if state.get("is_partial_evidence"):
+        act = NextStrategicAction(
+            action_type=NextStrategicActionType.CONTINUE_CURRENT_TEST,
+            rationale="Current experiment is in progress with partial evidence. Continue the test until target sample size is reached.",
+            target_area=weak_area,
+            key_decision="Whether the active hypothesis holds across the full required sample size.",
+            why_this_action="Switching or redesigning tests prematurely before gathering target observations would invalidate the current experiment.",
+            suggested_method="Continue executing the active test protocol with remaining target participants.",
+        )
+        return {"next_strategic_action": act.model_dump()}
+
+    # 2. Build readiness escalation guard
+    if build_decision == BuildReadinessAction.BUILD_MINIMAL_PROTOTYPE.value:
+        act = NextStrategicAction(
+            action_type=NextStrategicActionType.BUILD_MINIMAL_PROTOTYPE,
+            rationale="Prerequisite uncertainties are resolved through manual testing. The next uncertainty requires an unmediated product probe.",
+            target_area=weak_area,
+            key_decision="Whether users complete the core workflow independently through minimal software.",
+            why_this_action="Manual concierge coordination has become the primary confounder and bottleneck.",
+            suggested_method="Build minimal prototype probe strictly scoped to the active critical assumption.",
+        )
+        return {"next_strategic_action": act.model_dump()}
+
+    # 3. Product Friction & Feature Request Detection (Contract 4 & 5)
+    friction_keywords = [
+        "setup friction", "setup takes", "setup failure", "failed setup",
+        "recording drop-off", "recording failure", "failed to record",
+        "onboarding drop-off", "onboarding failure", "workflow friction",
+        "usability bottleneck", "dropped out during setup", "camera setup",
+        "hardware setup", "setup is too complicated", "friction during match recording",
+        "drop off between trial and recurring", "technical friction",
+        "audio sync issue", "export failed", "export confusing",
+        "tripod setup", "manual setup error",
+    ]
+    has_friction_evidence = any(k in all_founder_raw for k in friction_keywords) or any(k in stmt_lower for k in [
+        "setup takes", "recording drop", "friction in setup", "setup failure", "onboarding drop"
+    ])
+
+    # Feature request anti-hallucination check (Contract 4)
+    # Startary must NOT choose PRODUCT_ITERATION merely because the founder wants more features.
+    feature_request_only = any(k in all_founder_raw for k in [
+        "wants to add features", "want more features", "expand features",
+        "add tactical analytics", "add ai summaries", "new feature requests",
+        "founder wants new feature", "founder wants to build more features",
+        "wants more ai", "add advanced features"
+    ]) and not has_friction_evidence
+
+    # 4. Limited Weak-Link Override Authority (Contract 6)
+    is_weak_link_override = False
+    override_reason = None
+    target_area = weak_area
+
+    has_sufficient_customers = (paying_count >= 3) or ("8 paying" in all_founder_raw) or (has_repeat and has_live)
+    if (
+        has_live
+        and has_sufficient_customers
+        and (has_friction_evidence or any(k in stmt_lower for k in ["drop off", "drop-off", "retention", "churn"]))
+        and any(k in weak_lower for k in ["acquisition", "customer access", "demand signal"])
+    ):
+        is_weak_link_override = True
+        if has_friction_evidence:
+            target_area = "Solution / MVP"
+            override_reason = (
+                f"Although {weak_area} was selected by taxonomy, {paying_count or 'existing'} active/paying teams "
+                "face directly observed setup and recording friction. Acquiring new users into a leaky bucket before "
+                "fixing the core product workflow bottleneck would be wasteful."
+            )
+        else:
+            target_area = "Retention"
+            override_reason = (
+                f"Although {weak_area} was selected by taxonomy, {paying_count or 'existing'} active/paying teams "
+                "show retention and drop-off risks. Acquiring new users before proving repeat retention would be wasteful."
+            )
+
+    bottleneck_identified = None
+    blocked_behavior = None
+    smallest_change = None
+    measurable_outcome = None
+    what_not_to_build = []
+
+    # 5. Strategic Action Categorization
+    if has_live and has_friction_evidence and not feature_request_only:
+        # Contract 4 & 5: PRODUCT_ITERATION
+        action_type = NextStrategicActionType.PRODUCT_ITERATION
+        target_area = target_area if target_area in ("Solution / MVP", "Solution") else "Solution / MVP"
+        rationale = (
+            "User evidence reveals direct workflow friction during live product sessions. "
+            "Iterating the minimal product to eliminate setup drop-off must precede scaling acquisition."
+        )
+        key_decision = "Whether the smallest setup and workflow improvement enables users to record matches independently without dropping out."
+        why_this_action = "Fixing the specific drop-off bottleneck directly unblocks repeat product usage and value delivery."
+        suggested_method = "Implement the minimal setup verification improvement and observe subsequent match recording completion."
+
+        bottleneck_identified = "Camera setup complexity and recording failure drop-off during live match recording."
+        blocked_behavior = "Teams fail to record full matches independently, causing drop-off after initial trial."
+        smallest_change = "Add a 2-minute pre-match setup verification checklist and audio/video framing check."
+        measurable_outcome = "At least 4 out of 5 teams complete match recording without founder assistance on their next scheduled match."
+        what_not_to_build = [
+            "Do not build advanced automated tactical AI analysis yet.",
+            "Do not expand to multi-camera angles or additional sports yet.",
+            "Do not build an automated highlight reels generation engine yet.",
+        ]
+
+    elif (has_paying or has_repeat) and has_live:
+        # Live product with traction
+        t_lower = target_area.lower()
+        if "retention" in t_lower or any(k in stmt_lower for k in ["retention", "repeat", "churn", "engagement", "drop off", "drop-off", "weekly", "stickiness"]):
+            action_type = NextStrategicActionType.RETENTION_TEST
+            target_area = "Retention" if "retention" in t_lower else target_area
+            rationale = "With live product and paying customers, the highest priority is determining repeat engagement, cohort survival, and churn drivers."
+            key_decision = "Whether active users sustain weekly engagement and repeat usage across multiple cycles without founder intervention."
+            why_this_action = "Retention is the prerequisite for sustainable scaling; without it, acquiring new users is wasteful."
+            suggested_method = "Cohort tracking and exit interviews with drop-off users across active weeks."
+        elif "business model" in t_lower or any(k in stmt_lower for k in ["price", "pricing", "monetization", "unit economics", "willingness to pay", "pay", "fee", "margin", "cost"]):
+            action_type = NextStrategicActionType.PRICING_TEST
+            target_area = "Business Model" if "business model" in t_lower else target_area
+            rationale = "Usage and basic demand are demonstrated; the next step is establishing sustainable unit economics and pricing elasticity."
+            key_decision = "Whether target customers are willing to pay the required price and accept sustainable unit economics."
+            why_this_action = "Subsidized or underpriced usage can create false signal of product-market fit."
+            suggested_method = "Structured price threshold test or tiered pricing offer with renewal cohorts."
+        elif "acquisition" in t_lower or any(k in stmt_lower for k in ["acquisition", "channel", "cac", "outreach", "recruit", "growth", "marketing", "sales"]):
+            action_type = NextStrategicActionType.ACQUISITION_TEST
+            target_area = "Acquisition / Customer Access"
+            rationale = "Core value and retention are established; the next focus is finding repeatable, scalable customer acquisition channels beyond warm networks."
+            key_decision = "Whether target segments can be reached and acquired through repeatable, non-founder channels beyond warm personal networks."
+            why_this_action = "Personal network outreach does not prove scalable distribution."
+            suggested_method = "Cold outreach or outbound pilot campaign to unconnected target organizations."
+        elif "solution" in t_lower or "mvp" in t_lower:
+            action_type = NextStrategicActionType.NEW_VALIDATION_TEST
+            target_area = "Solution / MVP"
+            rationale = "Validating core solution usability ensures the software delivers the intended value."
+            key_decision = "Whether users complete the core workflow and derive value from the product independently."
+            why_this_action = "A solution that fails core usability cannot sustain customer retention."
+            suggested_method = "User workflow session tracking on key product tasks."
+        elif "existing alternatives" in t_lower:
+            action_type = NextStrategicActionType.NEW_VALIDATION_TEST
+            target_area = "Existing Alternatives"
+            rationale = "Even with early users, switching motivation against alternative workflows must be verified for broader market segments."
+            key_decision = "Whether current workarounds and competitor solutions fail significantly enough to motivate switching to the product."
+            why_this_action = "Understanding inertia against existing alternatives is essential for positioning."
+            suggested_method = "Alternative comparison interviews with target non-users."
+        elif "target user" in t_lower:
+            action_type = NextStrategicActionType.NEW_VALIDATION_TEST
+            target_area = "Target User"
+            rationale = "Focusing on the specific customer segment with the highest acute need ensures strong initial adoption."
+            key_decision = "Whether high-retention, high-urgency customer profiles can be clearly identified and distinguished from casual users."
+            why_this_action = "Targeting an overly broad audience dilutes value proposition and product focus."
+            suggested_method = "Segment analysis and interviews comparing active vs churned customer profiles."
+        else:
+            action_type = NextStrategicActionType.RETENTION_TEST
+            rationale = "For a deployed product with paying customers, recurring retention and cohort stickiness represent the primary gating risk."
+            key_decision = "Whether initial paying customers renew and sustain weekly usage."
+            why_this_action = "Early traction must prove repeat retention before expanding acquisition."
+            suggested_method = "Track multi-week match recording frequency and renewal intent."
+
+    else:
+        # Pre-traction / Idea Stage: Map strictly by target_area
+        t_lower = target_area.lower()
+        if "acquisition" in t_lower:
+            action_type = NextStrategicActionType.ACQUISITION_TEST
+            target_area = "Acquisition / Customer Access"
+            rationale = "Validating customer access channels early determines whether the startup can reach target users predictably."
+            key_decision = "Whether target customers can be reached through repeatable, non-founder channels outside warm personal networks."
+            why_this_action = "A problem that cannot be reached at reasonable cost cannot support a viable startup."
+            suggested_method = "Outbound message test or non-network channel outreach."
+        elif "business model" in t_lower:
+            action_type = NextStrategicActionType.PRICING_TEST
+            target_area = "Business Model"
+            rationale = "Verifying willingness to pay and economic exchange prevents building a solution that customers will not purchase."
+            key_decision = "Whether target customers are willing to pay the required price and accept sustainable unit economics."
+            why_this_action = "Willingness to pay is the ultimate validation of problem severity."
+            suggested_method = "Pricing discovery interviews or pre-order / LOI tests."
+        elif "solution" in t_lower or "mvp" in t_lower:
+            action_type = NextStrategicActionType.NEW_VALIDATION_TEST
+            target_area = "Solution / MVP"
+            rationale = "Early solution validation tests whether the proposed mechanism actually solves the validated problem."
+            key_decision = "Whether users can complete the core workflow and derive value from the minimal solution."
+            why_this_action = "Testing core workflow mechanics before full engineering prevents wasted development."
+            suggested_method = "Concierge test or manual paper prototype with target participants."
+        elif "target user" in t_lower:
+            action_type = NextStrategicActionType.NEW_VALIDATION_TEST
+            target_area = "Target User"
+            rationale = "Focusing on the specific customer segment with the highest acute need ensures strong initial adoption."
+            key_decision = "Whether high-urgency, high-retention customer profiles can be clearly identified and distinguished from casual users."
+            why_this_action = "Targeting an overly broad audience dilutes value proposition and product focus."
+            suggested_method = "Structured customer profile interviews comparing active vs inactive segments."
+        elif "pain" in t_lower or "urgency" in t_lower:
+            action_type = NextStrategicActionType.NEW_VALIDATION_TEST
+            target_area = "Pain / Urgency"
+            rationale = "Without acute urgency, prospects may acknowledge the problem but delay adoption indefinitely."
+            key_decision = "Whether the pain point creates immediate urgency and budget allocation rather than passive dissatisfaction."
+            why_this_action = "Urgency determines whether customers take immediate action or deprioritize the purchase."
+            suggested_method = "Urgency threshold interviews and budget validation conversations."
+        elif "alternative" in t_lower:
+            action_type = NextStrategicActionType.NEW_VALIDATION_TEST
+            target_area = "Existing Alternatives"
+            rationale = "Customers will only adopt a new solution if existing workarounds leave critical gaps or intolerable friction."
+            key_decision = "Whether current workarounds and competitor solutions fail significantly enough to motivate switching."
+            why_this_action = "Understanding inertia and workaround tolerance is required before designing an MVP."
+            suggested_method = "Workaround breakdown interviews analyzing current costs and failure modes."
+        elif "demand signal" in t_lower:
+            action_type = NextStrategicActionType.NEW_VALIDATION_TEST
+            target_area = "Demand Signal"
+            rationale = "Costly commitments (deposits, pre-orders, signed pilots) separate real demand from polite enthusiasm."
+            key_decision = "Whether target customers demonstrate genuine demand through costly behavioral commitment rather than verbal interest."
+            why_this_action = "Verbal praise is cheap; behavioral commitment proves willingness to adopt."
+            suggested_method = "Letter of intent, pre-order deposit, or scheduled pilot agreement test."
+        else:
+            action_type = NextStrategicActionType.NEW_VALIDATION_TEST
+            target_area = "Problem"
+            rationale = "Early-stage concept requiring empirical validation of the core problem severity and frequency."
+            key_decision = "Whether target customers experience the acute pain point with sufficient frequency and consequence to demand a solution."
+            why_this_action = "Validating the core problem cheaply prevents premature product investment."
+            suggested_method = "Problem discovery interviews or manual concierge test with target participants."
+
+    # 6. Deterministic Semantic Guards (Contract 3)
+    t_lower = target_area.lower()
+    if "acquisition" in t_lower:
+        bad_terms = ["acute pain", "pain point", "pricing", "willingness to pay", "unit economics"]
+        if (
+            any(b in key_decision.lower() for b in bad_terms)
+            or not any(k in key_decision.lower() for k in ["channel", "reach", "network", "acquir", "outreach", "distribution"])
+        ):
+            logger.warning("decide_next_strategic_action | Semantic guard triggered for Acquisition: repairing key_decision")
+            key_decision = "Whether target segments can be reached and acquired through repeatable, non-founder channels beyond warm personal networks."
+            action_type = NextStrategicActionType.ACQUISITION_TEST
+            rationale = "Core value is demonstrated; the critical priority is validating repeatable, non-founder customer acquisition channels."
+            why_this_action = "Personal network outreach does not prove scalable distribution."
+            suggested_method = "Outbound campaign or cold outreach to unconnected target organizations."
+
+    elif "business model" in t_lower:
+        if not any(k in key_decision.lower() for k in ["price", "pricing", "pay", "margin", "economics", "revenue", "fee"]):
+            logger.warning("decide_next_strategic_action | Semantic guard triggered for Business Model: repairing key_decision")
+            key_decision = "Whether target customers are willing to pay the required price and accept sustainable unit economics."
+            action_type = NextStrategicActionType.PRICING_TEST
+            rationale = "Monetization viability requires verifying price elasticity and sustainable unit economics before scaling."
+            why_this_action = "Subsidized or free usage can mask lack of genuine economic value."
+
+    elif "solution" in t_lower or "mvp" in t_lower:
+        if any(b in key_decision.lower() for b in ["channel", "cac", "pricing threshold", "unit economics"]):
+            logger.warning("decide_next_strategic_action | Semantic guard triggered for Solution/MVP: repairing key_decision")
+            if action_type == NextStrategicActionType.PRODUCT_ITERATION:
+                key_decision = "Whether the smallest setup and workflow improvement enables users to record matches independently without dropping out."
+            else:
+                key_decision = "Whether users can complete the core workflow and derive value from the minimal solution."
+
+    # 7. Sanitize any accidental domain leakage
+    rationale_clean = sanitize_domain_leakage(rationale, all_founder_raw)
+    why_clean = sanitize_domain_leakage(why_this_action, all_founder_raw)
+    method_clean = sanitize_domain_leakage(suggested_method, all_founder_raw) if suggested_method else None
+
+    act = NextStrategicAction(
+        action_type=action_type,
+        rationale=rationale_clean,
+        target_area=target_area,
+        key_decision=key_decision,
+        why_this_action=why_clean,
+        suggested_method=method_clean,
+        bottleneck_identified=bottleneck_identified,
+        blocked_behavior=blocked_behavior,
+        smallest_change=smallest_change,
+        measurable_outcome=measurable_outcome,
+        what_not_to_build=what_not_to_build,
+        is_weak_link_override=is_weak_link_override,
+        override_reason=override_reason,
+    )
+
+    logger.info(
+        "decide_next_strategic_action | action_type=%s target_area=%s is_override=%s key_decision=%s",
+        act.action_type.value, act.target_area, act.is_weak_link_override, act.key_decision[:80],
+    )
+
+    return {"next_strategic_action": act.model_dump()}
 

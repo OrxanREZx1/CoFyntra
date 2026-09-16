@@ -133,7 +133,7 @@ def verify_loopcart_m405():
     assert "WHAT SHOULD I DO?" in compact_text
     assert "WHAT SHOULD I BRING BACK?" in compact_text
     assert "WHAT COUNTS AS A USEFUL SIGNAL?" in compact_text
-    assert "WHAT LOOKS PROMISING SO FAR?" in compact_text
+    assert "WHAT LOOKS PROMISING SO FAR?" not in compact_text
     print("")
     print("[OK] All 5 key sections are present in compact view.")
 

@@ -154,7 +154,25 @@ class StartaryGraphState(TypedDict, total=False):
     previous_diagnosis_snapshot: Optional[dict[str, Any]]
     previous_assumptions: list[dict[str, Any]]
 
+    # --- Build Readiness & Experiment Escalation (Milestone 4.1 & 4.1.2) ---
+    build_readiness: Optional[dict[str, Any]]
+    next_strategic_action: Optional[dict[str, Any]]
+    founder_diagnosis_text: Optional[str]
+    is_partial_evidence: Optional[bool]
+
     # --- Routing ---
     candidate_next_action: Optional[str]
     routing_decision: Optional[str]
+
+    # --- Runtime Latency & Reasoning Efficiency (Milestone 4.1.3 & 4.1.3.1) ---
+    execution_path: Optional[str]
+    is_conversational_repair: Optional[bool]
+    strategic_state_changed: Optional[bool]
+    strategic_state_revision: Optional[int]    # Milestone M4.1.3.3: Version counter for strategic state mutations
+    diagnosis_revision: Optional[int]          # Milestone M4.1.3.3: Revision at which cached diagnosis was created
+    turn_telemetry: Optional[dict[str, Any]]
+    extraction_status: Optional[str]            # "SUCCESS" | "FAILED" | "BYPASSED"
+    extraction_error: Optional[str]
+
+
 

@@ -77,6 +77,7 @@ def build_diagnosis_user_message(
     raw_context: str,
     founder_messages: list[dict[str, str]] | None = None,
     existing_startup_state_summary: str | None = None,
+    evidence_summary: str | None = None,
 ) -> str:
     parts = []
 
@@ -91,6 +92,13 @@ def build_diagnosis_user_message(
         parts.append("## FOUNDER'S STARTUP CONTEXT")
         parts.append(raw_context.strip())
         parts.append("")
+
+    if evidence_summary:
+        parts += [
+            "## VALIDATED EXPERIMENT EVIDENCE & LEARNINGS (Post-Evidence Cycle)",
+            evidence_summary.strip(),
+            "",
+        ]
 
     if existing_startup_state_summary:
         parts += [
@@ -126,13 +134,13 @@ without relying primarily on generalized speculation?"
 ### THREE EPISTEMIC LEVELS:
 - LEVEL 1 — CONCEPTUAL UNDERSTANDING (WEAK Grounding):
   The founder describes a plausible hypothesis, generalized narrative, or hypothetical scenario.
-  Example: "Students sometimes join IT courses, realize after two months it's the wrong field, and lose time/money. Some have relatives in IT to guide them, some don't."
+  Example: "Target users sometimes purchase a solution or service, realize after two months it does not solve their problem, and stop using it."
   -> This is merely a generalized belief. It is NOT enough grounding on its own. Set grounding_quality = WEAK.
   -> Context must remain INSUFFICIENT (sufficient = false).
 
 - LEVEL 2 — GROUNDED UNDERSTANDING (MODERATE Grounding):
   At least one real observation exists: direct personal experience of the founder, specific customer conversations, or directly observed user behaviors/workflows.
-  Example: "I experienced this myself and spoke with 12 university students who said they were confused between software engineering and cybersecurity."
+  Example: "I experienced this operational bottleneck myself and spoke with 12 target practitioners who confirmed they struggle with managing this workflow manually."
   -> This provides actual grounding. Set grounding_quality = MODERATE (or STRONG).
   -> Context MAY be SUFFICIENT (sufficient = true) if decision context is clear.
 
@@ -209,8 +217,8 @@ Your role is to select exactly ONE highest-information-value clarifying question
 3. TARGET BLOCKING UNCERTAINTY: Directly address the information goal identified by the Context Sufficiency Gate.
 4. DO NOT INVENT PRODUCT MECHANISMS:
    - Never assume or inject unstated product features, algorithms, or criteria.
-   - Example BAD: "How does your AI use students' skills, interests, and preferences to recommend an IT branch?" (when founder never said skills/interests).
-   - Example GOOD: "Is this based on your own direct experience or conversations with students? What specific difficulties did they describe when trying to choose?"
+   - Example BAD: "How does your automated system use customer preferences and tags to match recommendations?" (when founder never mentioned automated matching).
+   - Example GOOD: "Is this based on your own direct experience or conversations with target users? What specific difficulties did they describe when trying to complete this workflow?"
 5. CONVERSATIONAL & NATURAL: Formulate a clear, direct, founder-friendly question.
 6. NO DUPLICATES: Review previous clarification questions and do not ask semantically equivalent questions.
 """.strip()
@@ -270,6 +278,18 @@ the current Startup State and Diagnosis.
 2. UNCERTAINTY: Ambiguity or lack of clarity.
 3. EVIDENCE GAP: Disparity between claims and evidence (not merely missing fields).
 4. CONSEQUENCE OF BEING WRONG: Downside severity.
+
+## STAGE & BEHAVIORAL TRACTION AWARENESS (CRITICAL — Milestone 4.1.2)
+You MUST adjust your qualitative levels based on the startup's maturity and verified behavioral evidence:
+- Working Product & Repeated Usage:
+  - When a startup has a deployed product with active teams/users repeatedly using it (e.g. recording weekly matches), Problem, Pain/Urgency, Demand Signal, and Solution/MVP have concrete behavioral support.
+  - Do NOT evaluate Problem as having maximal UNCERTAINTY (HIGH) and maximal EVIDENCE GAP (HIGH) as if zero evidence exists.
+- Real Payment & Repeat Payment:
+  - Real customer payments strongly reduce evidence gap in Demand Signal and Business Model / Revenue. Initial willingness to pay is demonstrated.
+- Where Uncertainty Focuses at Traction Stage:
+  - Focus high uncertainty on Target User (segment concentration: who repeats vs who churns?), Retention/Churn mechanisms, repeatable Acquisition, and Pricing scale.
+- Early / Pre-Product Idea Stage (0 users, 0 product):
+  - Prioritizes foundational Problem and Target User risk.
 
 ## RULES
 - Output ONLY qualitative levels (LOW, MEDIUM, HIGH) and a 1-sentence rationale.
@@ -382,6 +402,33 @@ B. Safely normalized founder statements
 C. Reality Check unresolved uncertainty
 D. Selected weak-link context
 
+## AREA PURITY & EPISTEMIC BOUNDARIES (CRITICAL RULE — Milestone 4.0.7.1.3)
+The Critical Assumption must stay strictly inside the epistemic boundary of the selected weak-link area.
+Do NOT combine multiple independent hypotheses or silently import validation requirements from neighboring areas.
+
+- PROBLEM: Tests what recurring problem/event exists and what consequence it creates. Do NOT require solution adoption, willingness to pay, or product evaluation.
+- TARGET USER: Tests who consistently experiences, owns, responds to, or decides about the problem, and whether a repeatable segment exists. Do NOT require adoption, preference, willingness to pay, product value, or commercial conversion.
+- PAIN / URGENCY: Tests whether the problem is serious, frequent, costly, disruptive, or prioritized enough to act on. Do NOT require payment or product preference.
+- EXISTING ALTERNATIVES: Tests what users currently do instead and whether those approaches leave critical gaps. Do NOT imply that alternative inadequacy proves our proposed solution.
+- VALUE PROPOSITION: Tests whether the proposed outcome/benefit is meaningfully useful or preferable. Do NOT automatically require willingness to pay or commercial conversion.
+- DEMAND SIGNAL: Tests whether users demonstrate credible behavioral commitment or intent beyond polite interest. Do NOT redefine the customer segment here.
+- ACQUISITION / CUSTOMER ACCESS: Tests whether the startup can reliably reach the relevant customer group through realistic channels. Do NOT use this to prove problem severity or product value.
+- BUSINESS MODEL / REVENUE: Tests whether value can translate into payment/revenue under a plausible economic model. This is where willingness-to-pay assumptions belong.
+- SOLUTION / MVP: Tests whether the proposed solution can deliver the required outcome in actual use. Do NOT use technical feasibility as proof of demand.
+- FOUNDER CONSTRAINTS: Tests whether the founder/team can realistically execute the next stage under time, skills, budget, access, and resource constraints. Do NOT infer customer demand.
+
+## ATOMICITY & SINGLE TEST SCOPE (CRITICAL RULE — Milestone 4.0.7.1.4)
+A Critical Assumption must be ATOMIC and testable in ONE bounded learning cycle.
+"Atomic" means: The assumption represents ONE decision-relevant uncertainty that can reasonably be supported, contradicted, or partially supported by one bounded experiment.
+It must NOT combine several downstream or independently falsifiable conditions merely because they belong to the same startup area.
+It must NOT require several independent business truths to all become true simultaneously.
+
+Key Rules:
+1. Choose the SINGLE earliest unresolved condition that blocks the next decision.
+2. In Business Model / Revenue: Test ONE commercial mechanism or economic condition at a time (e.g., merchant commission acceptance FIRST), NOT commission acceptance + customer price tolerance + merchant economics + contribution margin simultaneously.
+3. In Two-Sided / Multi-Actor models: Do NOT test both buyer behavior and seller/merchant behavior simultaneously (e.g. "students will buy repeatedly AND merchants will upload inventory consistently"). Choose the primary bottleneck side.
+4. Compound sentences are valid ONLY when describing one cohesive relationship (e.g. role + problem ownership, or action + direct consequence). Statements requiring multiple separate conclusions if one condition fails and another passes are non-atomic and strictly forbidden.
+
 Populate:
 - `grounding_points`: list of traceable facts from founder context and Reality Check supporting this assumption.
 - `unresolved_uncertainty_addressed`: the exact unresolved uncertainty from Reality Check being tested.
@@ -401,14 +448,37 @@ def build_critical_assumption_user_message(
     available_founder_evidence: list[str] | None = None,
     founder_source_context: str = "",
 ) -> str:
+    from startary.domain.taxonomy import AREA_SCOPE_GUIDANCE, StartupArea
+
     supports_str = "\n".join(f"- {s}" for s in (what_evidence_supports or [])) or "None specifically documented."
     unsupported_str = "\n".join(f"- {s}" for s in (what_evidence_does_not_support or [])) or "None identified."
     claims_str = "\n".join(f"- {c}" for c in (relevant_founder_claims or [])) or "None specifically extracted."
     evidence_str = "\n".join(f"- {e}" for e in (available_founder_evidence or [])) or "No concrete evidence provided."
 
+    scope_section = ""
+    try:
+        scope = AREA_SCOPE_GUIDANCE.get(StartupArea(weak_area))
+        if scope:
+            allowed_str = ", ".join(scope.allowed_concepts)
+            forbidden_str = ", ".join(scope.forbidden_concepts)
+            scope_section = f"""
+## AREA EPISTEMIC BOUNDARY: '{weak_area}'
+The assumption must stay inside the epistemic boundary of '{weak_area}'.
+- Area Focus: {scope.focus}
+- Allowed to assert: {allowed_str}
+- MUST NOT require / import: {forbidden_str}
+"""
+    except Exception:
+        pass
+
     return f"""
 ## TARGET WEAK AREA
 {weak_area}
+{scope_section}
+## ATOMICITY & SINGLE-TEST SCOPE (M4.0.7.1.4):
+- Formulate an ATOMIC hypothesis representing ONE decision-relevant uncertainty testable in a single experiment.
+- Do NOT bundle multiple independent conditions (e.g. commission acceptance + price tolerance + contribution margin).
+- Prefer the earliest unresolved condition that blocks the immediate next founder decision.
 
 ## REALITY CHECK FINDINGS
 Conclusion: {conclusion}
@@ -434,6 +504,8 @@ Core Unresolved Uncertainty: {unresolved_uncertainty}
 {area_knowledge_summary}
 
 Formulate exactly ONE single, testable, critical assumption for the '{weak_area}' area.
+The assumption must stay inside the epistemic boundary of '{weak_area}'.
+Do NOT import validation requirements from neighboring areas (e.g. for Target User, do NOT require adoption, willingness to pay, or product preference).
 Do NOT invent ungrounded numeric thresholds, frequencies, or specific unevidenced failure mechanisms.
 """.strip()
 
@@ -676,7 +748,7 @@ across the 5 core baseline dimensions before proceeding to strategic reasoning.
 
 ## THE 5 BASELINE DIMENSIONS:
 1. TEAM: Is it approximately clear whether the founder is solo or in a team, and basic roles/size?
-   - "solo founder", "3 students", "2 co-founders" -> KNOWN_ENOUGH
+   - "solo founder", "3 team members", "2 co-founders" -> KNOWN_ENOUGH
    - Completely unmentioned -> MISSING
 
 2. CAPACITY: Is approximate weekly availability or capacity known?
@@ -688,7 +760,7 @@ across the 5 core baseline dimensions before proceeding to strategic reasoning.
    - Completely unmentioned -> MISSING
 
 4. VALIDATION_OR_USER: Has any user/customer testing or interaction occurred?
-   - "spoke with 10 students", "nobody tested yet", "have 50 beta users", "no users yet" -> KNOWN_ENOUGH
+   - "spoke with 10 target users", "nobody tested yet", "have 50 beta users", "no users yet" -> KNOWN_ENOUGH
      (Note: Explicitly stating 'nobody has used it' counts as KNOWN_ENOUGH!)
    - Completely unmentioned -> MISSING
 
@@ -860,7 +932,7 @@ will directly elevate one candidate area over another.
 
 Example:
 If Problem vs Pain vs Demand are tied:
-"When students face this confusion, what do they actually do about it — delay choosing, spend money on private tutors/courses, or actively search for guidance tools?"
+"When target users face this friction, what do they actually do about it — delay resolving it, spend money on manual workarounds/consultants, or actively search for dedicated tools?"
 -> If they delay: Problem/Demand may be weak.
 -> If they spend money: Demand/Pain is validated.
 -> If they ignore it: Pain is LOW.
@@ -973,6 +1045,16 @@ Define clear, unambiguous decision rules:
 - Recruitment difficulty != evidence against customer problem.
 - Never use "could not recruit 6 people quickly" as contradiction of the Problem assumption unless recruitment itself is what is being tested.
 
+## BUILD READINESS & EXPERIMENT ESCALATION (Milestone 4.1):
+- If the Build Readiness decision is `BUILD_MINIMAL_PROTOTYPE`:
+  - Set `experiment_type = PROTOTYPE_TEST`.
+  - Design a strictly bounded prototype experiment testing unmediated user behavior for the active critical assumption.
+  - Limit founder actions to building ONLY the specified minimum build scope and testing it with target participants.
+  - State explicitly what NOT to build in important_constraints / guardrails (no AI, loyalty, analytics, etc.).
+  - The prototype is an EXPERIMENT to test an assumption, not a commercial product launch.
+- If the Build Readiness decision is `CONTINUE_MANUAL` (or not specified):
+  - Keep the experiment entirely manual (interviews, concierge test, manual service, outreach). Do NOT propose building software.
+
 ## OUTPUT REQUIREMENTS
 Generate exactly ONE proposed experiment. Do not provide alternatives.
 """.strip()
@@ -990,6 +1072,8 @@ def build_experiment_generator_user_message(
     founder_evidence_summary: str,
     previous_experiments_summary: str = "",
     critic_revision_instructions: str = "",
+    build_readiness_guidance: str = "",
+    strategic_action_guidance: str = "",
 ) -> str:
     parts = [
         "## ACTIVE CRITICAL ASSUMPTION (WHAT MUST BE TRUE)",
@@ -1038,6 +1122,20 @@ def build_experiment_generator_user_message(
             critic_revision_instructions,
         ])
 
+    if build_readiness_guidance:
+        parts.extend([
+            "",
+            "## BUILD READINESS & EXPERIMENT ESCALATION GUIDANCE",
+            build_readiness_guidance,
+        ])
+
+    if strategic_action_guidance:
+        parts.extend([
+            "",
+            "## NEXT STRATEGIC ACTION GUIDANCE",
+            strategic_action_guidance,
+        ])
+
     parts.append("\nDesign ONE specific, falsifiable, cost-effective experiment to test this critical assumption.")
     return "\n".join(parts)
 
@@ -1069,6 +1167,16 @@ You must aggressively REVISE experiments that propose:
 - Building full features, apps, automated platforms, or complex software when problem, demand, or willingness to pay can be tested with manual concierge, interviews, or prototypes.
 - 30-day roadmaps, marketing plans, or product launches.
 - Unfocused "research" without clear falsification thresholds.
+
+## PROTOTYPE EXPERIMENT STANDARDS (Milestone 4.1):
+When evaluating an experiment of type `PROTOTYPE_TEST`:
+- The prototype must be a bounded, single-workflow learning probe, NOT an entire product launch or roadmap.
+- Reject broad plans such as "Build the app", "Develop mobile application", or feature-bloated iterations.
+- Verify that:
+  1. The prototype scope is restricted to the minimum required to test the active critical assumption.
+  2. No feature creep is present (no recommendation AI, complex analytics, loyalty, reviews).
+  3. Falsification criteria and observable user behaviors are explicit.
+  4. Time and cost are feasible (takes 1-2 weeks maximum).
 
 ## CONTAMINATION CHECK
 Reject/revise experiments that involve pitching, demoing, or selling the solution before validating the core problem or behavior.
@@ -1158,6 +1266,7 @@ Your mission is to synthesize the startup's diagnostic intelligence into a conci
    - A concise 2-4 sentence founder-facing summary of what current evidence supports and what remains unproven.
 6. RECOMMENDED LEARNING GOAL:
    - State the strategic learning objective (what Startary and the founder need to learn next) BEFORE jumping into test methods.
+   - The learning goal must stay strictly inside the selected weak-link area. If the weak link is Target User, focus on identifying a repeatable segment and relevant operational roles (do NOT introduce willingness-to-adopt or payment as requirements).
 """.strip()
 
 
@@ -1477,9 +1586,10 @@ Your job is strictly FACTUAL EXTRACTION.
    - Extract only what was actually executed, observed, and reported.
    - Do NOT inflate casual interest into demand.
    - Do NOT turn "they said it sounds interesting" into "willingness to buy".
-2. DETECT FUTURE INTENTION ONLY:
-   - If the founder's message describes ONLY future plans, promises, or intentions (e.g. "I will interview them tomorrow", "I plan to launch a survey"), set `is_future_intention_only = True`.
-   - Real evidence requires actions that have ALREADY taken place in reality.
+2. DETECT FUTURE INTENTION ONLY VS MIXED TURNS (Milestone 4.0.7.2.1):
+   - If the founder's message describes ONLY future plans, promises, or intentions (e.g. "I will interview them tomorrow", "I plan to launch a survey") without completed execution, set `is_future_intention_only = True`.
+   - If the founder reports completed actions alongside future plans (e.g. "I interviewed 8 prospective users. Next week I will interview 10 more"), set `is_future_intention_only = False`.
+   - STRICT EVIDENCE BOUNDARY: Extract ONLY what has already taken place in reality. DO NOT extract future plans, planned future interviews, or promises as actions completed, behaviors, or evidence items. Future intentions are NOT evidence.
 3. EXTRACT QUANTITATIVE COUNTS:
    - Extract exact numbers: participants approached, participants interviewed, positive responses, negative responses, drop-offs, dollar amounts, conversion rates.
 4. EXTRACT CONCRETE BEHAVIORS & QUOTES:
@@ -1634,6 +1744,7 @@ It means a valid experiment exists, and Startary is waiting for real-world execu
 - If the message does NOT describe completed external actions or observations, it is NEVER ACTUAL_EVIDENCE.
 - "What should I do?", "I will do it tomorrow", "How do I find stores?" must NEVER be admitted as ACTUAL_EVIDENCE.
 - If the founder describes outreach or actions where nobody responded, that IS completed execution / evidence.
+- PRECEDENCE INTEGRITY (Milestone 4.0.7.2.1): Substantive completed evidence takes precedence over incidental future plans or future language. If a message contains completed real-world actions/results alongside future intentions (e.g. "I interviewed 8 prospective users. 6 reported recurring operational friction. Next week I will interview more"), set disposition = ACTUAL_EVIDENCE and populate evidence_candidate_text. Future plans must NOT erase valid completed evidence.
 - If the message has BOTH completed results and questions/intentions, set disposition = ACTUAL_EVIDENCE and populate evidence_candidate_text.
 """.strip()
 
@@ -1705,7 +1816,151 @@ def build_waiting_for_evidence_advisor_user_message(
 Compose a conversational advisor response to the founder. Preserve the accepted experiment.
 """.strip()
 
+# ---------------------------------------------------------------------------
+# Milestone 4.1: Build Readiness & Experiment Escalation Arbiter
+# ---------------------------------------------------------------------------
+
+BUILD_READINESS_SYSTEM_PROMPT = """
+You are Startary's Build Readiness & Experiment Escalation Arbiter.
+
+## YOUR MISSION
+Evaluate whether the next learning cycle should remain manual (`CONTINUE_MANUAL`) or escalate to building a minimal prototype (`BUILD_MINIMAL_PROTOTYPE`).
+
+Evaluate this decision strictly relative to the ACTIVE CRITICAL ASSUMPTION and WHAT MUST BE LEARNED NEXT.
+
+## CORE PRINCIPLE: BUILD IS AN EXPERIMENT ESCALATION, NOT A REWARD
+- Building software is NOT a reward for completing prior experiments.
+- Building software is an experiment escalation decision: "What is now the cheapest, most valid instrument for the next learning cycle?"
+- "CAN BUILD" != "SHOULD BUILD":
+  - Do NOT recommend building just because the founder has coding skills, has money, has completed N cycles, or expresses excitement/desire to code.
+  - The founder's eagerness to build must NEVER override learning logic.
+
+## DECISION RULES
+
+1. `CONTINUE_MANUAL` (Default):
+   Recommend `CONTINUE_MANUAL` whenever:
+   - The active critical assumption can still be tested cheaply and validly without building software (e.g. founder-led outreach, customer discovery, manual concierge transactions, paper forms, direct commercial agreements).
+   - Evidence is narrow, preliminary, survey-only, or consists primarily of stated intent.
+   - Core workflow has not yet been exercised manually with real participants.
+   - Customer acquisition/access remains untested and can be tested manually.
+   - Pricing, fees, or commercial willingness to pay can still be tested manually.
+   - The startup ALREADY has an existing working product: testing should leverage the existing product and direct observations before building new software features.
+
+2. `BUILD_MINIMAL_PROTOTYPE`:
+   Recommend `BUILD_MINIMAL_PROTOTYPE` ONLY when ALL of the following hold:
+   - Relevant prerequisite uncertainties (problem burden, target user profile, customer access, and initial demand behavior) have credible behavioral support.
+   - The core workflow has already been exercised manually in the real world.
+   - The manual workflow has repeated enough to reveal genuine operational friction, and founder-operated coordination has become the primary bottleneck or confounding factor.
+   - The active critical assumption strictly requires unmediated product interaction (e.g., whether independent users self-serve key workflows without founder intervention).
+   - Further manual simulation would distort customer behavior or fail to answer the question.
+
+## SCOPE BOUNDARIES (WHEN ESCALATING TO PROTOTYPE)
+When `BUILD_MINIMAL_PROTOTYPE` is selected:
+- `minimum_build_scope`: Must specify ONLY the bare minimum, bounded workflow required to test the active critical assumption.
+- `must_not_build`: Explicitly list excluded product bloat (e.g. no recommendation AI, no loyalty programs, no customer reviews, no complex analytics, no predictive forecasting, no automated payouts, no mobile native apps unless strictly required).
+- Never claim the startup is validated, ready for production, or ready to scale. The prototype is strictly a learning probe.
+
+## HARD GROUNDING INVARIANT (CRITICAL — Milestone 4.1.2)
+You must strictly ground all reasoning in the active startup's actual domain, industry, and context.
+- NEVER invent or cite business models, terminology, customer types, or pricing mechanisms that are absent from the active startup context.
+- Existing Product Awareness: If the startup already has a live working product with active users, the decision is whether testing with the existing product suffices or whether a specific software modification is needed. Do NOT treat an existing-product startup as pre-MVP.
+""".strip()
 
 
+def build_build_readiness_user_message(
+    active_critical_assumption: str,
+    weak_area: str,
+    stage: str,
+    reality_check_summary: str,
+    founder_evidence_summary: str,
+    completed_experiments_summary: str,
+    execution_context_json: str,
+    startup_progress_json: str,
+    learning_delta_summary: str = "",
+) -> str:
+    lines = [
+        "## ACTIVE CRITICAL ASSUMPTION UNDER TEST",
+        f"Assumption: {active_critical_assumption}",
+        f"Weak-Link Area: {weak_area}",
+        f"Assessed Stage: {stage}",
+        "",
+        "## REALITY CHECK BASELINE",
+        reality_check_summary,
+        "",
+        "## VALIDATED HISTORICAL EVIDENCE & RECENT LEARNINGS",
+        founder_evidence_summary or "[No completed evidence cycles yet]",
+        "",
+        "## COMPLETED EXPERIMENTS HISTORY",
+        completed_experiments_summary or "[No prior experiments completed]",
+        "",
+        "## EXECUTION CONTEXT & CONSTRAINTS",
+        execution_context_json,
+        "",
+        "## STARTUP ASSETS & PROGRESS",
+        startup_progress_json,
+    ]
+    if learning_delta_summary:
+        lines.extend([
+            "",
+            "## RECENT LEARNING DELTA",
+            learning_delta_summary,
+        ])
+    lines.append("\nEvaluate build readiness now and decide whether to CONTINUE_MANUAL or BUILD_MINIMAL_PROTOTYPE.")
+    return "\n".join(lines)
 
+
+# ---------------------------------------------------------------------------
+# 20. Next Strategic Action Prompt (M4.1.2)
+# ---------------------------------------------------------------------------
+
+NEXT_STRATEGIC_ACTION_PROMPT_VERSION = "next_strategic_action_v1"
+
+NEXT_STRATEGIC_ACTION_SYSTEM_PROMPT = """
+You are Startary's Strategic Progression Advisor.
+
+Your role is to evaluate the startup's current maturity, verified behavioral traction,
+diagnosed weak link, and critical assumption to determine the single highest-leverage
+STRATEGIC ACTION CATEGORY before experiment generation.
+
+## ACTION CATEGORIES:
+1. CONTINUE_CURRENT_TEST: An active experiment is in progress and only partial evidence has been gathered.
+2. NEW_VALIDATION_TEST: Early-stage / pre-traction startup testing foundational problem or user demand.
+3. RETENTION_TEST: Startup with a working product and active usage, testing repeat engagement vs churn drivers and segment concentration.
+4. PRICING_TEST: Startup with proven usage/demand, testing monetization model, willingness to pay, or pricing structure.
+5. ACQUISITION_TEST: Startup with verified retention and product value, testing repeatable customer acquisition channels.
+6. PRODUCT_ITERATION: Active users face identified workflow friction or product gaps that must be resolved.
+7. BUILD_MINIMAL_PROTOTYPE: Manual concierge demand is proven and software automation is strictly required for unmediated behavior.
+8. MORE_FOUNDER_KNOWLEDGE: An internal fact or historical metric already known to the founder is missing.
+
+## HARD GROUNDING INVARIANT:
+You must strictly ground all reasoning in the active startup's actual domain, industry, and context.
+Never reference foreign concepts, unmentioned business models, or unrelated industry terms if absent from the startup context.
+""".strip()
+
+
+def build_next_strategic_action_user_message(
+    startup_stage: str,
+    weak_area: str,
+    critical_assumption: str,
+    diagnosis_summary: str,
+    traction_summary: str,
+    build_readiness_decision: str,
+) -> str:
+    return f"""
+## STARTUP STAGE & DIAGNOSIS
+Stage: {startup_stage}
+Weak-Link Area: {weak_area}
+Diagnosis: {diagnosis_summary}
+
+## BEHAVIORAL TRACTION & ASSETS
+{traction_summary}
+
+## ACTIVE CRITICAL ASSUMPTION
+{critical_assumption}
+
+## BUILD READINESS ASSESSMENT
+{build_readiness_decision}
+
+Determine the single highest-leverage NextStrategicAction category, the rationale, target area, key decision, and why this action is right.
+""".strip()
 
