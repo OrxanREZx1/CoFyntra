@@ -464,7 +464,7 @@ def test_service_signature_is_stable(name):
     assert hints["return"] is resp_cls
 
 
-@pytest.mark.parametrize("base", ["catch_up", "detect_conflicts", "draft_proposal"])  # chat, extract_knowledge implemented
+@pytest.mark.parametrize("base", ["draft_proposal"])  # chat, extract_knowledge, catch_up, detect_conflicts implemented
 def test_service_stub_raises_not_implemented(base):
     with pytest.raises(CofytraAIError) as exc_info:
         getattr(service, _BASES[base])(_req(base))

@@ -41,7 +41,7 @@ def draft_proposal(request: ProposalRequest, *, settings=None, llm_factory=None)
 - Django serializes the response with `response.model_dump(mode="json")`.
 - `settings` and `llm_factory` are for tests and configuration only. Django calls `service.chat(request)` and nothing more.
 - Before it returns, every function checks its response with `models.contract_violations(request, response)`. Django may call the same check again as a defence.
-- **Current state:** `chat` and `extract_knowledge` are implemented. The other three functions are still contract stubs and raise `CofytraAIError` with code `not_implemented`.
+- **Current state:** `chat`, `extract_knowledge`, `catch_up` and `detect_conflicts` are implemented. `draft_proposal` is still a contract stub and raises `CofytraAIError` with code `not_implemented`.
 
 ## 3. Data layers and identity boundaries
 
@@ -345,6 +345,13 @@ Django:
 - Select the other founder's shared items since the viewer's last catch-up.
 - Track "last caught up at" per viewer.
 
+Behaviour (implemented in `cofytra_ai/catchup.py`, prompt `cofytra.catchup.v1`, fast tier):
+- **No LLM call** when there's no knowledge and no pending proposals (the empty example above), or when there are only pending proposals. The pending points are then written deterministically from the proposal titles.
+- The model sees only the other founder's shared items, grouped by bucket with their status labels and with exact restatements collapsed, plus pending proposals and the committed state, which is marked as context only. It never sees `source_quote` or any private text.
+- A point is dropped if it cites an unknown, unsent or wrong-bucket ID. A knowledge ID cited twice is kept only in its first point. Unknown or repeated proposal IDs are dropped.
+- Wording is checked deterministically. A hypothesis point without hedging is prefixed "Untested belief:". An external-source point without attribution gets "(external source, not checked)". An observation point with no attribution is prefixed "<name> reports:". Pending text that reads as approved is replaced with "<who> proposed: <title>. It awaits team approval."
+- Every pending proposal appears in `pending_decisions`, even if the model skipped it.
+
 ### 6.4 `detect_conflicts`: conflict detection
 
 This finds pairs of claims **from different founders** that contradict (`contradiction`: both cannot be true) or pull the strategy in different directions (`tension`). Both claims are returned with their exact ID, author and statement.
@@ -382,7 +389,7 @@ This finds pairs of claims **from different founders** that contradict (`contrad
       "question_to_resolve": "Does the MVP need an integration, or must it work standalone?"
     }
   ],
-  "meta": {"request_id": "req-conflicts-001", "contract_version": "v1", "prompt_version": "cofytra.conflicts.v1", "model": "gpt-5.6-luna", "tier": "fast", "latency_ms": 2780, "attempts": 1}
+  "meta": {"request_id": "req-conflicts-001", "contract_version": "v1", "prompt_version": "cofytra.conflicts.v2", "model": "gpt-5.6-luna", "tier": "fast", "latency_ms": 2780, "attempts": 1}
 }
 ```
 
@@ -394,6 +401,15 @@ Validation:
 Django:
 - Send items from at least two founders.
 - Decide whether conflicts are persisted or recomputed (see D6).
+- Keep both claims unchanged. Do not treat a detected conflict as a verified fact, an approval, or a committed decision.
+
+Behaviour (implemented in `cofytra_ai/conflicts.py`, prompt `cofytra.conflicts.v2`, fast tier):
+- **No LLM call** when `knowledge` is empty or every item has the same author. The response is `conflicts: []` with `tier: "none"`.
+- Otherwise one fast-tier structured call sees each shared item's id, author, category, epistemic-status label and statement, plus `external_reference` when it is present. `source_quote` is not sent. There is no private-message field.
+- Before returning a pair, the model checks that the claims refer to the same population, subject, and measurement, that the locations, samples, periods, and conditions are comparable, that both claims cannot reasonably be true together, and that the difference forces a shared startup decision. Observations from different samples, places, or periods are omitted. They are not relabelled as `tension`.
+- `contradiction` means both claims cannot be true: a direct negation under comparable conditions, two mutually exclusive "first / best / only" choices, or founder-reported observations that disagree about the same subjects, question, segment, conditions, and time period. `tension` means both could be true but they pull one shared startup decision in different directions.
+- The model returns no pair for compatible segments, observations that can both be true, opinions that do not affect a shared decision, duplicates and paraphrases, same-founder claims, or incompatible-looking numbers from different populations, periods or methods. Insufficient evidence produces no conflict.
+- Guards drop unknown ids, a pair that cites one item twice, same-founder pairs, author ids that do not match the item, exact duplicate claims, repeated pairs in either order, over-length text, and wording that declares a winner, a verified fact, or a team decision. A rewritten statement is replaced with the stored statement. Valid pairs are kept. Nothing is stored, approved, or committed.
 
 ### 6.5 `draft_proposal`: decision proposal drafting
 

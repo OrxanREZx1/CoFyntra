@@ -4,9 +4,9 @@ Cofytra AI public interface (contract v1).
 Django calls these five functions in-process with a validated request model and receives a
 validated response model, or a ``CofytraAIError``. The signatures are the frozen contract.
 
-Implemented: ``chat`` (``cofytra_ai.assistant``) and ``extract_knowledge`` (``cofytra_ai.extraction``).
-Still CONTRACT STUBS: ``catch_up``, ``detect_conflicts``, ``draft_proposal``; they validate their input
-type and raise ``CofytraAIError(ErrorCode.NOT_IMPLEMENTED)``.
+Implemented: ``chat`` (``cofytra_ai.assistant``), ``extract_knowledge`` (``cofytra_ai.extraction``),
+``catch_up`` (``cofytra_ai.catchup``) and ``detect_conflicts`` (``cofytra_ai.conflicts``). Still a CONTRACT
+STUB: ``draft_proposal``; it validates its input type and raises ``CofytraAIError(ErrorCode.NOT_IMPLEMENTED)``.
 
 Capability modules are imported lazily, so ``import cofytra_ai`` stays free of LangChain/OpenAI.
 
@@ -62,15 +62,21 @@ def extract_knowledge(request: ExtractRequest, *, settings: Optional[Any] = None
 
 def catch_up(request: CatchupRequest, *, settings: Optional[Any] = None, llm_factory: Optional[LLMFactory] = None) -> CatchupResponse:
     """Summarize the other founder's shared knowledge and pending proposals. Never sees private chat."""
-    _not_implemented("catch_up", request, CatchupRequest)
-    raise AssertionError("unreachable")
+    if not isinstance(request, CatchupRequest):
+        raise TypeError(f"catch_up expects CatchupRequest, got {type(request).__name__}")
+    from cofytra_ai.catchup import run_catchup  # lazy: keeps package import light
+
+    return run_catchup(request, settings=settings, llm_factory=llm_factory)
 
 
 def detect_conflicts(request: ConflictRequest, *, settings: Optional[Any] = None,
                      llm_factory: Optional[LLMFactory] = None) -> ConflictResponse:
     """Find contradictory or tense claim pairs across founders, preserving both claims verbatim."""
-    _not_implemented("detect_conflicts", request, ConflictRequest)
-    raise AssertionError("unreachable")
+    if not isinstance(request, ConflictRequest):
+        raise TypeError(f"detect_conflicts expects ConflictRequest, got {type(request).__name__}")
+    from cofytra_ai.conflicts import run_conflicts  # lazy: keeps package import light
+
+    return run_conflicts(request, settings=settings, llm_factory=llm_factory)
 
 
 def draft_proposal(request: ProposalRequest, *, settings: Optional[Any] = None,
