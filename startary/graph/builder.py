@@ -46,6 +46,15 @@ M2.6.1 graph flow (Three Distinct Information Loops):
                                                                                                save_critical_assumption
                                                                                                     ↓
                                                                                                    END
+
+M6.2.3 question delivery (every planner question):
+  plan_baseline_question / plan_information_gap / select_weak_link_question
+       ↓
+  compose_founder_question   (single composer LLM call; exact prompt persisted in checkpoint)
+       ↓
+  ask_and_wait_for_founder   (LLM-free interrupt; re-executes safely on resume)
+       ↓
+  merge_founder_answer       (transcript records the persisted prompt verbatim)
 """
 
 from __future__ import annotations
@@ -56,6 +65,7 @@ from typing import Any, Optional
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
+from startary.domain.experiment_contract import experiment_critique_route
 from startary.domain.enums import (
     EvidenceSubmissionSufficiency,
     ExecutionReadiness,
@@ -70,6 +80,7 @@ from startary.domain.gap_plan import (
     UncertaintyResolutionMode,
     can_formulate_testable_uncertainty,
 )
+from startary.config import get_settings
 from startary.graph.graph_state import StartaryGraphState
 from startary.graph.nodes import (
     MAX_BASELINE_QUESTION_TURNS,
@@ -91,11 +102,14 @@ from startary.graph.nodes import (
     classify_waiting_for_evidence_turn,
     compose_advisor_response,
     compose_execution_handoff,
+    compose_founder_question,
     compose_learning_delta,
     compose_startup_diagnosis,
     critique_experiment,
+    revise_experiment,
     diagnose_startup,
     extract_experiment_evidence,
+    dispatch_founder_turn,
     extract_startup_state,
     generate_critical_assumption,
     generate_experiment,
@@ -105,9 +119,12 @@ from startary.graph.nodes import (
     increment_iteration,
     initialize_state,
     interpret_founder_turn,
+    join_founder_turn,
     merge_diagnosis,
     merge_execution_state,
     merge_founder_answer,
+    parallel_extract_startup_state,
+    parallel_interpret_founder_turn,
     pause_needs_help,
     plan_baseline_question,
     plan_information_gap,
@@ -286,19 +303,17 @@ def route_on_experiment_critique(state: StartaryGraphState) -> str:
     - If REVISE and revision_count > 1 -> handle_experiment_failure_stop
     """
     critic_output = state.get("experiment_critic_output") or {}
-    verdict = (critic_output.get("verdict") or "REVISE").upper().strip()
     revision_count = state.get("critic_revision_count", 0)
-
-    if "ACCEPT" in verdict:
-        logger.info("route_on_experiment_critique -> save_final_experiment (ACCEPTED)")
-        return "save_final_experiment"
-
-    if revision_count <= 1:
-        logger.info("route_on_experiment_critique -> generate_experiment (REVISE attempt %d)", revision_count)
-        return "generate_experiment"
-
-    logger.warning("route_on_experiment_critique -> handle_experiment_failure_stop (REVISE rejected after max revision)")
-    return "handle_experiment_failure_stop"
+    # Milestone 6.2.5: exact-token verdict (no substring matching); rule shared with critic telemetry.
+    strategy = (state.get("experiment_revision") or {}).get("next_strategy")  # M6.2.6 V2 only
+    route = experiment_critique_route(critic_output.get("verdict"), revision_count, strategy)
+    log = logger.warning if route == "handle_experiment_failure_stop" else logger.info
+    log(
+        "route_on_experiment_critique -> %s (verdict=%s source=%s failed=%s revision_count=%d)",
+        route, critic_output.get("verdict"), critic_output.get("decision_source"),
+        critic_output.get("failed_dimensions"), revision_count,
+    )
+    return route
 
 
 def route_after_can_execute(state: StartaryGraphState) -> str:
@@ -332,6 +347,38 @@ def route_after_interpret_founder_turn(state: StartaryGraphState) -> str:
     if phase == WorkflowPhase.WAITING_FOR_EVIDENCE or phase == "WAITING_FOR_EVIDENCE":
         return "classify_waiting_for_evidence_turn"
     return "extract_startup_state"
+
+
+# --- Milestone 6.2.7: parallel understanding routes (only wired when STARTARY_PARALLEL_UNDERSTANDING=true) ---
+
+def _dispatch_is_parallel(state: StartaryGraphState) -> bool:
+    return (state.get("founder_turn_dispatch") or {}).get("mode") == "PARALLEL"
+
+
+def route_on_founder_turn_dispatch(state: StartaryGraphState) -> Any:
+    """PARALLEL -> fan out to both understanding nodes (same superstep); SEQUENTIAL -> interpretation only."""
+    if _dispatch_is_parallel(state):
+        return ["interpret_founder_turn", "extract_startup_state"]
+    return "interpret_founder_turn"
+
+
+def route_after_interpret_parallel_aware(state: StartaryGraphState) -> str:
+    """In the parallel region interpretation always goes to the barrier; otherwise the unchanged route."""
+    if _dispatch_is_parallel(state):
+        return "join_founder_turn"
+    return route_after_interpret_founder_turn(state)
+
+
+def route_after_join_founder_turn(state: StartaryGraphState) -> str:
+    """After the barrier: the same repair check route_after_interpret_founder_turn applies, else merge."""
+    if state.get("is_conversational_repair") or state.get("execution_path") == "CONVERSATIONAL_REPAIR":
+        return "handle_conversational_repair"
+    return "merge_execution_state"
+
+
+def parallel_understanding_enabled() -> bool:
+    """STARTARY_PARALLEL_UNDERSTANDING; only an explicit boolean True enables it."""
+    return getattr(get_settings(), "parallel_understanding", False) is True
 
 
 def route_waiting_for_evidence_turn(state: StartaryGraphState) -> str:
@@ -396,7 +443,7 @@ def route_after_validate_evidence(state: StartaryGraphState) -> str:
     return "apply_validated_state_updates"
 
 
-def build_graph(checkpointer: Optional[Any] = None):
+def build_graph(checkpointer: Optional[Any] = None, parallel_understanding: Optional[bool] = None):
     """
     Compile and return the Startary LangGraph (Milestone 4 version).
 
@@ -408,13 +455,20 @@ def build_graph(checkpointer: Optional[Any] = None):
       5. Evidence Clarification (if needed)
     Followed by Evidence Analysis, Validated State Updates, Iteration Increment,
     Re-Diagnosis, and Learning Delta.
+
+    parallel_understanding (Milestone 6.2.7): None reads STARTARY_PARALLEL_UNDERSTANDING. False builds
+    the unchanged sequential graph. True inserts dispatch_founder_turn / join_founder_turn around
+    interpret_founder_turn and extract_startup_state so they run concurrently on extraction turns.
     """
+    if parallel_understanding is None:
+        parallel_understanding = parallel_understanding_enabled()
+    parallel_understanding = parallel_understanding is True
     graph = StateGraph(StartaryGraphState)
 
     # --- Nodes ---
     graph.add_node("initialize_state", initialize_state)
     graph.add_node("verify_state", verify_state)
-    graph.add_node("extract_startup_state", extract_startup_state)
+    graph.add_node("extract_startup_state", parallel_extract_startup_state if parallel_understanding else extract_startup_state)
     graph.add_node("merge_execution_state", merge_execution_state)
 
     # Baseline Nodes (M2.6.1)
@@ -422,6 +476,8 @@ def build_graph(checkpointer: Optional[Any] = None):
     graph.add_node("plan_baseline_question", plan_baseline_question)
 
     # Common Interrupt & Answer Merge Nodes
+    # M6.2.3: composition is checkpointed before the interrupt so resume never re-composes.
+    graph.add_node("compose_founder_question", compose_founder_question)
     graph.add_node("ask_and_wait_for_founder", ask_and_wait_for_founder)
     graph.add_node("merge_founder_answer", merge_founder_answer)
 
@@ -448,12 +504,13 @@ def build_graph(checkpointer: Optional[Any] = None):
     graph.add_node("compose_startup_diagnosis", compose_startup_diagnosis)
 
     # Milestone 3.2: Founder Intent & Conversational Awareness Nodes
-    graph.add_node("interpret_founder_turn", interpret_founder_turn)
+    graph.add_node("interpret_founder_turn", parallel_interpret_founder_turn if parallel_understanding else interpret_founder_turn)
     graph.add_node("compose_advisor_response", compose_advisor_response)
 
     # Milestone 3 Nodes: Experiment Generation & Critic
     graph.add_node("generate_experiment", generate_experiment)
     graph.add_node("validate_proposed_experiment", validate_proposed_experiment)
+    graph.add_node("revise_experiment", revise_experiment)  # M6.2.6 V2: targeted edit (unreachable with the flag off)
     graph.add_node("critique_experiment", critique_experiment)
     graph.add_node("save_final_experiment", save_final_experiment)
     graph.add_node("assess_can_execute", assess_can_execute)
@@ -482,21 +539,57 @@ def build_graph(checkpointer: Optional[Any] = None):
     # Milestone 4.1.3 Node: Conversational Repair Fast Path
     graph.add_node("handle_conversational_repair", handle_conversational_repair)
 
+    # Milestone 6.2.7: every founder turn enters understanding here (interpret_founder_turn when the
+    # flag is off, exactly as before; dispatch_founder_turn when it is on).
+    understanding_entry = "interpret_founder_turn"
+    if parallel_understanding:
+        understanding_entry = "dispatch_founder_turn"
+        graph.add_node("dispatch_founder_turn", dispatch_founder_turn)
+        graph.add_node("join_founder_turn", join_founder_turn)
+
     # --- Flow Topology ---
     graph.set_entry_point("initialize_state")
     graph.add_edge("initialize_state", "verify_state")
-    graph.add_edge("verify_state", "interpret_founder_turn")
-    graph.add_conditional_edges(
-        "interpret_founder_turn",
-        route_after_interpret_founder_turn,
-        {
-            "extract_startup_state": "extract_startup_state",
-            "classify_waiting_for_evidence_turn": "classify_waiting_for_evidence_turn",
-            "handle_conversational_repair": "handle_conversational_repair",
-        },
-    )
+    graph.add_edge("verify_state", understanding_entry)
+    if not parallel_understanding:
+        graph.add_conditional_edges(
+            "interpret_founder_turn",
+            route_after_interpret_founder_turn,
+            {
+                "extract_startup_state": "extract_startup_state",
+                "classify_waiting_for_evidence_turn": "classify_waiting_for_evidence_turn",
+                "handle_conversational_repair": "handle_conversational_repair",
+            },
+        )
+        graph.add_edge("extract_startup_state", "merge_execution_state")
+    else:
+        # Fan-out: both branches run in one superstep; LangGraph completes the superstep (both
+        # branches) before join_founder_turn runs, and join verifies both branch results exist.
+        graph.add_conditional_edges(
+            "dispatch_founder_turn",
+            route_on_founder_turn_dispatch,
+            ["interpret_founder_turn", "extract_startup_state"],
+        )
+        graph.add_conditional_edges(
+            "interpret_founder_turn",
+            route_after_interpret_parallel_aware,
+            {
+                "join_founder_turn": "join_founder_turn",
+                "extract_startup_state": "extract_startup_state",
+                "classify_waiting_for_evidence_turn": "classify_waiting_for_evidence_turn",
+                "handle_conversational_repair": "handle_conversational_repair",
+            },
+        )
+        graph.add_edge("extract_startup_state", "join_founder_turn")
+        graph.add_conditional_edges(
+            "join_founder_turn",
+            route_after_join_founder_turn,
+            {
+                "merge_execution_state": "merge_execution_state",
+                "handle_conversational_repair": "handle_conversational_repair",
+            },
+        )
     graph.add_edge("handle_conversational_repair", "ask_and_wait_for_founder")
-    graph.add_edge("extract_startup_state", "merge_execution_state")
     graph.add_edge("merge_execution_state", "assess_baseline_state_sufficiency")
 
     # --- Conditional Edge: Baseline Routing ---
@@ -508,7 +601,7 @@ def build_graph(checkpointer: Optional[Any] = None):
             "plan_baseline_question": "plan_baseline_question",
         },
     )
-    graph.add_edge("plan_baseline_question", "ask_and_wait_for_founder")
+    graph.add_edge("plan_baseline_question", "compose_founder_question")
 
     # --- Strategic Diagnosis Flow ---
     graph.add_edge("diagnose_startup", "merge_diagnosis")
@@ -527,14 +620,16 @@ def build_graph(checkpointer: Optional[Any] = None):
         route_on_gap_plan,
         {
             "assess_startup_areas": "assess_startup_areas",
-            "ask_and_wait_for_founder": "ask_and_wait_for_founder",
+            # Route key kept stable; the founder question is composed before the interrupt.
+            "ask_and_wait_for_founder": "compose_founder_question",
             "handle_insufficient_context_stop": "handle_insufficient_context_stop",
         },
     )
 
     # --- Answer Loop (interprets turn and re-extracts delta after founder responds) ---
+    graph.add_edge("compose_founder_question", "ask_and_wait_for_founder")
     graph.add_edge("ask_and_wait_for_founder", "merge_founder_answer")
-    graph.add_edge("merge_founder_answer", "interpret_founder_turn")
+    graph.add_edge("merge_founder_answer", understanding_entry)
 
     # --- Insufficient Context Safe Stop ---
     graph.add_edge("handle_insufficient_context_stop", END)
@@ -552,7 +647,7 @@ def build_graph(checkpointer: Optional[Any] = None):
             "reality_check": "reality_check",
         },
     )
-    graph.add_edge("select_weak_link_question", "ask_and_wait_for_founder")
+    graph.add_edge("select_weak_link_question", "compose_founder_question")
 
     # --- Downstream Pipeline ---
     graph.add_edge("reality_check", "generate_critical_assumption")
@@ -574,9 +669,11 @@ def build_graph(checkpointer: Optional[Any] = None):
         {
             "save_final_experiment": "save_final_experiment",
             "generate_experiment": "generate_experiment",
+            "revise_experiment": "revise_experiment",
             "handle_experiment_failure_stop": "handle_experiment_failure_stop",
         },
     )
+    graph.add_edge("revise_experiment", "validate_proposed_experiment")
 
     graph.add_edge("save_final_experiment", "assess_can_execute")
     graph.add_conditional_edges(
@@ -594,7 +691,7 @@ def build_graph(checkpointer: Optional[Any] = None):
     graph.add_edge("handle_experiment_failure_stop", "ask_and_wait_for_founder")
 
     # --- Milestone 4 & 4.0.3 Evidence Admission & Learning Loop ---
-    graph.add_edge("wait_for_evidence", "interpret_founder_turn")
+    graph.add_edge("wait_for_evidence", understanding_entry)
     graph.add_conditional_edges(
         "classify_waiting_for_evidence_turn",
         route_waiting_for_evidence_turn,
@@ -632,7 +729,7 @@ def build_graph(checkpointer: Optional[Any] = None):
     graph.add_edge("increment_iteration", "diagnose_startup")
 
     compiled = graph.compile(checkpointer=checkpointer)
-    logger.debug("LangGraph compiled successfully (Milestone 4 with checkpointer)")
+    logger.debug("LangGraph compiled successfully (Milestone 4 with checkpointer, parallel_understanding=%s)", parallel_understanding)
     return compiled
 
 
@@ -644,6 +741,7 @@ def build_experiment_graph(checkpointer: Optional[Any] = None):
     graph = StateGraph(StartaryGraphState)
     graph.add_node("generate_experiment", generate_experiment)
     graph.add_node("validate_proposed_experiment", validate_proposed_experiment)
+    graph.add_node("revise_experiment", revise_experiment)  # M6.2.6 V2: targeted edit (unreachable with the flag off)
     graph.add_node("critique_experiment", critique_experiment)
     graph.add_node("save_final_experiment", save_final_experiment)
     graph.add_node("assess_can_execute", assess_can_execute)
@@ -658,9 +756,11 @@ def build_experiment_graph(checkpointer: Optional[Any] = None):
         {
             "save_final_experiment": "save_final_experiment",
             "generate_experiment": "generate_experiment",
+            "revise_experiment": "revise_experiment",
             "handle_experiment_failure_stop": "handle_experiment_failure_stop",
         },
     )
+    graph.add_edge("revise_experiment", "validate_proposed_experiment")
     graph.add_edge("save_final_experiment", "assess_can_execute")
     graph.add_edge("assess_can_execute", END)
     graph.add_edge("handle_experiment_failure_stop", END)

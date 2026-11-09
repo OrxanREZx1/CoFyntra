@@ -130,26 +130,30 @@ class TestValidateProposedExperiment:
         res = validate_proposed_experiment(base_test_state)
         assert "proposed_experiment_output" in res
 
-    def test_validator_rejects_missing_objective(self, base_test_state):
-        exp = make_valid_experiment_generator_output_dict()
-        exp["objective"] = ""
-        base_test_state["proposed_experiment_output"] = exp
-        with pytest.raises(ValueError, match="field 'objective' is empty"):
-            validate_proposed_experiment(base_test_state)
+    # Milestone 6.2.5: structural draft defects no longer raise (a raise aborted the graph and /retry
+    # re-validated the same committed draft forever). The validator passes the draft through and the
+    # critic's deterministic contract check turns the defect into a bounded REVISE without an LLM call.
+    @pytest.mark.parametrize("field, empty_value", [
+        ("objective", ""),
+        ("founder_actions", []),
+        ("valid_inferences", []),
+        ("support_signal", "   "),
+    ])
+    def test_validator_defect_becomes_deterministic_revise(self, base_test_state, field, empty_value):
+        from unittest.mock import patch
+        from startary.graph.nodes import critique_experiment
 
-    def test_validator_rejects_empty_founder_actions(self, base_test_state):
         exp = make_valid_experiment_generator_output_dict()
-        exp["founder_actions"] = []
+        exp[field] = empty_value
         base_test_state["proposed_experiment_output"] = exp
-        with pytest.raises(ValueError, match="founder_actions cannot be empty"):
-            validate_proposed_experiment(base_test_state)
-
-    def test_validator_rejects_empty_inferences(self, base_test_state):
-        exp = make_valid_experiment_generator_output_dict()
-        exp["valid_inferences"] = []
-        base_test_state["proposed_experiment_output"] = exp
-        with pytest.raises(ValueError, match="valid_inferences cannot be empty"):
-            validate_proposed_experiment(base_test_state)
+        validated = validate_proposed_experiment(base_test_state)  # does not raise
+        state = {**base_test_state, **validated}
+        with patch("startary.graph.nodes.get_llm_client", side_effect=AssertionError("critic LLM must not be called")):
+            res = critique_experiment(state)
+        assert res["experiment_critic_output"]["verdict"] == "REVISE"
+        assert res["experiment_critic_output"]["contract_violation_codes"] == ["REQUIRED_FIELD_EMPTY"]
+        assert field in res["critic_revision_instructions"]
+        assert res["critic_revision_count"] == 1
 
     def test_validator_normalizes_divergent_hypothesis(self, base_test_state):
         exp = make_valid_experiment_generator_output_dict()

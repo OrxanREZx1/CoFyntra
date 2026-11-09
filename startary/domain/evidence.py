@@ -172,6 +172,57 @@ COUNT_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+# Milestone 6.2.3: negation-aware traction keyword detection.
+# "zero paying customers" / "no active users" / "haven't got paying teams" are NEGATIVE evidence
+# and must never be read as positive traction signals.
+_KEYWORD_NEGATION_REGEX = re.compile(
+    r"\b(no|not|zero|0|none|never|nobody|without|lack|lacks|lacking|neither|nor|yet to)\b"
+    r"|\bno one\b|haven't|have not|hasn't|has not|don't|do not|doesn't|does not|didn't|did not"
+    r"|aren't|are not|isn't|is not|wasn't|was not|weren't|were not",
+    re.IGNORECASE,
+)
+_KEYWORD_SUFFIX_NEGATION_REGEX = re.compile(
+    r"^\s*(?:so far|yet|to date)?\s*[:=\-]?\s*(?:0|zero|none|nil)\b"
+    r"|^\s*(?:[a-z]+\s*){0,3}[:=\-]\s*(?:0|zero|none|nil)\b",
+    re.IGNORECASE,
+)
+# A negation only governs the keyword when it sits in the same sub-clause:
+# "zero revenue and 8 paying teams" must still count the 8 paying teams.
+_SUBCLAUSE_BOUNDARY_REGEX = re.compile(r"[,;.!?\n]|\band\b|\bbut\b|\bwhile\b|\bwhereas\b|\bhowever\b", re.IGNORECASE)
+
+
+def contains_unnegated_keyword(text: str, keywords: list[str] | tuple[str, ...], window: int = 40) -> bool:
+    """
+    Return True if any keyword occurs in ``text`` at least once WITHOUT a negation governing it.
+
+    A keyword occurrence is treated as negated when, within its own sub-clause, it is preceded
+    by a negation/zero marker ("zero paying customers", "we have no active users",
+    "haven't had any paying teams") or immediately followed by a zero value
+    ("paying customers: 0"). Plain substring semantics are otherwise preserved.
+    """
+    if not text:
+        return False
+    lowered = text.lower()
+    for kw in keywords:
+        kw_lower = kw.lower()
+        if not kw_lower:
+            continue
+        start = 0
+        while True:
+            idx = lowered.find(kw_lower, start)
+            if idx < 0:
+                break
+            start = idx + 1
+            prefix = lowered[max(0, idx - window):idx]
+            boundaries = list(_SUBCLAUSE_BOUNDARY_REGEX.finditer(prefix))
+            if boundaries:
+                prefix = prefix[boundaries[-1].end():]
+            suffix = lowered[idx + len(kw_lower): idx + len(kw_lower) + 32]
+            if _KEYWORD_NEGATION_REGEX.search(prefix) or _KEYWORD_SUFFIX_NEGATION_REGEX.search(suffix):
+                continue
+            return True
+    return False
+
 
 def has_substantive_completed_evidence(
     raw_message: str,

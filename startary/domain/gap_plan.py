@@ -156,7 +156,15 @@ def can_formulate_testable_uncertainty(state: dict, gap_plan: dict | None = None
             return False
 
     startup_st = state.get("startup_state") or {}
-    area_knowledge = startup_st.get("area_knowledge") or {}
+    # Milestone 6.2.3: merge_diagnosis persists areas under "areas"; "area_knowledge" is only
+    # written after an evidence cycle. Areas explicitly diagnosed UNKNOWN carry placeholder
+    # narration, not recognizable founder content, so they never count as grounding.
+    raw_areas = startup_st.get("areas") or startup_st.get("area_knowledge") or {}
+    area_knowledge = {
+        str(name): info
+        for name, info in raw_areas.items()
+        if isinstance(info, dict) and str(info.get("status") or "").upper() != "UNKNOWN"
+    }
     diagnosis = state.get("diagnosis") or {}
     raw_ctx = (state.get("raw_context") or "").lower().strip()
     founder_messages = state.get("founder_messages") or []

@@ -20,8 +20,21 @@ Milestone 2.6 additions:
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 from typing_extensions import TypedDict
+
+
+def merge_understanding_branches(current: Optional[dict[str, Any]], update: Any) -> dict[str, Any]:
+    """
+    Reducer for the M6.2.7 parallel understanding region: interpret_founder_turn and
+    extract_startup_state write their shared-key outputs here concurrently under distinct branch
+    names, so neither can overwrite the other. {"__reset__": True, ...} replaces the whole value.
+    """
+    if not isinstance(update, dict):
+        return dict(current or {})
+    if update.get("__reset__"):
+        return {k: v for k, v in update.items() if k != "__reset__"}
+    return {**(current or {}), **update}
 
 from startary.domain.enums import WorkflowPhase
 
@@ -112,11 +125,23 @@ class StartaryGraphState(TypedDict, total=False):
     experiment_critic_output: Optional[dict[str, Any]]
     critic_revision_count: int
     critic_revision_instructions: Optional[str]
+    # Milestone 6.2.6 (STARTARY_EXPERIMENT_REVISION_V2 only): revision bookkeeping for the current
+    # experiment cycle — rejected draft + critique summary, chosen strategy, how the active draft was
+    # produced, and which fields a targeted edit changed. Reset with critic_revision_count.
+    experiment_revision: Optional[dict[str, Any]]
     can_execute_result: Optional[dict[str, Any]]
     active_experiment: Optional[dict[str, Any]]
     previous_experiments: list[dict[str, Any]]
     fallback_learning_action: Optional[dict[str, Any]]
     learning_input_mode: Optional[str]
+    # Milestone 6.2.5: these were written and read but undeclared, so LangGraph silently dropped them.
+    # READY / REVISION_REQUIRED / QUALITY_BAR_NOT_MET (ExperimentDesignStatus); read by the terminal renderer.
+    experiment_design_status: Optional[str]
+
+    # --- Execution handoff & waiting-for-evidence loop (Milestone 4.0.3; declared in 6.2.5) ---
+    active_execution_handoff: Optional[dict[str, Any]]   # composed ExecutionHandoff (compose_execution_handoff)
+    execution_handoff_text: Optional[str]                # compact founder-facing handoff rendering
+    waiting_response: Optional[str]                      # advisor reply shown at the next wait_for_evidence
 
     # --- Founder Diagnosis Snapshot (Milestone 3.1) ---
     diagnosis_snapshot: Optional[dict[str, Any]]
@@ -125,6 +150,9 @@ class StartaryGraphState(TypedDict, total=False):
     latest_founder_turn_interpretation: Optional[dict[str, Any]]
     latest_advisor_response: Optional[dict[str, Any]]
     pending_question: Optional[str]
+    # Milestone 6.2.3: exact founder-facing prompt, persisted by compose_founder_question BEFORE
+    # the interrupt so display, resume, and transcript all use the same text (never regenerated).
+    pending_founder_prompt: Optional[dict[str, Any]]
     founder_current_concern: Optional[str]
     cannot_act_now_context: Optional[bool]
     recent_corrections: list[str]
@@ -132,6 +160,14 @@ class StartaryGraphState(TypedDict, total=False):
     # --- Conversational Control Integrity (Milestone 3.2.1) ---
     active_next_turn_decision: Optional[dict[str, Any]]
     question_history: list[dict[str, Any]]
+    # Milestone 6.2.7 (STARTARY_PARALLEL_UNDERSTANDING only): dispatch decision for the current founder
+    # turn (mode PARALLEL|SEQUENTIAL, reason, dispatch time) and the per-branch outputs of the parallel
+    # region (traces / telemetry records / last_trace), merged deterministically by join_founder_turn.
+    founder_turn_dispatch: Optional[dict[str, Any]]
+    understanding_branches: Annotated[dict[str, Any], merge_understanding_branches]
+    # Milestone 6.2.3: written by merge_founder_answer and read by telemetry (founder_turn_id);
+    # undeclared keys are silently dropped by LangGraph, so attribution was previously lost.
+    answered_question_id: Optional[str]
     founder_current_goal: Optional[dict[str, Any]]
     fact_conflicts: list[dict[str, Any]]
     intro_summary_shown: Optional[bool]

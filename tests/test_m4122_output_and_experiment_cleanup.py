@@ -52,6 +52,7 @@ from startary.domain.experiment import (
 )
 from startary.domain.strategic_action import NextStrategicAction, NextStrategicActionType
 from startary.graph.builder import resume_post_evidence_diagnosis, run_evidence_learning_pipeline
+from tests.fixtures.scenarios import make_valid_area_assessments_batch_output_dict
 from startary.graph.graph_state import StartaryGraphState
 from startary.graph.nodes import (
     apply_validated_state_updates,
@@ -600,7 +601,9 @@ def test_24_retry_resumes_diagnosis_from_current_state():
         "missing_areas": [],
         "unsupported_claims": [],
     }
+    # M6.2.3: assess_startup_areas was unmocked and made a live reasoning-tier LLM call.
     with patch("startary.graph.builder.diagnose_startup", return_value={"diagnosis_output": mock_diag_output, "phase": WorkflowPhase.DIAGNOSE}), \
+         patch("startary.graph.builder.assess_startup_areas", return_value={"area_assessments_output": make_valid_area_assessments_batch_output_dict()}), \
          patch("startary.graph.builder.reality_check", return_value={"reality_check": {}}), \
          patch("startary.graph.builder.generate_critical_assumption", return_value={"proposed_critical_assumption": {"id": "ca-2", "statement": "New CA"}}), \
          patch("startary.graph.builder.save_critical_assumption", return_value={"active_assumption": {"id": "ca-2", "statement": "New CA"}}), \
@@ -638,7 +641,9 @@ def test_25_founder_does_not_need_to_resubmit_evidence_after_timeout():
         "missing_areas": [],
         "unsupported_claims": [],
     }
+    # M6.2.3: assess_startup_areas was unmocked and made a live reasoning-tier LLM call.
     with patch("startary.graph.builder.diagnose_startup", return_value={"diagnosis_output": mock_diag_output}), \
+         patch("startary.graph.builder.assess_startup_areas", return_value={"area_assessments_output": make_valid_area_assessments_batch_output_dict()}), \
          patch("startary.graph.builder.reality_check", return_value={}), \
          patch("startary.graph.builder.generate_critical_assumption", return_value={}), \
          patch("startary.graph.builder.save_critical_assumption", return_value={}), \

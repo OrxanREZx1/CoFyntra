@@ -72,6 +72,25 @@ class Settings(BaseSettings):
     # --- Database (Milestone 2+) ---
     database_url: str | None = Field(default=None, alias="startary_database_url")
 
+    # --- LangSmith Observability (Milestone 6.1) ---
+    langsmith_tracing: bool = Field(default=False, alias="langsmith_tracing")
+    langsmith_api_key: str | None = Field(default=None, alias="langsmith_api_key")
+    langsmith_project: str = Field(default="startary-ai-latency", alias="langsmith_project")
+    langsmith_hide_inputs: bool = Field(default=True, alias="langsmith_hide_inputs")
+    langsmith_hide_outputs: bool = Field(default=True, alias="langsmith_hide_outputs")
+    langsmith_workspace_id: str | None = Field(default=None, alias="langsmith_workspace_id")
+    langsmith_endpoint: str | None = Field(default=None, alias="langsmith_endpoint")
+
+    # --- Experiment revision architecture (Milestone 6.2.6) ---
+    # false (default): M6.2.5.1 loop (full regeneration + full critique on REVISE).
+    # true: targeted edits, focused re-critique, and deterministic consent remediation.
+    experiment_revision_v2: bool = Field(default=False, alias="startary_experiment_revision_v2")
+
+    # --- First-turn understanding parallelization (Milestone 6.2.7) ---
+    # false (default): interpret_founder_turn then extract_startup_state, sequentially (unchanged graph).
+    # true: both run concurrently on turns that will be extracted anyway; read when the graph is built.
+    parallel_understanding: bool = Field(default=False, alias="startary_parallel_understanding")
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

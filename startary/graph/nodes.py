@@ -25,6 +25,7 @@ import json as _json
 import logging
 import uuid
 import re
+import copy as _copy
 import time
 import uuid
 from typing import Any
@@ -83,6 +84,7 @@ from startary.domain.evidence import (
     has_valid_completed_evidence_cycle,
     get_most_recent_completed_evidence_cycle,
     has_substantive_completed_evidence,
+    contains_unnegated_keyword,
 )
 from startary.domain.customer_access import (
     CustomerAccessAssessment,
@@ -170,6 +172,13 @@ from startary.llm.prompts import (
     EXPERIMENT_CRITIC_PROMPT_VERSION,
     EXPERIMENT_CRITIC_SYSTEM_PROMPT,
     build_experiment_critic_user_message,
+    EXPERIMENT_CRITIC_REVISION_SCOPE_ADDENDUM,
+    EXPERIMENT_FOCUSED_CRITIC_PROMPT_VERSION,
+    EXPERIMENT_FOCUSED_CRITIC_SYSTEM_PROMPT,
+    EXPERIMENT_REVISION_PROMPT_VERSION,
+    EXPERIMENT_REVISION_SYSTEM_PROMPT,
+    build_experiment_focused_critic_user_message,
+    build_experiment_revision_user_message,
     STARTUP_DIAGNOSIS_COMPOSER_PROMPT_VERSION,
     STARTUP_DIAGNOSIS_COMPOSER_SYSTEM_PROMPT,
     build_startup_diagnosis_composer_user_message,
@@ -219,7 +228,43 @@ from startary.domain.discrimination import (
     WeakLinkClarifyingQuestion,
     WeakLinkDiscrimination,
 )
+from startary.domain.experiment_contract import (
+    CRITIC_DIMENSIONS,
+    BudgetStatus,
+    CriticDecision,
+    PrototypeStatus,
+    assess_prototype_requirement,
+    compare_cost_to_budget,
+    critic_decision_metadata,
+    deterministic_decision,
+    evaluate_experiment_contract,
+    experiment_critique_route,
+    interpret_critic_output,
+    pending_authorization_notice,
+    pending_authorizations,
+    required_authorizations,
+)
+from startary.domain.experiment_revision import (
+    CriticMode,
+    DraftOrigin,
+    RevisionStrategy,
+    apply_focused_acceptance_rule,
+    apply_revision_patch,
+    change_summary,
+    critic_v2_metadata,
+    diff_experiment,
+    generation_record,
+    is_substantial_revision,
+    rejection_record,
+    remediate_consent_violations,
+    select_critic_mode,
+    select_revision_strategy,
+)
+from startary.observability.langsmith import emit_decision_span
 from startary.llm.provider import (
+    LLMFailureKind,
+    classify_llm_failure,
+    schema_correction_message,
     TokenBudgetExhaustedError,
     get_llm_client,
     get_llm_client_resolution_info,
@@ -237,7 +282,10 @@ from startary.llm.schemas import (
     EvidenceAnalysisLLMOutput,
     EvidenceTurnAssessmentLLMOutput,
     ExperimentCriticLLMOutput,
+    ExperimentCriticV2LLMOutput,
+    ExperimentFocusedCriticLLMOutput,
     ExperimentGeneratorLLMOutput,
+    ExperimentRevisionPatchLLMOutput,
     ExperimentParameterLLM,
     ExtractedEvidenceLLMOutput,
     FounderTurnInterpretationLLMOutput,
@@ -257,6 +305,7 @@ from startary.domain.bound_answers import parse_bound_answer
 from startary.domain.telemetry import (
     NodeTelemetryRecord,
     TurnTelemetrySummary,
+    logical_stage_for,
     record_telemetry_event,
 )
 
@@ -297,6 +346,7 @@ def _invoke_structured_with_token_retry(
     base_max_tokens: int,
     node_name: str,
     schema_cls: type,
+    run_metadata: dict[str, Any] | None = None,
 ) -> tuple[Any, float]:
     """
     Invoke structured LLM with smart token-budget recovery.
@@ -305,9 +355,28 @@ def _invoke_structured_with_token_retry(
     Never retries the identical request with the identical exhausted token cap.
     If retry fails with token exhaustion, raises TokenBudgetExhaustedError.
     """
+    attempt_1_config = {
+        "run_name": f"{node_name}:attempt_1",
+        "metadata": {
+            "node_name": node_name,
+            "logical_stage": logical_stage_for(node_name),
+            "attempt": 1,
+            "model_tier": tier,
+            "base_max_tokens": base_max_tokens,
+            "is_retry": False,
+            **(run_metadata or {}),
+        },
+        "tags": [f"node:{node_name}", f"tier:{tier}", "attempt:1"],
+    }
     t_start = time.monotonic()
     try:
-        res = structured_llm.invoke(messages)
+        try:
+            res = structured_llm.invoke(messages, config=attempt_1_config)
+        except TypeError as te:
+            if "config" in str(te):
+                res = structured_llm.invoke(messages)
+            else:
+                raise
         latency_ms = (time.monotonic() - t_start) * 1000
         return res, latency_ms
     except Exception as exc:
@@ -317,16 +386,41 @@ def _invoke_structured_with_token_retry(
                 "%s | token budget exhausted with cap %d. Retrying AT MOST ONCE with safe expanded cap %d and reasoning_effort='low'. Error: %s",
                 node_name, base_max_tokens, expanded_tokens, exc,
             )
+            is_reasoning_tier = (tier == "reasoning") or any(
+                m in (getattr(settings, "fast_model_name", None) or "").lower() for m in ("o1", "o3", "sol", "luna")
+            )
             expanded_llm = _safe_get_llm_client(
                 settings,
                 tier=tier,
                 max_completion_tokens=expanded_tokens,
-                reasoning_effort="low" if tier == "reasoning" else None,
+                reasoning_effort="low" if is_reasoning_tier else None,
             )
             expanded_structured = expanded_llm.with_structured_output(schema_cls)
             t_retry = time.monotonic()
+            retry_config = {
+                "run_name": f"{node_name}:retry_token_expansion",
+                "metadata": {
+                    "node_name": node_name,
+                    "logical_stage": logical_stage_for(node_name),
+                    "attempt": 2,
+                    "model_tier": tier,
+                    "base_max_tokens": base_max_tokens,
+                    "expanded_max_tokens": expanded_tokens,
+                    "is_retry": True,
+                    "retry_reason": "token_budget_exhausted",
+                    "reasoning_effort": "low" if is_reasoning_tier else "standard",
+                    **(run_metadata or {}),
+                },
+                "tags": [f"node:{node_name}", f"tier:{tier}", "attempt:2", "retry:token_expansion"],
+            }
             try:
-                res = expanded_structured.invoke(messages)
+                try:
+                    res = expanded_structured.invoke(messages, config=retry_config)
+                except TypeError as te:
+                    if "config" in str(te):
+                        res = expanded_structured.invoke(messages)
+                    else:
+                        raise
                 latency_ms = (time.monotonic() - t_retry) * 1000
                 logger.info("%s | retry with expanded token budget SUCCEEDED in %.2fms", node_name, latency_ms)
                 return res, latency_ms
@@ -339,6 +433,69 @@ def _invoke_structured_with_token_retry(
                     ) from retry_exc
                 raise
         raise
+
+
+def _record_llm_node_telemetry(
+    state: StartaryGraphState,
+    node_name: str,
+    llm: Any,
+    tier: str,
+    latency_ms: float,
+    attempts: int,
+    schema_name: str,
+    status: str = "SUCCESS",
+    messages: list[dict[str, str]] | None = None,
+    result: Any = None,
+    details: dict[str, Any] | None = None,
+) -> TurnTelemetrySummary:
+    """
+    Milestone 6.2.3: uniform Startary telemetry for an LLM node (node, logical stage, tier,
+    resolved model, reasoning effort, duration, retry count, status). Only sizes are derived
+    from prompts/outputs; no founder text is recorded.
+    """
+    res_info = get_llm_client_resolution_info(llm)
+    prompt_tokens = sum(len(str(m.get("content", ""))) for m in messages) // 4 if messages else None
+    completion_tokens = None
+    if result is not None and hasattr(result, "model_dump"):
+        try:
+            completion_tokens = len(json.dumps(result.model_dump(), default=str)) // 4
+        except Exception:
+            completion_tokens = None
+    total_tokens = (prompt_tokens or 0) + (completion_tokens or 0) if (prompt_tokens or completion_tokens) else None
+    return record_telemetry_event(
+        state=state,
+        node_name=node_name,
+        model_name=res_info["resolved_model"] or tier,
+        duration_ms=latency_ms,
+        latency_ms=latency_ms,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        retry_count=max(0, attempts - 1),
+        schema_name=schema_name,
+        configured_model=res_info["configured_model"],
+        resolved_model=res_info["resolved_model"],
+        fallback_used=res_info["fallback_used"],
+        fallback_reason=res_info["fallback_reason"],
+        model_tier=res_info.get("model_tier") or tier,
+        reasoning_effort=res_info.get("reasoning_effort"),
+        status=status,
+        details=details,
+    )
+
+
+def _revision_v2_enabled(settings: Any) -> bool:
+    """Milestone 6.2.6 A/B flag (STARTARY_EXPERIMENT_REVISION_V2). Only an explicit True enables V2."""
+    return getattr(settings, "experiment_revision_v2", False) is True
+
+
+def _slim_facts(facts: dict[str, Any]) -> dict[str, Any]:
+    """Known fact values only (UNKNOWN placeholders dropped), as the critic receives them."""
+    return {
+        k: (v.get("value") if isinstance(v, dict) and "value" in v else v)
+        for k, v in (facts or {}).items()
+        if v and (not isinstance(v, dict) or v.get("value") not in (None, "UNKNOWN", ""))
+    }
 
 
 MAX_BASELINE_QUESTION_TURNS = 5
@@ -483,6 +640,8 @@ def initialize_state(state: StartaryGraphState) -> dict:
         updates["latest_founder_turn_interpretation"] = None
     if "latest_advisor_response" not in state:
         updates["latest_advisor_response"] = None
+    if "pending_founder_prompt" not in state:
+        updates["pending_founder_prompt"] = None
     if "pending_question" not in state:
         updates["pending_question"] = None
     if "founder_current_concern" not in state:
@@ -766,6 +925,9 @@ def diagnose_startup(state: StartaryGraphState) -> dict:
                 resolved_model=res_model,
                 fallback_used=fb_used,
                 fallback_reason=fb_reason,
+                retry_count=attempt - 1,
+                model_tier="reasoning",
+                reasoning_effort=get_llm_client_resolution_info(llm).get("reasoning_effort"),
             )
 
             trace = AITrace(
@@ -815,6 +977,48 @@ def diagnose_startup(state: StartaryGraphState) -> dict:
 # ---------------------------------------------------------------------------
 # 4. merge_diagnosis (Deterministic)
 # ---------------------------------------------------------------------------
+
+# Milestone 6.2.3: StartupState mirrors the canonical fact stores owned by merge_execution_state
+# (top-level execution_context / startup_progress). (StartupState layer key, canonical state key)
+_FACT_LAYERS: tuple[tuple[str, str], ...] = (
+    ("execution_context", "execution_context"),
+    ("progress", "startup_progress"),
+)
+
+
+def _is_known_fact(field: Any) -> bool:
+    return isinstance(field, dict) and str(field.get("provenance") or "UNKNOWN").upper() != "UNKNOWN"
+
+
+def _preserve_fact_layer(canonical: dict | None, mirrored: dict | None, default: dict) -> dict:
+    """
+    Field-wise fact mirror that never downgrades a known fact to an UNKNOWN placeholder.
+    Precedence per schema field: known canonical value > known previously-mirrored value > default.
+    Values are copied verbatim (value, provenance, confidence, source_turn), so EXPLICIT facts,
+    INFERRED facts, and explicit negatives (e.g. paying_customers=0) keep their epistemic status.
+    """
+    merged = dict(default)
+    for source in (mirrored or {}, canonical or {}):  # canonical last: it wins when known
+        for key in default:
+            val = source.get(key)
+            if _is_known_fact(val):
+                merged[key] = val
+            elif isinstance(val, list) and val:
+                merged[key] = val
+    return merged
+
+
+def _startup_state_with_canonical_facts(state: StartaryGraphState) -> dict:
+    """StartupState dict whose execution/progress layers reflect the canonical fact stores."""
+    st = dict(state.get("startup_state") or {})
+    defaults = {"execution_context": ExecutionContext().model_dump(), "progress": StartupProgress().model_dump()}
+    for layer_key, canonical_key in _FACT_LAYERS:
+        canonical = state.get(canonical_key)
+        if canonical is None and layer_key not in st:
+            continue
+        st[layer_key] = _preserve_fact_layer(canonical, st.get(layer_key), defaults[layer_key])
+    return st
+
 
 def merge_diagnosis(state: StartaryGraphState) -> dict:
     """Merge validated diagnosis output into StartupState & Diagnosis models."""
@@ -880,6 +1084,15 @@ def merge_diagnosis(state: StartaryGraphState) -> dict:
                     areas[area].understanding = existing_k.get("understanding")
 
     new_startup_state = StartupState(raw_context=raw_context, areas=areas)
+    startup_state_dump = new_startup_state.model_dump()
+    # Milestone 6.2.3: diagnosis owns `areas` only. Founder facts extracted by
+    # merge_execution_state must survive this rebuild instead of resetting to UNKNOWN defaults.
+    for layer_key, canonical_key in _FACT_LAYERS:
+        startup_state_dump[layer_key] = _preserve_fact_layer(
+            state.get(canonical_key),
+            existing_startup_state.get(layer_key),
+            startup_state_dump[layer_key],
+        )
 
     assessments = [
         StartupAreaAssessment(
@@ -908,7 +1121,7 @@ def merge_diagnosis(state: StartaryGraphState) -> dict:
     )
 
     return {
-        "startup_state": new_startup_state.model_dump(),
+        "startup_state": startup_state_dump,
         "diagnosis": diagnosis.model_dump(mode="json"),
     }
 
@@ -1107,16 +1320,120 @@ def select_clarifying_question(state: StartaryGraphState) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 7. ask_and_wait_for_founder (Interrupt Node — Milestone 2.5)
+# 7. compose_founder_question + ask_and_wait_for_founder (Milestone 2.5 & 6.2.3)
 # ---------------------------------------------------------------------------
+#
+# LangGraph re-executes an interrupted node from the top on resume, and nothing a node computes
+# before interrupt() is committed. Composing the question inside the interrupt node therefore
+# ran the composer LLM twice (once before display, once on resume) and let the transcript
+# record a regenerated wording. Composition now lives in its own node whose output is
+# checkpointed before the interrupt node runs; the interrupt node is LLM-free.
+
+def _resolve_active_question(state: StartaryGraphState) -> dict[str, Any]:
+    """Pure function of committed state: the question currently awaiting the founder."""
+    active_type = state.get("active_interrupt_type") or "strategic"
+    active_decision = state.get("active_next_turn_decision") or {}
+
+    if active_type == "baseline" and state.get("current_baseline_question"):
+        q_dict = state["current_baseline_question"]
+    elif active_type == "weak_link" and state.get("current_weak_link_question"):
+        q_dict = state["current_weak_link_question"]
+    else:
+        q_dict = state.get("current_clarifying_question") or {}
+
+    turn_number = (
+        state.get("baseline_question_turns", 0) + 1 if active_type == "baseline"
+        else (state.get("weak_link_clarification_turns", 0) + 1 if active_type == "weak_link"
+              else state.get("strategic_clarification_turns", state.get("clarification_turn_count", 0)) + 1)
+    )
+
+    return {
+        "interrupt_type": active_type,
+        "question_id": active_decision.get("question_id"),
+        "raw_planner_question": active_decision.get("canonical_question") or q_dict.get("question", "Could you provide more context about your startup?"),
+        "target_area": str(active_decision.get("information_target") or q_dict.get("target_area") or q_dict.get("target_group") or "Context"),
+        "information_goal": q_dict.get("information_goal", ""),
+        "turn": turn_number,
+    }
+
+
+def _advisor_response_is_bound(advisor_resp: dict | None, question_id: str | None) -> bool:
+    """An advisor response may be displayed only for the question it was composed for."""
+    if not advisor_resp:
+        return False
+    if advisor_resp.get("response_mode") == "CONVERSATIONAL_REPAIR":
+        return True
+    return question_id is not None and advisor_resp.get("question_id") == question_id
+
+
+def _build_founder_prompt(question: dict[str, Any], advisor_resp: dict | None, source: str) -> dict[str, Any]:
+    """Freeze the exact founder-facing prompt (display text + attribution metadata)."""
+    display = (advisor_resp or {}).get("response_text") or question["raw_planner_question"]
+    if not (advisor_resp or {}).get("response_text"):
+        source = "planner_fallback"
+    return {
+        **question,
+        "question_id": question.get("question_id") or f"q_legacy_turn_{question.get('turn', 0)}",
+        "question": display,
+        "source": source,
+    }
+
+
+def _prompt_matches_active_question(prompt: dict | None, question: dict[str, Any]) -> bool:
+    """True when a persisted prompt was composed for the question currently awaiting the founder."""
+    if not prompt or not prompt.get("question"):
+        return False
+    if prompt.get("interrupt_type") != question["interrupt_type"]:
+        return False
+    if question.get("question_id"):
+        return prompt.get("question_id") == question["question_id"]
+    return prompt.get("raw_planner_question") == question["raw_planner_question"]
+
+
+def compose_founder_question(state: StartaryGraphState) -> dict:
+    """
+    Node (Milestone 6.2.3): compose the founder-facing question exactly once and persist it.
+
+    Runs between the question planners (plan_baseline_question, plan_information_gap,
+    select_weak_link_question) and ask_and_wait_for_founder. Its output, including the
+    exact display text in ``pending_founder_prompt``, is checkpointed BEFORE the interrupt,
+    so resume, retry, and checkpoint restoration never trigger a second composer call.
+    """
+    question = _resolve_active_question(state)
+    if question["interrupt_type"] == "waiting_for_learning_input":
+        return {}
+
+    advisor_resp = state.get("latest_advisor_response")
+    updates: dict[str, Any] = {}
+    if _advisor_response_is_bound(advisor_resp, question["question_id"]):
+        source = "conversational_repair" if advisor_resp.get("response_mode") == "CONVERSATIONAL_REPAIR" else "advisor_composer"
+    else:
+        source = "advisor_composer"
+        try:
+            updates = compose_advisor_response(state)
+            advisor_resp = updates.get("latest_advisor_response")
+        except Exception as exc:
+            logger.warning("compose_founder_question: advisor composition failed (%s); displaying planner question verbatim", exc)
+            advisor_resp = None
+
+    prompt = _build_founder_prompt(question, advisor_resp, source)
+    updates["pending_founder_prompt"] = prompt
+    logger.info(
+        "compose_founder_question | type=%s qid=%s source=%s",
+        prompt["interrupt_type"], prompt["question_id"], prompt["source"],
+    )
+    return updates
+
 
 def ask_and_wait_for_founder(state: StartaryGraphState) -> dict:
     """
-    Interrupt Node: Exposes the conversational advisor response (bound to active NextTurnDecision)
-    and pauses execution until resumed with the founder's response.
+    Interrupt Node: displays the persisted founder-facing question and pauses execution until
+    resumed with the founder's response.
+
+    LLM-free by design (Milestone 6.2.3): LangGraph re-runs this node from the top on resume,
+    so everything before interrupt() must be a deterministic function of committed state.
     """
     active_type = state.get("active_interrupt_type") or "strategic"
-    active_decision = state.get("active_next_turn_decision") or {}
 
     # Milestone 4.1.1: Recoverable experiment design failure interrupt
     if active_type == "waiting_for_learning_input":
@@ -1146,52 +1463,34 @@ def ask_and_wait_for_founder(state: StartaryGraphState) -> dict:
             "active_interrupt_type": "waiting_for_learning_input",
         }
 
-    if active_type == "baseline" and state.get("current_baseline_question"):
-        q_dict = state["current_baseline_question"]
-    elif active_type == "weak_link" and state.get("current_weak_link_question"):
-        q_dict = state["current_weak_link_question"]
-    else:
-        q_dict = state.get("current_clarifying_question") or {}
-
-    raw_question_text = active_decision.get("canonical_question") or q_dict.get("question", "Could you provide more context about your startup?")
-    target_area = active_decision.get("information_target") or q_dict.get("target_area") or q_dict.get("target_group") or "Context"
-    question_id = active_decision.get("question_id") or f"q_legacy_{int(time.time())}"
-
-    # Milestone 3.2.1: ensure advisor response is composed and bound to current decision
-    advisor_resp = state.get("latest_advisor_response")
-    advisor_updates: dict[str, Any] = {}
-    if not advisor_resp or (advisor_resp.get("question_id") != question_id and advisor_resp.get("response_mode") != "CONVERSATIONAL_REPAIR"):
-        try:
-            advisor_updates = compose_advisor_response(state)
-            advisor_resp = advisor_updates.get("latest_advisor_response")
-        except Exception as exc:
-            logger.warning("Failed to compose advisor response in ask_and_wait: %s", exc)
-
-    display_question = (advisor_resp or {}).get("response_text") or raw_question_text
-
-    turn_number = (
-        state.get("baseline_question_turns", 0) + 1 if active_type == "baseline"
-        else (state.get("weak_link_clarification_turns", 0) + 1 if active_type == "weak_link"
-              else state.get("strategic_clarification_turns", state.get("clarification_turn_count", 0)) + 1)
-    )
+    question = _resolve_active_question(state)
+    prompt = state.get("pending_founder_prompt")
+    prompt_updates: dict[str, Any] = {}
+    if not _prompt_matches_active_question(prompt, question):
+        # Deterministic fallback for direct node calls and the conversational-repair path:
+        # display the advisor response already committed for this question, else the planner text.
+        advisor_resp = state.get("latest_advisor_response")
+        bound = _advisor_response_is_bound(advisor_resp, question["question_id"])
+        source = "conversational_repair" if bound and advisor_resp.get("response_mode") == "CONVERSATIONAL_REPAIR" else "advisor_composer"
+        prompt = _build_founder_prompt(question, advisor_resp if bound else None, source)
+        prompt_updates["pending_founder_prompt"] = prompt
 
     # LangGraph interrupt: suspends graph execution and awaits resume value from CLI / caller
     founder_answer = interrupt({
-        "question": display_question,
-        "raw_planner_question": raw_question_text,
-        "target_area": str(target_area),
-        "question_id": question_id,
-        "information_goal": q_dict.get("information_goal", ""),
-        "turn": turn_number,
-        "interrupt_type": active_type,
+        "question": prompt["question"],
+        "raw_planner_question": prompt["raw_planner_question"],
+        "target_area": prompt["target_area"],
+        "question_id": prompt["question_id"],
+        "information_goal": prompt["information_goal"],
+        "turn": prompt["turn"],
+        "interrupt_type": prompt["interrupt_type"],
     })
 
-    logger.info("ask_and_wait_for_founder resumed (%s, qid=%s) with answer: %s", active_type, question_id, str(founder_answer)[:60])
+    logger.info("ask_and_wait_for_founder resumed (%s, qid=%s) with answer: %s", prompt["interrupt_type"], prompt["question_id"], str(founder_answer)[:60])
     res: dict[str, Any] = {
         "founder_response": str(founder_answer),
     }
-    if advisor_updates:
-        res.update(advisor_updates)
+    res.update(prompt_updates)
     return res
 
 
@@ -1280,12 +1579,14 @@ def merge_founder_answer(state: StartaryGraphState) -> dict:
             "startup_state": st_state,
             "founder_evidence": founder_ev,
             "active_interrupt_type": None,
+            "pending_founder_prompt": None,
             "fallback_learning_action": None,
             "learning_input_mode": None,
             "experiment_design_status": None,
             "phase": WorkflowPhase.UNDERSTAND,
             "critic_revision_count": 0,
             "critic_revision_instructions": "",
+            "experiment_revision": None,
             "proposed_experiment_output": None,
             "experiment_critic_output": None,
             "active_experiment": None,
@@ -1303,8 +1604,14 @@ def merge_founder_answer(state: StartaryGraphState) -> dict:
     else:
         q_dict = state.get("current_clarifying_question") or {}
 
-    advisor_resp = state.get("latest_advisor_response") or {}
-    question_text = advisor_resp.get("response_text") or active_decision.get("canonical_question") or q_dict.get("question", "")
+    # Milestone 6.2.3: attribute the answer to the exact prompt the founder was shown
+    # (persisted before the interrupt), never to a regenerated or stale advisor response.
+    shown_prompt = state.get("pending_founder_prompt")
+    if _prompt_matches_active_question(shown_prompt, _resolve_active_question(state)):
+        question_text = shown_prompt["question"]
+    else:
+        advisor_resp = state.get("latest_advisor_response") or {}
+        question_text = advisor_resp.get("response_text") or active_decision.get("canonical_question") or q_dict.get("question", "")
 
     # Milestone 4.1.3: Conversational Repair Fast Path Interception
     if is_conversational_repair_text(founder_answer):
@@ -1326,6 +1633,7 @@ def merge_founder_answer(state: StartaryGraphState) -> dict:
             "current_clarifying_question": state.get("current_clarifying_question"),
             "active_next_turn_decision": active_decision,
             "founder_response": founder_answer,
+            "pending_founder_prompt": None,
         }
 
     founder_messages = list(state.get("founder_messages") or [])
@@ -1354,6 +1662,7 @@ def merge_founder_answer(state: StartaryGraphState) -> dict:
         "answered_question_id": qid,
         "active_next_turn_decision": None,  # CONSUMED: stale question cannot survive
         "latest_advisor_response": None,   # CLEARED: forces fresh advisor composition on next turn
+        "pending_founder_prompt": None,    # CONSUMED: answered prompt cannot be re-displayed
         "current_clarifying_question": None,
         "current_baseline_question": None,
         "current_weak_link_question": None,
@@ -1631,7 +1940,16 @@ def extract_startup_state(state: StartaryGraphState) -> dict:
     })
 
     settings = get_settings()
-    llm = _safe_get_llm_client(settings, tier="fast", max_tokens=1000)
+    base_max_tokens = 2500
+    is_reasoning_fast = any(
+        m in (getattr(settings, "fast_model_name", None) or "").lower() for m in ("o1", "o3", "sol", "luna")
+    )
+    llm = _safe_get_llm_client(
+        settings,
+        tier="fast",
+        max_completion_tokens=base_max_tokens,
+        reasoning_effort="low" if is_reasoning_fast else None,
+    )
     conf_model, res_model, fb_used, fb_reason = get_llm_client_resolution_info(llm)
     structured_llm = llm.with_structured_output(StartupStateDeltaLLMOutput)
 
@@ -1648,128 +1966,130 @@ def extract_startup_state(state: StartaryGraphState) -> dict:
         {"role": "user", "content": user_message},
     ]
 
-    attempt = 0
-    last_error: Exception | None = None
+    try:
+        result, latency_ms = _invoke_structured_with_token_retry(
+            structured_llm=structured_llm,
+            messages=messages,
+            settings=settings,
+            tier="fast",
+            base_max_tokens=base_max_tokens,
+            node_name="extract_startup_state",
+            schema_cls=StartupStateDeltaLLMOutput,
+        )
 
-    while attempt < 2:
-        attempt += 1
-        t_start = time.monotonic()
-        try:
-            result: StartupStateDeltaLLMOutput = structured_llm.invoke(messages)
-            latency_ms = (time.monotonic() - t_start) * 1000
+        if not isinstance(result, StartupStateDeltaLLMOutput):
+            raise ValueError(f"Expected StartupStateDeltaLLMOutput, got {type(result)}")
 
-            delta_dict = result.model_dump()
-            delta_dict["_source_turn"] = source_turn
+        delta_dict = result.model_dump()
+        delta_dict["_source_turn"] = source_turn
 
-            # Short-answer guardrail (Section 15/16): prevent unrelated speculative INFERRED fields
-            if is_short_answer and pending_question:
-                pq_lower = pending_question.lower()
-                field_keywords = {
-                    "founder_count": ["founder", "co-founder", "team", "alone", "solo"],
-                    "active_team_size": ["team", "people", "members", "size"],
-                    "has_technical_capability": ["technical", "developer", "engineer", "code"],
-                    "has_design_capability": ["design", "ui", "ux"],
-                    "has_marketing_capability": ["marketing", "sales", "growth"],
-                    "weekly_hours_per_member": ["hour", "time", "weekly", "capacity"],
-                    "total_weekly_capacity_hours": ["hour", "time", "weekly", "capacity"],
-                    "available_budget_amount": ["budget", "money", "fund", "cash", "spend", "dollar", "azn", "eur"],
-                    "funding_status": ["funding", "funded", "investor", "bootstrap"],
-                    "customer_access": ["access", "network", "contact", "customer", "user", "owner", "manager"],
-                    "prototype_exists": ["prototype", "wireframe", "mockup"],
-                    "mvp_exists": ["mvp", "product", "software", "app", "tool"],
-                    "launched": ["launch", "live", "market"],
-                    "active_users": ["user", "active", "pilot"],
-                    "paying_customers": ["customer", "paying", "client"],
-                    "revenue": ["revenue", "money", "sales", "income", "pricing", "pay"],
-                }
-                for k, v in list(delta_dict.items()):
-                    if isinstance(v, dict) and v.get("provenance") == "INFERRED":
-                        keywords = field_keywords.get(k, [])
-                        if keywords and not any(kw in pq_lower for kw in keywords):
-                            logger.info("extract_startup_state | dropping speculative inference '%s' on short answer '%s'", k, latest_founder_text)
-                            delta_dict[k] = None
-
-            # Milestone 4.0.4: Factual state grounding validation
-            delta_dict = validate_state_grounding(state, delta_dict, latest_founder_text)
-
-            trace = AITrace(
-                module_name="extract_startup_state",
-                prompt_version=STARTUP_STATE_EXTRACTOR_PROMPT_VERSION,
-                input_data={"founder_messages_count": len(source_lines), "source_turn": source_turn},
-                output_data={"delta_keys": [k for k, v in delta_dict.items() if v is not None and k != "_source_turn"]},
-                latency_ms=latency_ms,
-                project_id=project_id,
-                model_name=res_model or getattr(settings, "fast_model_name", None),
-                configured_model=conf_model,
-                resolved_model=res_model,
-                fallback_used=fb_used,
-                fallback_reason=fb_reason,
-                execution_path=state.get("execution_path", "DELTA_STATE_UPDATE"),
-            )
-
-            existing_traces = list(state.get("traces") or [])
-            existing_traces.append(trace.model_dump(mode="json"))
-
-            # Token accounting with fallback character counting
-            prompt_tokens = getattr(getattr(result, "usage_metadata", None), "prompt_tokens", None)
-            if prompt_tokens is None:
-                prompt_tokens = sum(len(m.get("content", "")) for m in messages) // 4
-            completion_tokens = getattr(getattr(result, "usage_metadata", None), "completion_tokens", None)
-            if completion_tokens is None:
-                completion_tokens = len(_json.dumps(delta_dict)) // 4
-            total_tokens = prompt_tokens + completion_tokens
-
-            turn_telem = record_telemetry_event(
-                state=state,
-                node_name="extract_startup_state",
-                model_name=res_model or getattr(settings, "fast_model_name", None) or "fast_tier",
-                configured_model=conf_model,
-                resolved_model=res_model,
-                fallback_used=fb_used,
-                fallback_reason=fb_reason,
-                duration_ms=latency_ms,
-                latency_ms=latency_ms,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_tokens,
-                execution_path=state.get("execution_path", "DELTA_STATE_UPDATE"),
-            )
-
-            logger.info("extract_startup_state | project_id=%s latency_ms=%.0f", project_id, latency_ms)
-
-            return {
-                "startup_state_delta": delta_dict,
-                "last_trace": trace.model_dump(mode="json"),
-                "traces": existing_traces,
-                "turn_telemetry": turn_telem,
-                "extraction_status": "SUCCESS",
+        # Short-answer guardrail (Section 15/16): prevent unrelated speculative INFERRED fields
+        if is_short_answer and pending_question:
+            pq_lower = pending_question.lower()
+            field_keywords = {
+                "founder_count": ["founder", "co-founder", "team", "alone", "solo"],
+                "active_team_size": ["team", "people", "members", "size"],
+                "has_technical_capability": ["technical", "developer", "engineer", "code"],
+                "has_design_capability": ["design", "ui", "ux"],
+                "has_marketing_capability": ["marketing", "sales", "growth"],
+                "weekly_hours_per_member": ["hour", "time", "weekly", "capacity"],
+                "total_weekly_capacity_hours": ["hour", "time", "weekly", "capacity"],
+                "available_budget_amount": ["budget", "money", "fund", "cash", "spend", "dollar", "azn", "eur"],
+                "funding_status": ["funding", "funded", "investor", "bootstrap"],
+                "customer_access": ["access", "network", "contact", "customer", "user", "owner", "manager"],
+                "prototype_exists": ["prototype", "wireframe", "mockup"],
+                "mvp_exists": ["mvp", "product", "software", "app", "tool"],
+                "launched": ["launch", "live", "market"],
+                "active_users": ["user", "active", "pilot"],
+                "paying_customers": ["customer", "paying", "client"],
+                "revenue": ["revenue", "money", "sales", "income", "pricing", "pay"],
             }
-        except Exception as exc:
-            last_error = exc
-            logger.warning("extract_startup_state failed attempt %d: %s", attempt, exc)
-            if is_permanent_model_error(exc):
-                logger.warning("extract_startup_state: permanent model error (%s). Aborting retries.", exc)
-                break
+            for k, v in list(delta_dict.items()):
+                if isinstance(v, dict) and v.get("provenance") == "INFERRED":
+                    keywords = field_keywords.get(k, [])
+                    if keywords and not any(kw in pq_lower for kw in keywords):
+                        logger.info("extract_startup_state | dropping speculative inference '%s' on short answer '%s'", k, latest_founder_text)
+                        delta_dict[k] = None
 
-    logger.error("extract_startup_state failed after %d attempts: %s", attempt, last_error)
-    turn_telem = record_telemetry_event(
-        state=state,
-        node_name="extract_startup_state",
-        model_name="local_deterministic",
-        configured_model=conf_model,
-        resolved_model="local_deterministic",
-        fallback_used=True,
-        fallback_reason="EXTRACTION_FAILURE_FALLBACK",
-        duration_ms=0.0,
-        execution_path=state.get("execution_path", "DELTA_STATE_UPDATE"),
-    )
-    return {
-        "startup_state_delta": {},
-        "extraction_status": "FAILED",
-        "extraction_error": str(last_error),
-        "strategic_state_changed": True,
-        "turn_telemetry": turn_telem,
-    }
+        # Milestone 4.0.4: Factual state grounding validation
+        delta_dict = validate_state_grounding(state, delta_dict, latest_founder_text)
+
+        trace = AITrace(
+            module_name="extract_startup_state",
+            prompt_version=STARTUP_STATE_EXTRACTOR_PROMPT_VERSION,
+            input_data={"founder_messages_count": len(source_lines), "source_turn": source_turn},
+            output_data={"delta_keys": [k for k, v in delta_dict.items() if v is not None and k != "_source_turn"]},
+            latency_ms=latency_ms,
+            project_id=project_id,
+            model_name=res_model or getattr(settings, "fast_model_name", None),
+            configured_model=conf_model,
+            resolved_model=res_model,
+            fallback_used=fb_used,
+            fallback_reason=fb_reason,
+            execution_path=state.get("execution_path", "DELTA_STATE_UPDATE"),
+        )
+
+        existing_traces = list(state.get("traces") or [])
+        existing_traces.append(trace.model_dump(mode="json"))
+
+        # Token accounting with fallback character counting
+        prompt_tokens = getattr(getattr(result, "usage_metadata", None), "prompt_tokens", None)
+        if prompt_tokens is None:
+            prompt_tokens = sum(len(m.get("content", "")) for m in messages) // 4
+        completion_tokens = getattr(getattr(result, "usage_metadata", None), "completion_tokens", None)
+        if completion_tokens is None:
+            completion_tokens = len(_json.dumps(delta_dict)) // 4
+        total_tokens = prompt_tokens + completion_tokens
+
+        turn_telem = record_telemetry_event(
+            state=state,
+            node_name="extract_startup_state",
+            model_name=res_model or getattr(settings, "fast_model_name", None) or "fast_tier",
+            configured_model=conf_model,
+            resolved_model=res_model,
+            fallback_used=fb_used,
+            fallback_reason=fb_reason,
+            duration_ms=latency_ms,
+            latency_ms=latency_ms,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            execution_path=state.get("execution_path", "DELTA_STATE_UPDATE"),
+            model_tier="fast",
+            reasoning_effort=get_llm_client_resolution_info(llm).get("reasoning_effort"),
+        )
+
+        logger.info("extract_startup_state | project_id=%s latency_ms=%.0f", project_id, latency_ms)
+
+        return {
+            "startup_state_delta": delta_dict,
+            "last_trace": trace.model_dump(mode="json"),
+            "traces": existing_traces,
+            "turn_telemetry": turn_telem,
+            "extraction_status": "SUCCESS",
+        }
+    except Exception as exc:
+        logger.error("extract_startup_state failed: %s", exc)
+        turn_telem = record_telemetry_event(
+            state=state,
+            node_name="extract_startup_state",
+            model_name="local_deterministic",
+            configured_model=conf_model,
+            resolved_model="local_deterministic",
+            fallback_used=True,
+            fallback_reason="EXTRACTION_FAILURE_FALLBACK",
+            duration_ms=0.0,
+            execution_path=state.get("execution_path", "DELTA_STATE_UPDATE"),
+            model_tier="fast",
+            status="FAILED",
+        )
+        return {
+            "startup_state_delta": {},
+            "extraction_status": "FAILED",
+            "extraction_error": str(exc),
+            "strategic_state_changed": True,
+            "turn_telemetry": turn_telem,
+        }
 
 
 def _is_sharp_contradiction(field_name: str, existing_val: Any, incoming_val: Any) -> bool:
@@ -2157,7 +2477,13 @@ def plan_information_gap(state: StartaryGraphState) -> dict:
                 project_id, should_ask, strategic_sufficient, res_mode_enum.value, turn_count,
             )
 
+            turn_telem = _record_llm_node_telemetry(
+                state, "plan_information_gap", llm, "reasoning", latency_ms, attempt,
+                "InformationGapPlanLLMOutput", messages=messages, result=result,
+            )
+
             return {
+                "turn_telemetry": turn_telem,
                 "gap_plan": gap_plan.model_dump(mode="json"),
                 "context_sufficiency": compat_cs,
                 "context_sufficiency_output": compat_cs,
@@ -2174,6 +2500,7 @@ def plan_information_gap(state: StartaryGraphState) -> dict:
             if is_permanent_model_error(exc) or isinstance(exc, TokenBudgetExhaustedError):
                 break
 
+    _record_llm_node_telemetry(state, "plan_information_gap", llm, "reasoning", 0.0, attempt, "InformationGapPlanLLMOutput", status="FAILED")
     if isinstance(last_error, TokenBudgetExhaustedError):
         raise last_error
     raise RuntimeError(f"plan_information_gap failed after {attempt} attempts. Error: {last_error}")
@@ -2188,7 +2515,8 @@ def assess_startup_areas(state: StartaryGraphState) -> dict:
     LLM Node: Evaluate all 10 canonical startup areas across 4 qualitative risk dimensions.
     """
     project_id = state.get("project_id", "<unknown>")
-    startup_state_dict = state.get("startup_state") or {}
+    # Milestone 6.2.3: risk evaluation sees the founder facts already extracted, not placeholders.
+    startup_state_dict = _startup_state_with_canonical_facts(state)
     diagnosis_dict = state.get("diagnosis") or {}
 
     settings = get_settings()
@@ -2197,7 +2525,7 @@ def assess_startup_areas(state: StartaryGraphState) -> dict:
     structured_llm = llm.with_structured_output(StartupAreaAssessmentBatchLLMOutput)
 
     user_message = build_area_assessment_user_message(
-        startup_state_summary=json.dumps(startup_state_dict, indent=2),
+        startup_state_summary=json.dumps(startup_state_dict, indent=2, default=str),
         diagnosis_summary=diagnosis_dict.get("summary") or (state.get("diagnosis_output") or {}).get("diagnosis_summary", ""),
         startup_stage=diagnosis_dict.get("startup_stage") or (state.get("diagnosis_output") or {}).get("startup_stage"),
     )
@@ -2233,9 +2561,10 @@ def assess_startup_areas(state: StartaryGraphState) -> dict:
                 str(diagnosis_dict.get("summary") or ""),
             ]).lower()
 
-            has_paying = any(k in all_text for k in ["paying", "paid", "repeat payment", "repeat payments", "paying teams", "paying customers", "paid pilot", "subscription revenue", "mrr", "8 paying"])
-            has_repeat = any(k in all_text for k in ["repeat use", "weekly use", "recorded full matches", "weekly active", "using weekly", "repeat usage", "multiple matches"])
-            has_live = any(k in all_text for k in ["deployed", "live product", "in production", "app is live", "product is live", "active users", "20 teams tried", "14 recorded"])
+            # Milestone 6.2.3: negation-aware ("zero paying customers" is negative evidence, not traction)
+            has_paying = contains_unnegated_keyword(all_text, ["paying", "paid", "repeat payment", "repeat payments", "paying teams", "paying customers", "paid pilot", "subscription revenue", "mrr", "8 paying"])
+            has_repeat = contains_unnegated_keyword(all_text, ["repeat use", "weekly use", "recorded full matches", "weekly active", "using weekly", "repeat usage", "multiple matches"])
+            has_live = contains_unnegated_keyword(all_text, ["deployed", "live product", "in production", "app is live", "product is live", "active users", "20 teams tried", "14 recorded"])
 
             if (has_paying or has_repeat) and has_live:
                 adjusted_assessments = []
@@ -2283,7 +2612,13 @@ def assess_startup_areas(state: StartaryGraphState) -> dict:
             existing_traces = list(state.get("traces") or [])
             existing_traces.append(trace.model_dump(mode="json"))
 
+            turn_telem = _record_llm_node_telemetry(
+                state, "assess_startup_areas", llm, "reasoning", latency_ms, attempt,
+                "StartupAreaAssessmentBatchLLMOutput", messages=messages, result=result,
+            )
+
             return {
+                "turn_telemetry": turn_telem,
                 "area_assessments_output": result.model_dump(),
                 "last_trace": trace.model_dump(mode="json"),
                 "traces": existing_traces,
@@ -2294,6 +2629,7 @@ def assess_startup_areas(state: StartaryGraphState) -> dict:
             if is_permanent_model_error(exc) or isinstance(exc, TokenBudgetExhaustedError):
                 break
 
+    _record_llm_node_telemetry(state, "assess_startup_areas", llm, "reasoning", 0.0, attempt, "StartupAreaAssessmentBatchLLMOutput", status="FAILED")
     if isinstance(last_error, TokenBudgetExhaustedError):
         raise last_error
     raise RuntimeError(f"assess_startup_areas failed after {attempt} attempts. Error: {last_error}")
@@ -3450,6 +3786,20 @@ def assess_baseline_state_sufficiency(state: StartaryGraphState) -> dict:
 
     missing = [dim for dim, status in dim_statuses.items() if status == BaselineDimensionStatus.MISSING]
 
+    # Invariant: If extraction failed, facts were not persisted; baseline CANNOT be sufficient
+    if state.get("extraction_status") == "FAILED":
+        suff_domain = BaselineStartupStateSufficiency(
+            is_sufficient=False,
+            dimension_statuses=dim_statuses,
+            missing_groups=missing if missing else list(BaselineDimension),
+            reason=f"Baseline operational facts have not been successfully persisted (extraction_status=FAILED: {state.get('extraction_error', 'extraction failed')}).",
+        )
+        logger.warning("assess_baseline_state_sufficiency | project_id=%s -> INSUFFICIENT (extraction_status=FAILED)", project_id)
+        return {
+            "baseline_sufficiency": suff_domain.model_dump(mode="json"),
+            "is_baseline_sufficient": False,
+        }
+
     # Fast path shortcut: all 5 dimensions known
     if not missing:
         suff_domain = BaselineStartupStateSufficiency(
@@ -3509,10 +3859,12 @@ def assess_baseline_state_sufficiency(state: StartaryGraphState) -> dict:
             }
             res_missing = [dim for dim, status in res_dim_statuses.items() if status == BaselineDimensionStatus.MISSING]
 
+            final_is_sufficient = bool(res.is_sufficient) and len(res_missing) == 0
+
             suff_domain = BaselineStartupStateSufficiency(
-                is_sufficient=bool(res.is_sufficient) and len(res_missing) == 0,
+                is_sufficient=final_is_sufficient,
                 dimension_statuses=res_dim_statuses,
-                missing_groups=res_missing,
+                missing_groups=res_missing if not final_is_sufficient else [],
                 reason=res.reason if isinstance(res.reason, str) else "",
             )
 
@@ -3813,6 +4165,10 @@ def assess_weak_link_discrimination(state: StartaryGraphState) -> dict:
     if turns_used >= MAX_WEAK_LINK_CLARIFICATION_TURNS:
         logger.info("assess_weak_link_discrimination | Max turns reached (%d); proceeding with deterministic winner under LOW confidence", turns_used)
         return {
+            "turn_telemetry": record_telemetry_event(
+                state=state, node_name="assess_weak_link_discrimination", model_name="local_deterministic",
+                skipped_by_fast_path=True, execution_path="DETERMINISTIC_MAX_TURNS", model_tier="none",
+            ),
             "selection_confidence": "LOW",
             "should_clarify": False,
             "should_clarify_weak_link": False,
@@ -3841,6 +4197,10 @@ def assess_weak_link_discrimination(state: StartaryGraphState) -> dict:
             should_clarify=False,
         )
         return {
+            "turn_telemetry": record_telemetry_event(
+                state=state, node_name="assess_weak_link_discrimination", model_name="local_deterministic",
+                skipped_by_fast_path=True, execution_path="DETERMINISTIC_CLEAR_WINNER", model_tier="none",
+            ),
             "weak_link_discrimination": disc_domain.model_dump(mode="json"),
             "selection_confidence": "HIGH",
             "competing_weak_areas": [],
@@ -3927,7 +4287,12 @@ def assess_weak_link_discrimination(state: StartaryGraphState) -> dict:
             )
             disc_dump = res.model_dump()
             disc_dump["should_clarify"] = clarify_flag
+            turn_telem = _record_llm_node_telemetry(
+                state, "assess_weak_link_discrimination", llm, "reasoning", latency_ms, attempt,
+                "WeakLinkDiscriminationLLMOutput", messages=messages, result=res,
+            )
             return {
+                "turn_telemetry": turn_telem,
                 "weak_link_discrimination": disc_dump,
                 "selection_confidence": conf_enum.value,
                 "competing_weak_areas": competing,
@@ -3949,7 +4314,12 @@ def assess_weak_link_discrimination(state: StartaryGraphState) -> dict:
     fallback_conf = "LOW" if (tie_count > 1 or sat_count > 1) else "MEDIUM"
     fallback_competing = [str(a.get("area")) for a in sorted_areas[:3] if a.get("area") != weak_area]
     fallback_clarify = (fallback_conf == "LOW") and turns_used < MAX_WEAK_LINK_CLARIFICATION_TURNS
+    fallback_telem = _record_llm_node_telemetry(
+        state, "assess_weak_link_discrimination", llm, "reasoning", 0.0, attempt,
+        "WeakLinkDiscriminationLLMOutput", status="FALLBACK",
+    )
     return {
+        "turn_telemetry": fallback_telem,
         "selection_confidence": fallback_conf,
         "competing_weak_areas": fallback_competing,
         "should_clarify": fallback_clarify,
@@ -4033,7 +4403,12 @@ def select_weak_link_question(state: StartaryGraphState) -> dict:
             )
 
             logger.info("select_weak_link_question | competing=%s qid=%s question=%s", competing, wl_qid, res.question[:70])
+            turn_telem = _record_llm_node_telemetry(
+                state, "select_weak_link_question", llm, "reasoning", latency_ms, attempt,
+                "WeakLinkClarifyingQuestionLLMOutput", messages=messages, result=res,
+            )
             return {
+                "turn_telemetry": turn_telem,
                 "active_next_turn_decision": wl_decision.model_dump(),
                 "current_weak_link_question": res.model_dump(),
                 "current_clarifying_question": {
@@ -4067,7 +4442,12 @@ def select_weak_link_question(state: StartaryGraphState) -> dict:
         clarification_reason=info_goal,
         planner_version=WEAK_LINK_CLARIFICATION_PROMPT_VERSION,
     )
+    fallback_telem = _record_llm_node_telemetry(
+        state, "select_weak_link_question", llm, "reasoning", 0.0, attempt,
+        "WeakLinkClarifyingQuestionLLMOutput", status="FALLBACK",
+    )
     return {
+        "turn_telemetry": fallback_telem,
         "active_next_turn_decision": fb_wl_decision.model_dump(),
         "current_weak_link_question": {
             "question": fallback_q,
@@ -4176,6 +4556,10 @@ def generate_experiment(state: StartaryGraphState) -> dict:
     ]
 
     res_info = get_llm_client_resolution_info(llm)
+    revision_round = int(state.get("critic_revision_count") or 0) + 1
+    run_metadata = {"revision_round": revision_round, "is_revision": bool(revision_instructions)}
+    request_messages = messages
+    failure_kinds: list[str] = []
     attempt = 0
     last_err = None
     while attempt < 2:
@@ -4183,17 +4567,21 @@ def generate_experiment(state: StartaryGraphState) -> dict:
         try:
             res, latency_ms = _invoke_structured_with_token_retry(
                 structured_llm=structured_llm,
-                messages=messages,
+                messages=request_messages,
                 settings=settings,
                 tier="reasoning",
                 base_max_tokens=base_max_tokens,
                 node_name="generate_experiment",
                 schema_cls=ExperimentGeneratorLLMOutput,
+                run_metadata=run_metadata,
             )
 
             res_data = res.model_dump() if hasattr(res, "model_dump") and isinstance(res.model_dump(), dict) else (res if isinstance(res, dict) else {})
             if isinstance(build_rd, dict) and build_rd.get("decision") == "BUILD_MINIMAL_PROTOTYPE":
                 res_data["experiment_type"] = ExperimentType.PROTOTYPE_TEST.value
+            # Milestone 6.2.5: code-owned stamp binding the draft to the assumption it was generated for
+            if active_assumption.get("id"):
+                res_data["assumption_id"] = active_assumption["id"]
 
             trace = AITrace(
                 module_name="generate_experiment",
@@ -4219,7 +4607,7 @@ def generate_experiment(state: StartaryGraphState) -> dict:
             # Token accounting with fallback character counting
             prompt_tokens = getattr(getattr(res, "usage_metadata", None), "prompt_tokens", None)
             if prompt_tokens is None:
-                prompt_tokens = sum(len(m.get("content", "")) for m in messages) // 4
+                prompt_tokens = sum(len(m.get("content", "")) for m in request_messages) // 4
             completion_tokens = getattr(getattr(res, "usage_metadata", None), "completion_tokens", None)
             if completion_tokens is None:
                 completion_tokens = len(_json.dumps(res_data)) // 4
@@ -4239,33 +4627,195 @@ def generate_experiment(state: StartaryGraphState) -> dict:
                 resolved_model=res_info["resolved_model"],
                 fallback_used=res_info["fallback_used"],
                 fallback_reason=res_info["fallback_reason"],
+                retry_count=attempt - 1,
+                model_tier="reasoning",
+                reasoning_effort=res_info.get("reasoning_effort"),
+                details={"revision_round": revision_round, "is_revision": bool(revision_instructions), "llm_failure_kinds": list(failure_kinds)},
             )
 
             exp_type = getattr(res, "experiment_type", res_data.get("experiment_type", "OTHER"))
             obj = getattr(res, "objective", res_data.get("objective", ""))
-            logger.info("generate_experiment | type=%s objective=%s (attempt=%d)", exp_type, obj[:60], attempt)
-            return {
+            logger.info("generate_experiment | type=%s objective=%s (attempt=%d round=%d)", exp_type, obj[:60], attempt, revision_round)
+            gen_updates: dict[str, Any] = {
                 "proposed_experiment_output": res_data,
+                "last_trace": trace.model_dump(mode="json"),
+                "traces": existing_traces,
+                "turn_telemetry": turn_telem,
+            }
+            if _revision_v2_enabled(settings):
+                gen_updates["experiment_revision"] = generation_record(state.get("experiment_revision"), is_revision=revision_round > 1)
+            return gen_updates
+        except Exception as exc:
+            last_err = exc
+            kind = classify_llm_failure(exc)
+            failure_kinds.append(kind)
+            logger.warning("generate_experiment failed attempt %d (%s): %s", attempt, kind, exc)
+            if kind in (LLMFailureKind.TOKEN_BUDGET_EXHAUSTED, LLMFailureKind.PERMANENT_API_ERROR):
+                break
+            if kind == LLMFailureKind.INVALID_STRUCTURED_OUTPUT:
+                request_messages = messages + [schema_correction_message(exc)]
+
+    _record_llm_node_telemetry(
+        state, "generate_experiment", llm, "reasoning", 0.0, attempt, "ExperimentGeneratorLLMOutput",
+        status="FAILED", details={"revision_round": revision_round, "llm_failure_kinds": list(failure_kinds)},
+    )
+    if isinstance(last_err, TokenBudgetExhaustedError):
+        raise last_err
+    raise RuntimeError(f"generate_experiment failed after {attempt} attempts. Error: {last_err}")
+
+
+def revise_experiment(state: StartaryGraphState) -> dict:
+    """
+    LLM Node (Milestone 6.2.6, STARTARY_EXPERIMENT_REVISION_V2 only): targeted edit of the rejected draft.
+
+    The reviser returns ONLY the fields that must change (ExperimentRevisionPatchLLMOutput); the patch
+    is applied to the preserved rejected draft, so untouched fields cannot regress. The merged draft
+    must satisfy ExperimentGeneratorLLMOutput (otherwise: one corrective retry). Records which
+    fields changed and whether the change is substantial (which forces a FULL re-critique).
+    """
+    project_id = state.get("project_id", "<unknown>")
+    rev = dict(state.get("experiment_revision") or {})
+    original = rev.get("rejected_draft")
+    critique = rev.get("rejected_critique") or {}
+    active_assumption = state.get("active_assumption") or {}
+    if not original or not active_assumption.get("statement"):
+        raise ValueError(f"revise_experiment | project_id={project_id}: rejected draft or active assumption missing.")
+    statement = active_assumption["statement"]
+    weak_area = state.get("weak_area") or str(active_assumption.get("area", "Problem"))
+    revision_round = int(state.get("critic_revision_count") or 0) + 1
+
+    build_rd = state.get("build_readiness") or {}
+    if isinstance(build_rd, dict) and build_rd.get("decision") == "BUILD_MINIMAL_PROTOTYPE":
+        build_guidance = (
+            "BUILD_MINIMAL_PROTOTYPE is authorized ONLY within this minimum scope: "
+            f"{'; '.join(build_rd.get('minimum_build_scope') or [])}. Must NOT build: {'; '.join(build_rd.get('must_not_build') or [])}."
+        )
+    else:
+        build_guidance = "CONTINUE_MANUAL: keep the experiment manual; do not propose building software."
+
+    contract_before = evaluate_experiment_contract(original, state)
+    user_msg = build_experiment_revision_user_message(
+        critical_assumption=statement,
+        weak_area=weak_area,
+        original_experiment_json=json.dumps(original, indent=2, default=str),
+        failed_dimensions=list(critique.get("failed_dimensions") or []),
+        critic_issues=list(critique.get("issues") or []),
+        revision_instructions=str(critique.get("revision_instructions") or ""),
+        deterministic_findings=[f.message for f in contract_before.violations + contract_before.advisories],
+        execution_context_json=json.dumps(_slim_facts(state.get("execution_context") or {}), indent=2, default=str),
+        startup_progress_json=json.dumps(_slim_facts(state.get("startup_progress") or {}), indent=2, default=str),
+        revision_round=revision_round,
+        build_readiness_guidance=build_guidance,
+    )
+    messages = [
+        {"role": "system", "content": EXPERIMENT_REVISION_SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
+
+    settings = get_settings()
+    base_max_tokens = 3500
+    llm = _safe_get_llm_client(settings, tier="reasoning", max_completion_tokens=base_max_tokens)
+    structured_llm = llm.with_structured_output(ExperimentRevisionPatchLLMOutput)
+    run_metadata = {"revision_round": revision_round, "revision_strategy": RevisionStrategy.TARGETED_EDIT.value}
+    request_messages = messages
+    failure_kinds: list[str] = []
+    attempt = 0
+    last_err = None
+    while attempt < 2:
+        attempt += 1
+        try:
+            res, latency_ms = _invoke_structured_with_token_retry(
+                structured_llm=structured_llm,
+                messages=request_messages,
+                settings=settings,
+                tier="reasoning",
+                base_max_tokens=base_max_tokens,
+                node_name="revise_experiment",
+                schema_cls=ExperimentRevisionPatchLLMOutput,
+                run_metadata=run_metadata,
+            )
+            patch = res.model_dump(mode="json", exclude_none=True) if hasattr(res, "model_dump") else dict(res or {})
+            revised = apply_revision_patch(original, patch)
+            # Code-owned fields: the hypothesis belongs to the assumption; safeguards are re-derived by validate.
+            revised["hypothesis"] = statement
+            if active_assumption.get("id"):
+                revised["assumption_id"] = active_assumption["id"]
+            if isinstance(build_rd, dict) and build_rd.get("decision") == "BUILD_MINIMAL_PROTOTYPE":
+                revised["experiment_type"] = ExperimentType.PROTOTYPE_TEST.value
+            for derived in ("remediation_codes", "required_authorizations", "authorization_status"):
+                revised.pop(derived, None)
+            # The merged draft must still be a valid experiment (raises ValidationError -> corrective retry).
+            ExperimentGeneratorLLMOutput(**{k: revised[k] for k in ExperimentGeneratorLLMOutput.model_fields if k in revised})
+
+            changed = diff_experiment(original, revised)
+            substantial = is_substantial_revision(original, revised, changed)
+            details = {
+                "revision_mode": "V2",
+                "revision_strategy": RevisionStrategy.TARGETED_EDIT.value,
+                "revision_round": revision_round,
+                "changed_fields": changed,
+                "substantial_change": substantial,
+                "next_critic_mode": CriticMode.FULL.value if substantial else CriticMode.FOCUSED.value,
+                "llm_failure_kinds": list(failure_kinds),
+            }
+            emit_decision_span("experiment_targeted_revision", details, tags=["node:revise_experiment", "revision:v2"])
+            turn_telem = _record_llm_node_telemetry(
+                state, "revise_experiment", llm, "reasoning", latency_ms, attempt,
+                "ExperimentRevisionPatchLLMOutput", messages=request_messages, result=res, details=details,
+            )
+            trace = AITrace(
+                module_name="revise_experiment",
+                prompt_version=EXPERIMENT_REVISION_PROMPT_VERSION,
+                input_data={"assumption_id": active_assumption.get("id"), "revision_round": revision_round,
+                            "failed_dimensions": list(critique.get("failed_dimensions") or [])},
+                output_data={"changed_fields": changed, "substantial_change": substantial},
+                latency_ms=latency_ms,
+                project_id=project_id,
+                execution_path=state.get("execution_path", "STRATEGIC_REASONING"),
+            )
+            existing_traces = list(state.get("traces") or [])
+            existing_traces.append(trace.model_dump(mode="json"))
+            logger.info("revise_experiment | round=%d changed=%s substantial=%s", revision_round, changed, substantial)
+            return {
+                "proposed_experiment_output": revised,
+                "experiment_revision": {
+                    **rev,
+                    "draft_origin": DraftOrigin.TARGETED_EDIT.value,
+                    "changed_fields": changed,
+                    "substantial_change": substantial,
+                    "next_strategy": None,
+                },
                 "last_trace": trace.model_dump(mode="json"),
                 "traces": existing_traces,
                 "turn_telemetry": turn_telem,
             }
         except Exception as exc:
             last_err = exc
-            logger.warning("generate_experiment failed attempt %d: %s", attempt, exc)
-            if is_permanent_model_error(exc) or isinstance(exc, TokenBudgetExhaustedError):
+            kind = classify_llm_failure(exc)
+            failure_kinds.append(kind)
+            logger.warning("revise_experiment failed attempt %d (%s): %s", attempt, kind, exc)
+            if kind in (LLMFailureKind.TOKEN_BUDGET_EXHAUSTED, LLMFailureKind.PERMANENT_API_ERROR):
                 break
+            if kind == LLMFailureKind.INVALID_STRUCTURED_OUTPUT:
+                request_messages = messages + [schema_correction_message(exc)]
 
+    _record_llm_node_telemetry(
+        state, "revise_experiment", llm, "reasoning", 0.0, attempt, "ExperimentRevisionPatchLLMOutput",
+        status="FAILED", details={"revision_round": revision_round, "llm_failure_kinds": list(failure_kinds)},
+    )
     if isinstance(last_err, TokenBudgetExhaustedError):
         raise last_err
-    raise RuntimeError(f"generate_experiment failed after {attempt} attempts. Error: {last_err}")
+    raise RuntimeError(f"revise_experiment failed after {attempt} attempts. Error: {last_err}")
 
 
 def validate_proposed_experiment(state: StartaryGraphState) -> dict:
     """
-    Deterministic Node:
-    Validates structural completeness and parameters of the proposed experiment
-    before sending it to the Experiment Critic.
+    Deterministic Node: normalizes the generated draft before critique.
+
+    Milestone 6.2.5: draft defects no longer raise. A raised ValueError used to abort the graph,
+    and /retry re-validated the same committed draft, so it could never recover. Defects are now
+    evaluated by the shared experiment contract and turned into a deterministic REVISE by
+    critique_experiment, which keeps them inside the bounded revision loop.
     """
     project_id = state.get("project_id", "<unknown>")
     exp_output = state.get("proposed_experiment_output")
@@ -4275,45 +4825,70 @@ def validate_proposed_experiment(state: StartaryGraphState) -> dict:
     if not exp_output:
         raise ValueError(f"validate_proposed_experiment | project_id={project_id}: proposed_experiment_output missing.")
 
-    # 1. Non-empty required fields
-    required_str_fields = [
-        "objective", "method", "evidence_to_collect",
-        "support_signal", "contradiction_signal", "inconclusive_signal"
-    ]
-    for field in required_str_fields:
-        val = (exp_output.get(field) or "").strip()
-        if len(val) < 5:
-            raise ValueError(f"validate_proposed_experiment | field '{field}' is empty or too short: '{val}'")
-
-    if not exp_output.get("founder_actions"):
-        raise ValueError("validate_proposed_experiment | founder_actions cannot be empty.")
-
-    if not exp_output.get("valid_inferences"):
-        raise ValueError("validate_proposed_experiment | valid_inferences cannot be empty.")
-
-    if not exp_output.get("invalid_inferences"):
-        raise ValueError("validate_proposed_experiment | invalid_inferences cannot be empty.")
-
-    # 2. Hypothesis alignment
-    if not exp_output.get("hypothesis") or exp_output.get("hypothesis") != statement:
+    exp_output = dict(exp_output)
+    # Grounding: the experiment's hypothesis is owned by the active critical assumption.
+    if statement and exp_output.get("hypothesis") != statement:
         exp_output["hypothesis"] = statement
 
-    # 3. Fake precision validation on parameters
+    # Fake precision is flagged for the critic's judgement, not rewritten.
     for p in exp_output.get("parameters") or []:
         val_str = str(p.get("value", ""))
         if re.search(r"\b\d+\.\d+%", val_str) or re.search(r"\b\d+\.\d+\s*(?:users|customers|sellers|people)\b", val_str):
-            logger.warning("validate_proposed_experiment: parameter '%s' contains fake precision '%s'. Normalizing.", p.get("name"), val_str)
+            logger.warning("validate_proposed_experiment: parameter '%s' contains fake precision '%s'.", p.get("name"), val_str)
 
-    logger.info("validate_proposed_experiment | experiment validated for critic evaluation.")
-    return {
-        "proposed_experiment_output": exp_output,
-    }
+    contract = evaluate_experiment_contract(exp_output, state)
+    updates: dict[str, Any] = {}
+    if _revision_v2_enabled(get_settings()):
+        # Milestone 6.2.6: consent-class violations are repaired deterministically (no LLM call, no
+        # semantic revision consumed). The repair is kept only if the contract then passes in full.
+        violations_before = contract.violation_codes
+        remediation = remediate_consent_violations(exp_output, contract)
+        outcome = remediation.skipped_reason
+        if remediation.applied:
+            after = evaluate_experiment_contract(remediation.draft, state)
+            if after.violations:
+                outcome = "REMEDIATION_INSUFFICIENT"
+            else:
+                exp_output, contract, outcome = remediation.draft, after, "APPLIED"
+        if violations_before:
+            meta = {
+                "revision_mode": "V2",
+                "revision_strategy": RevisionStrategy.DETERMINISTIC_REMEDIATION.value,
+                "remediation_applied": outcome == "APPLIED",
+                "remediation_codes": remediation.applied_codes if outcome == "APPLIED" else [],
+                "remediation_outcome": outcome,
+                "violations_before": violations_before,
+                "contract_violation_codes": contract.violation_codes,
+            }
+            emit_decision_span("experiment_remediation", meta, tags=["node:validate_proposed_experiment", "revision:v2"])
+            updates["turn_telemetry"] = record_telemetry_event(
+                state=state, node_name="validate_proposed_experiment", model_name="deterministic",
+                skipped_by_fast_path=True, model_tier="none", details=meta,
+            )
+        # A permission STEP is a task, not a grant: authorization stays PENDING until the founder confirms it.
+        auths = required_authorizations(exp_output, state)
+        exp_output["required_authorizations"] = auths
+        exp_output["authorization_status"] = "PENDING" if auths else None
+
+    logger.info(
+        "validate_proposed_experiment | violations=%s advisories=%s",
+        contract.violation_codes, contract.advisory_codes,
+    )
+    updates["proposed_experiment_output"] = exp_output
+    return updates
 
 
 def critique_experiment(state: StartaryGraphState) -> dict:
     """
     LLM Node: Evaluates proposed experiment for assumption alignment, evidence validity,
     feasibility, cost efficiency, and falsifiability. Decides ACCEPT or REVISE.
+
+    Milestone 6.2.5:
+    - Deterministic contract violations REVISE without an LLM call; advisories go to the critic.
+    - Strict, fail-closed verdict: ACCEPT only when verdict == ACCEPT and all six dimensions PASS.
+    - Bounded recovery: token exhaustion / permanent errors stop; invalid output retries once
+      with schema feedback; transient errors retry once.
+    - Every decision records non-sensitive metadata in telemetry and as a LangSmith span.
     """
     project_id = state.get("project_id", "<unknown>")
     active_assumption = state.get("active_assumption") or {}
@@ -4333,48 +4908,60 @@ def critique_experiment(state: StartaryGraphState) -> dict:
         founder_evidence_summary = (state.get("raw_context", "") or "")[:500]
 
     revision_count = state.get("critic_revision_count", 0)
+    revision_round = int(revision_count or 0) + 1
+    contract = evaluate_experiment_contract(exp_output, state)
+    settings = get_settings()
+    v2 = _revision_v2_enabled(settings)
+    rev = dict(state.get("experiment_revision") or {}) if v2 else {}
+    prior_critique = (rev.get("rejected_critique") or {}) if rev.get("draft_origin") in (DraftOrigin.TARGETED_EDIT.value, DraftOrigin.FULL_REGENERATION.value) else {}
+    # M6.2.6: a targeted edit that changed nothing would be rejected again; do it without a critic call.
+    no_effective_change = v2 and rev.get("draft_origin") == DraftOrigin.TARGETED_EDIT.value and rev.get("changed_fields") == []
 
-    # Deterministic Critic Pre-Checks (Milestone M4.1.4):
-    # Intercepts objective structural faults in 0ms without consuming reasoning LLM tokens.
-    deterministic_issues: list[str] = []
-
-    sample_size = exp_output.get("target_sample_size")
-    if sample_size is not None and isinstance(sample_size, (int, float)) and sample_size <= 0:
-        deterministic_issues.append("Target sample size must be explicitly specified and >= 1.")
-
-    exp_type = str(exp_output.get("experiment_type", "OTHER")).upper()
-    if exp_type in ("PROTOTYPE_TEST", "MVP_TEST", "USABILITY_TEST"):
-        mvp_field = prog.get("mvp_exists")
-        mvp_val = mvp_field.get("value") if isinstance(mvp_field, dict) else mvp_field
-        if str(mvp_val).lower() not in ("true", "yes"):
-            deterministic_issues.append("Experiment requires testing a working prototype, but no prototype exists yet.")
-
-    budget_field = exec_ctx.get("monthly_budget") or {}
-    budget_val = budget_field.get("value") if isinstance(budget_field, dict) else getattr(budget_field, "value", None)
-    est_cost = str(exp_output.get("estimated_cost") or "").lower()
-    if budget_val in ("$0", "0", 0, "$0/mo") and any(c in est_cost for c in ["$", "dollar", "paid ads", "hire", "purchase"]) and not any(z in est_cost for z in ["$0", "zero", "free", "no cost"]):
-        deterministic_issues.append("Experiment requires financial budget exceeding founder's $0 constraint.")
-
-    exp_asmp_id = exp_output.get("assumption_id")
-    act_asmp_id = active_assumption.get("id")
-    if exp_asmp_id and act_asmp_id and str(exp_asmp_id) != str(act_asmp_id):
-        deterministic_issues.append(f"Experiment assumption_id '{exp_asmp_id}' does not match active assumption '{act_asmp_id}'.")
-
-    if deterministic_issues:
-        logger.info("critique_experiment | deterministic pre-checks triggered REVISE: %s", deterministic_issues)
+    if contract.violations or no_effective_change:
+        if contract.violations:
+            decision = deterministic_decision(contract)
+            issues = [v.message for v in contract.violations]
+            instructions = contract.revision_instructions
+            rationale = f"Deterministic contract check found {len(issues)} violation(s): {', '.join(contract.violation_codes)}."
+        else:
+            prior_failed = list(prior_critique.get("failed_dimensions") or [])
+            decision = CriticDecision(
+                "REVISE", None, {d: ("FAIL" if d in prior_failed else "NOT_EVALUATED") for d in CRITIC_DIMENSIONS},
+                prior_failed, False, "DETERMINISTIC",
+            )
+            issues = ["The targeted revision did not change the rejected experiment."]
+            instructions = prior_critique.get("revision_instructions") or issues[0]
+            rationale = "Targeted revision made no effective change."
         precheck_res = ExperimentCriticLLMOutput(
             verdict="REVISE",
-            issues=deterministic_issues,
-            assumption_alignment="FAIL" if any("assumption" in iss.lower() or "hypothesis" in iss.lower() for iss in deterministic_issues) else "PASS",
-            evidence_validity="FAIL" if any("sample" in iss.lower() for iss in deterministic_issues) else "PASS",
-            feasibility="FAIL" if any("budget" in iss.lower() or "prototype" in iss.lower() for iss in deterministic_issues) else "PASS",
-            cost_efficiency="PASS",
-            falsifiability="PASS",
-            scope="PASS",
-            revision_instructions=" ".join(deterministic_issues),
-            rationale=f"Deterministic structural pre-check identified {len(deterministic_issues)} issue(s): " + "; ".join(deterministic_issues),
+            issues=issues,
+            **{d: ("FAIL" if d in decision.failed_dimensions else "PASS") for d in decision.dimensions},
+            revision_instructions=instructions,
+            rationale=rationale,
         )
-        res_data = precheck_res.model_dump()
+        res_data = precheck_res.model_dump(mode="json")
+        res_data.update({
+            "decision_source": decision.decision_source,
+            "failed_dimensions": decision.failed_dimensions,
+            "contract_violation_codes": contract.violation_codes,
+            "revision_round": revision_round,
+        })
+        det_strategy = select_revision_strategy("DETERMINISTIC", decision.failed_dimensions, contract.violation_codes, None) if v2 else None
+        meta = critic_decision_metadata(
+            decision, revision_round=revision_round, revision_count_after=revision_count + 1,
+            issues=issues, contract=contract, attempts=0, failure_kinds=[],
+            revision_strategy=det_strategy,
+            extra=critic_v2_metadata(
+                rev, exp_output, decision, CriticMode.DETERMINISTIC.value, det_strategy,
+                reason_codes=["NO_EFFECTIVE_CHANGE"] if no_effective_change and not contract.violations else [],
+            ) if v2 else None,
+        )
+        emit_decision_span("experiment_critic_decision", meta, tags=["node:critique_experiment", "decision:deterministic"])
+        turn_telem = record_telemetry_event(
+            state=state, node_name="critique_experiment", model_name="deterministic_precheck",
+            skipped_by_fast_path=True, execution_path=state.get("execution_path", "STRATEGIC_REASONING"),
+            model_tier="none", schema_name="ExperimentCriticLLMOutput", details=meta,
+        )
         trace = AITrace(
             module_name="critique_experiment",
             prompt_version=EXPERIMENT_CRITIC_PROMPT_VERSION,
@@ -4394,19 +4981,28 @@ def critique_experiment(state: StartaryGraphState) -> dict:
         )
         existing_traces = list(state.get("traces") or [])
         existing_traces.append(trace.model_dump(mode="json"))
-        return {
+        logger.info("critique_experiment | deterministic REVISE codes=%s round=%d", contract.violation_codes, revision_round)
+        det_updates: dict[str, Any] = {
             "experiment_critic_output": res_data,
             "critic_revision_count": revision_count + 1,
-            "critic_revision_instructions": " ".join(deterministic_issues),
+            "critic_revision_instructions": instructions,
             "traces": existing_traces,
             "last_trace": trace.model_dump(mode="json"),
+            "turn_telemetry": turn_telem,
             "phase": WorkflowPhase.TEST,
         }
+        if v2:
+            det_updates["experiment_revision"] = rejection_record(
+                rev, exp_output, decision, issues, instructions, CriticMode.DETERMINISTIC.value, None, det_strategy, revision_round,
+            )
+        return det_updates
 
-    settings = get_settings()
+    critic_mode = select_critic_mode(rev) if v2 else CriticMode.FULL.value
+    focused = v2 and critic_mode == CriticMode.FOCUSED.value
+    schema_cls = ExperimentFocusedCriticLLMOutput if focused else (ExperimentCriticV2LLMOutput if v2 else ExperimentCriticLLMOutput)
     base_max_tokens = 2500
     llm = _safe_get_llm_client(settings, tier="reasoning", max_tokens=base_max_tokens)
-    structured_llm = llm.with_structured_output(ExperimentCriticLLMOutput)
+    structured_llm = llm.with_structured_output(schema_cls)
 
     exec_ctx_slimmed = {
         k: (v.get("value") if isinstance(v, dict) and "value" in v else v)
@@ -4419,22 +5015,47 @@ def critique_experiment(state: StartaryGraphState) -> dict:
         if v and (not isinstance(v, dict) or v.get("value") not in (None, "UNKNOWN", ""))
     }
 
-    user_msg = build_experiment_critic_user_message(
-        critical_assumption=statement,
-        weak_area=weak_area,
-        reality_check_summary=rc.get("summary", ""),
-        proposed_experiment_json=json.dumps(exp_output, indent=2, default=str),
-        execution_context_json=json.dumps(exec_ctx_slimmed, indent=2, default=str),
-        startup_progress_json=json.dumps(prog_slimmed, indent=2, default=str),
-        founder_evidence_summary=founder_evidence_summary,
-    )
+    if focused:
+        # M6.2.6: verify the original issues against the changed fields; all six dimensions re-evaluated.
+        prior = rev.get("rejected_critique") or {}
+        changes = change_summary(rev.get("rejected_draft") or {}, exp_output, list(rev.get("changed_fields") or []))
+        user_msg = build_experiment_focused_critic_user_message(
+            critical_assumption=statement,
+            weak_area=weak_area,
+            revised_experiment_json=json.dumps(exp_output, indent=2, default=str),
+            changes_json=json.dumps(changes, indent=2, default=str),
+            original_verdict=str(prior.get("verdict") or "REVISE"),
+            original_dimensions=prior.get("dimensions") or {},
+            original_issues=list(prior.get("issues") or []),
+            execution_context_json=json.dumps(exec_ctx_slimmed, indent=2, default=str),
+            startup_progress_json=json.dumps(prog_slimmed, indent=2, default=str),
+            deterministic_notes=[a.message for a in contract.advisories],
+        )
+        system_prompt = EXPERIMENT_FOCUSED_CRITIC_SYSTEM_PROMPT
+        prompt_version = EXPERIMENT_FOCUSED_CRITIC_PROMPT_VERSION
+    else:
+        user_msg = build_experiment_critic_user_message(
+            critical_assumption=statement,
+            weak_area=weak_area,
+            reality_check_summary=rc.get("summary", ""),
+            proposed_experiment_json=json.dumps(exp_output, indent=2, default=str),
+            execution_context_json=json.dumps(exec_ctx_slimmed, indent=2, default=str),
+            startup_progress_json=json.dumps(prog_slimmed, indent=2, default=str),
+            founder_evidence_summary=founder_evidence_summary,
+            deterministic_notes=[a.message for a in contract.advisories],
+        )
+        system_prompt = EXPERIMENT_CRITIC_SYSTEM_PROMPT + (("\n\n" + EXPERIMENT_CRITIC_REVISION_SCOPE_ADDENDUM) if v2 else "")
+        prompt_version = EXPERIMENT_CRITIC_PROMPT_VERSION
 
     messages = [
-        {"role": "system", "content": EXPERIMENT_CRITIC_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_msg},
     ]
 
     res_info = get_llm_client_resolution_info(llm)
+    run_metadata = {"revision_round": revision_round, **({"critic_mode": critic_mode} if v2 else {})}
+    request_messages = messages
+    failure_kinds: list[str] = []
     attempt = 0
     last_err = None
     while attempt < 2:
@@ -4442,19 +5063,45 @@ def critique_experiment(state: StartaryGraphState) -> dict:
         try:
             res, latency_ms = _invoke_structured_with_token_retry(
                 structured_llm=structured_llm,
-                messages=messages,
+                messages=request_messages,
                 settings=settings,
                 tier="reasoning",
                 base_max_tokens=base_max_tokens,
                 node_name="critique_experiment",
-                schema_cls=ExperimentCriticLLMOutput,
+                schema_cls=schema_cls,
+                run_metadata=run_metadata,
             )
 
-            res_data = res.model_dump() if hasattr(res, "model_dump") and isinstance(res.model_dump(), dict) else (res if isinstance(res, dict) else {})
+            res_data = res.model_dump(mode="json") if hasattr(res, "model_dump") and isinstance(res.model_dump(), dict) else (res if isinstance(res, dict) else {})
+            res_data = dict(res_data)
+            decision = interpret_critic_output(res_data)
+            if focused:
+                decision = apply_focused_acceptance_rule(decision, res_data)
+            issues = list(res_data.get("issues") or [])
+            next_strategy = (
+                select_revision_strategy("LLM", decision.failed_dimensions, [], res_data.get("revision_scope"))
+                if v2 and decision.verdict == "REVISE" else None
+            )
+            res_data.update({
+                "verdict": decision.verdict,
+                "model_verdict": decision.model_verdict,
+                "verdict_flag_conflict": decision.verdict_flag_conflict,
+                "failed_dimensions": decision.failed_dimensions,
+                "decision_source": decision.decision_source,
+                "revision_round": revision_round,
+            })
+            revision_count_after = revision_count + 1 if decision.verdict == "REVISE" else revision_count
+            meta = critic_decision_metadata(
+                decision, revision_round=revision_round, revision_count_after=revision_count_after,
+                issues=issues, contract=contract, attempts=attempt, failure_kinds=failure_kinds,
+                revision_strategy=next_strategy,
+                extra=critic_v2_metadata(rev, exp_output, decision, critic_mode, next_strategy, raw=res_data) if v2 else None,
+            )
+            emit_decision_span("experiment_critic_decision", meta, tags=["node:critique_experiment", "decision:llm"])
 
             trace = AITrace(
                 module_name="critique_experiment",
-                prompt_version=EXPERIMENT_CRITIC_PROMPT_VERSION,
+                prompt_version=prompt_version,
                 input_data={
                     "assumption_id": active_assumption.get("id"),
                     "experiment_type": exp_output.get("experiment_type"),
@@ -4473,43 +5120,16 @@ def critique_experiment(state: StartaryGraphState) -> dict:
             existing_traces = list(state.get("traces") or [])
             existing_traces.append(trace.model_dump(mode="json"))
 
-            # Token accounting with fallback character counting
-            prompt_tokens = getattr(getattr(res, "usage_metadata", None), "prompt_tokens", None)
-            if prompt_tokens is None:
-                prompt_tokens = sum(len(m.get("content", "")) for m in messages) // 4
-            completion_tokens = getattr(getattr(res, "usage_metadata", None), "completion_tokens", None)
-            if completion_tokens is None:
-                completion_tokens = len(_json.dumps(res_data)) // 4
-            total_tokens = prompt_tokens + completion_tokens
-
-            turn_telem = record_telemetry_event(
-                state=state,
-                node_name="critique_experiment",
-                model_name=res_info["resolved_model"] or getattr(settings, "reasoning_model_name", None) or "reasoning_tier",
-                duration_ms=latency_ms,
-                latency_ms=latency_ms,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_tokens,
-                execution_path=state.get("execution_path", "STRATEGIC_REASONING"),
-                configured_model=res_info["configured_model"],
-                resolved_model=res_info["resolved_model"],
-                fallback_used=res_info["fallback_used"],
-                fallback_reason=res_info["fallback_reason"],
+            turn_telem = _record_llm_node_telemetry(
+                state, "critique_experiment", llm, "reasoning", latency_ms, attempt,
+                schema_cls.__name__, messages=request_messages, result=res, details=meta,
             )
 
-            verdict_raw = getattr(res, "verdict", res_data.get("verdict", "REVISE"))
-            verdict_norm = str(verdict_raw).upper().strip()
-            if "ACCEPT" in verdict_norm:
-                verdict_norm = "ACCEPT"
-            else:
-                verdict_norm = "REVISE"
-            if hasattr(res, "verdict"):
-                res.verdict = verdict_norm
-            res_data["verdict"] = verdict_norm
-
-            issues = getattr(res, "issues", res_data.get("issues", []))
-            logger.info("critique_experiment | verdict=%s revision_count=%d issues=%s", verdict_norm, revision_count, issues)
+            logger.info(
+                "critique_experiment | verdict=%s model_verdict=%s conflict=%s failed=%s round=%d issue_codes=%s",
+                decision.verdict, decision.model_verdict, decision.verdict_flag_conflict,
+                decision.failed_dimensions, revision_round, meta["issue_codes"],
+            )
 
             updates: dict[str, Any] = {
                 "experiment_critic_output": res_data,
@@ -4518,17 +5138,36 @@ def critique_experiment(state: StartaryGraphState) -> dict:
                 "turn_telemetry": turn_telem,
             }
 
-            if verdict_norm == "REVISE":
-                updates["critic_revision_count"] = revision_count + 1
-                updates["critic_revision_instructions"] = res.revision_instructions or "; ".join(res.issues)
+            if decision.verdict == "REVISE":
+                updates["critic_revision_count"] = revision_count_after
+                updates["critic_revision_instructions"] = (
+                    (res_data.get("revision_instructions") or "").strip()
+                    or "; ".join(str(i) for i in issues)
+                    or (f"Resolve the failing quality dimensions: {', '.join(decision.failed_dimensions)}." if decision.failed_dimensions else "")
+                    or str(res_data.get("rationale") or "")
+                )
+                if v2:
+                    updates["experiment_revision"] = rejection_record(
+                        rev, exp_output, decision, issues + list(res_data.get("new_blocking_issues") or []),
+                        updates["critic_revision_instructions"], critic_mode, res_data.get("revision_scope"),
+                        next_strategy, revision_round,
+                    )
 
             return updates
         except Exception as exc:
             last_err = exc
-            logger.warning("critique_experiment failed attempt %d: %s", attempt, exc)
-            if is_permanent_model_error(exc):
+            kind = classify_llm_failure(exc)
+            failure_kinds.append(kind)
+            logger.warning("critique_experiment failed attempt %d (%s): %s", attempt, kind, exc)
+            if kind in (LLMFailureKind.TOKEN_BUDGET_EXHAUSTED, LLMFailureKind.PERMANENT_API_ERROR):
                 break
+            if kind == LLMFailureKind.INVALID_STRUCTURED_OUTPUT:
+                request_messages = messages + [schema_correction_message(exc)]
 
+    _record_llm_node_telemetry(
+        state, "critique_experiment", llm, "reasoning", 0.0, attempt, "ExperimentCriticLLMOutput",
+        status="FAILED", details={"revision_round": revision_round, "critic_attempts": attempt, "llm_failure_kinds": list(failure_kinds)},
+    )
     if isinstance(last_err, TokenBudgetExhaustedError):
         raise last_err
     raise RuntimeError(f"critique_experiment failed after {attempt} attempts. Error: {last_err}")
@@ -4590,12 +5229,18 @@ def save_final_experiment(state: StartaryGraphState) -> dict:
         created_iteration=iteration,
     )
 
+    saved = exp.model_dump(mode="json")
+    # Milestone 6.2.6 (V2 drafts only): permissions the founder must still obtain. Never marked OBTAINED here.
+    if exp_output.get("required_authorizations"):
+        saved["required_authorizations"] = list(exp_output["required_authorizations"])
+        saved["authorization_status"] = exp_output.get("authorization_status") or "PENDING"
+
     prev_experiments = list(state.get("previous_experiments") or [])
-    prev_experiments.append(exp.model_dump(mode="json"))
+    prev_experiments.append(dict(saved))
 
     logger.info("save_final_experiment | experiment_id=%s type=%s status=READY", exp.id, exp.experiment_type)
     return {
-        "active_experiment": exp.model_dump(mode="json"),
+        "active_experiment": saved,
         "previous_experiments": prev_experiments,
         "phase": WorkflowPhase.TEST,
     }
@@ -4711,6 +5356,16 @@ def resolve_customer_access(state: StartaryGraphState) -> CustomerAccessAssessme
         if kw in all_msgs_text:
             evidence_sources.append(f"conversation history: mentioned '{kw}'")
 
+    access_indicators = [
+        "access to", "relationships with", "relationship with", "agreed to test",
+        "agreed to participate", "agreed to review", "partner teams", "partner clubs",
+        "coaches agreed", "teams agreed", "district supervisors", "pilot agreement",
+    ]
+    for ind in access_indicators:
+        if ind in all_msgs_text:
+            evidence_sources.append(f"conversation history: mentioned '{ind}'")
+            break
+
     # 5. Check historical evidence submissions
     if founder_evidence:
         evidence_sources.append(f"historical evidence: {len(founder_evidence)} completed experiment submission(s)")
@@ -4734,6 +5389,7 @@ def resolve_customer_access(state: StartaryGraphState) -> CustomerAccessAssessme
         or any("existing_audience:" in s for s in evidence_sources)
         or any(("active_users_count" in s or "paying_customers_count" in s) for s in evidence_sources)
         or any("audience" in s.lower() for s in evidence_sources)
+        or any(("access to" in s.lower() or "agreed to test" in s.lower() or "teams agreed" in s.lower() or "coaches agreed" in s.lower()) for s in evidence_sources)
     )
 
     if has_established_access:
@@ -4778,18 +5434,17 @@ def assess_can_execute(state: StartaryGraphState) -> dict:
     missing_requirements: list[str] = []
     blockers: list[str] = []
 
-    # 1. Prototype requirement check
-    if exp_type == ExperimentType.PROTOTYPE_TEST.value:
-        mvp_field = prog.get("mvp_exists")
-        mvp_val = mvp_field.get("value") if isinstance(mvp_field, dict) else mvp_field
-        if str(mvp_val).lower() not in ("true", "yes"):
-            missing_requirements.append(
-                "Experiment requires testing a working prototype, but no prototype exists yet."
-            )
+    # 1. Prototype requirement check (Milestone 6.2.5: shared with the critic's contract check, so an
+    # authorized BUILD_MINIMAL_PROTOTYPE probe is not reported as "no prototype exists")
+    prototype = assess_prototype_requirement(exp_type, prog, state.get("build_readiness"))
+    if prototype.status in (PrototypeStatus.UNAVAILABLE, PrototypeStatus.BUILD_SCOPE_UNDEFINED):
+        missing_requirements.append(
+            "Experiment requires testing a working prototype, but no prototype exists yet."
+        )
 
     # 2. Customer access check (Milestone 4.0.1)
     access_assessment = resolve_customer_access(state)
-    sample_needed = exp_dict.get("sample_size") or "qualifying participants"
+    sample_needed = exp_dict.get("target_sample_size") or "qualifying participants"
 
     if required_access or exp_type in (ExperimentType.PROBLEM_INTERVIEW.value, ExperimentType.PROTOTYPE_TEST.value):
         req_str = ", ".join(required_access) if required_access else "target customer segment"
@@ -4803,25 +5458,20 @@ def assess_can_execute(state: StartaryGraphState) -> dict:
             )
         # If ESTABLISHED, access requirement is satisfied without missing requirement!
 
-    # 3. Budget check
-    budget_field = exec_ctx.get("available_budget_amount")
-    if isinstance(budget_field, dict) and budget_field.get("value") is not None and budget_field.get("provenance") != "UNKNOWN":
-        try:
-            available_amt = float(budget_field.get("value", 0))
-            cost_matches = re.findall(r"\$?\b(\d+)\b", estimated_cost)
-            if cost_matches:
-                estimated_amt = float(cost_matches[0])
-                if estimated_amt > available_amt and estimated_amt > 0:
-                    if available_amt == 0 and estimated_amt > 100:
-                        blockers.append(
-                            f"Estimated cost (${estimated_amt:.0f}) exceeds zero available budget."
-                        )
-                    else:
-                        missing_requirements.append(
-                            f"Estimated cost (${estimated_amt:.0f}) exceeds available budget (${available_amt:.0f})."
-                        )
-        except (ValueError, TypeError):
-            pass
+    # 3. Budget check (Milestone 6.2.5: currency-anchored parsing shared with the critic's contract;
+    # "$1,500" is 1500, "$50 over 2 weeks" is 50, and an unknown budget is never treated as zero)
+    budget_cmp = compare_cost_to_budget(exp_dict.get("estimated_cost"), exec_ctx)
+    if budget_cmp.status == BudgetStatus.EXCEEDS_BUDGET:
+        estimated_amt = budget_cmp.cost.low
+        available_amt = budget_cmp.budget.high
+        if available_amt == 0 and estimated_amt > 100:
+            blockers.append(
+                f"Estimated cost (${estimated_amt:.0f}) exceeds zero available budget."
+            )
+        else:
+            missing_requirements.append(
+                f"Estimated cost (${estimated_amt:.0f}) exceeds available budget (${available_amt:.0f})."
+            )
 
     # Determine readiness
     if blockers:
@@ -4833,6 +5483,12 @@ def assess_can_execute(state: StartaryGraphState) -> dict:
     else:
         readiness = ExecutionReadiness.CAN_EXECUTE
         reason = "Founder has sufficient capacity, access, and budget to execute this experiment immediately."
+        pending = pending_authorizations(exp_dict)
+        if pending:
+            reason = (
+                "Founder has the capacity, access, and budget for this experiment, but it may start only after these "
+                f"permissions are obtained (not yet obtained): {', '.join(pending)}."
+            )
 
     # Grounding & contradiction guard (Milestone 4.0.1)
     if access_assessment.access_status != CustomerAccessStatus.NONE:
@@ -4851,7 +5507,6 @@ def assess_can_execute(state: StartaryGraphState) -> dict:
     logger.info("assess_can_execute | readiness=%s access_status=%s reason=%s", readiness, access_assessment.access_status.value, reason[:80])
     return {
         "can_execute_result": assessment.model_dump(mode="json"),
-        "customer_access_assessment": access_assessment.model_dump(mode="json"),
         "phase": WorkflowPhase.TEST,
     }
 
@@ -5295,6 +5950,24 @@ def interpret_founder_turn(state: StartaryGraphState) -> dict:
             if detected_goal:
                 res_data["detected_founder_goal"] = detected_goal
 
+            # 8. Deterministic guard: Initial onboarding / intake context is NOT empirical evidence
+            # (ordinary facts like team, hours, budget, customer access are baseline context/answer, not experiment evidence)
+            is_initial_turn = (latest_turn_index == 0) or (pending_question is None)
+            is_intake_phase = (
+                str(state.get("phase", "")).upper() in ("UNDERSTAND", "WORKFLOWPHASE.UNDERSTAND")
+                and state.get("clarification_turn_count", 0) == 0
+            )
+            has_no_active_exp = not (state.get("active_experiment") or state.get("evidence_submissions"))
+            if (is_initial_turn or is_intake_phase or has_no_active_exp) and "NEW_EVIDENCE" in intent_types:
+                has_empirical_evidence = any(kw in msg_lower for kw in [
+                    "conducted interviews", "interviewed", "survey results", "tested with users",
+                    "experiment result", "pilot results", "retention data", "conversion rate",
+                ])
+                if not has_empirical_evidence:
+                    logger.info("interpret_founder_turn | sanitizing NEW_EVIDENCE on turn %d (intake/context message)", latest_turn_index)
+                    intent_types = [it for it in intent_types if it != "NEW_EVIDENCE"]
+                    res_data["new_evidence_summary"] = None
+
             # Priority escalation: HIGH if question, concern, correction, inabilities, or claim
             if has_question or has_concern or is_correction or is_cannot_act or is_dnk or is_already_ans:
                 res_data["response_priority"] = "HIGH"
@@ -5390,6 +6063,10 @@ def interpret_founder_turn(state: StartaryGraphState) -> dict:
         resolved_model="local_deterministic" if used_fallback else res_info["resolved_model"],
         fallback_used=True if used_fallback else res_info["fallback_used"],
         fallback_reason=f"fast_fail_error: {last_error}" if used_fallback else res_info["fallback_reason"],
+        model_tier="fast",
+        reasoning_effort=res_info.get("reasoning_effort"),
+        status="FALLBACK" if used_fallback else "SUCCESS",
+        retry_count=max(0, attempt - 1),
     )
 
     updates = {
@@ -5437,6 +6114,189 @@ def interpret_founder_turn(state: StartaryGraphState) -> dict:
         (updates.get("founder_current_goal") or {}).get("goal_type"),
         is_repair,
     )
+    return updates
+
+
+# ---------------------------------------------------------------------------
+# Milestone 6.2.7: safe parallel understanding (STARTARY_PARALLEL_UNDERSTANDING only)
+# ---------------------------------------------------------------------------
+#
+# interpret_founder_turn and extract_startup_state read disjoint inputs and neither consumes the
+# other's output. The route after interpretation is a deterministic function of state that exists
+# BEFORE interpretation (repair flags / repair phrasing of the latest founder message / phase), so the
+# extraction decision is made up front: both nodes run concurrently only on turns the sequential graph
+# would extract anyway. Their only shared writes (traces, last_trace, turn_telemetry) are isolated per
+# branch and merged deterministically by join_founder_turn in sequential order (interpretation first).
+
+_DISPATCH_REASONS = {
+    "extract_startup_state": "UNDERSTAND_TURN",
+    "handle_conversational_repair": "CONVERSATIONAL_REPAIR",
+    "classify_waiting_for_evidence_turn": "WAITING_FOR_EVIDENCE",
+}
+
+
+def _latest_founder_text(state: StartaryGraphState) -> str:
+    for msg in reversed(state.get("founder_messages") or []):
+        if msg.get("role") == "founder":
+            return (msg.get("content") or "").strip()
+    return ""
+
+
+def founder_turn_route(state: StartaryGraphState) -> str:
+    """
+    The route route_after_interpret_founder_turn will take, computed BEFORE interpretation from the
+    same deterministic inputs: interpret_founder_turn only sets the repair flags when the state already
+    has them or is_conversational_repair_text(latest founder message) is true, and never changes phase.
+    """
+    latest = _latest_founder_text(state)
+    if (
+        state.get("is_conversational_repair")
+        or state.get("execution_path") == "CONVERSATIONAL_REPAIR"
+        or (latest and is_conversational_repair_text(latest))
+    ):
+        return "handle_conversational_repair"
+    phase = state.get("phase")
+    if phase == WorkflowPhase.WAITING_FOR_EVIDENCE or phase == "WAITING_FOR_EVIDENCE":
+        return "classify_waiting_for_evidence_turn"
+    return "extract_startup_state"
+
+
+def dispatch_founder_turn(state: StartaryGraphState) -> dict:
+    """
+    Deterministic Node (M6.2.7): decide whether this founder turn runs interpretation and extraction
+    concurrently (PARALLEL: the turn will be extracted anyway) or interpretation alone (SEQUENTIAL:
+    repair / evidence turns, which never extract, so no speculative extraction call is made).
+    """
+    route = founder_turn_route(state)
+    mode = "PARALLEL" if route == "extract_startup_state" else "SEQUENTIAL"
+    dispatch = {
+        "mode": mode,
+        "reason": _DISPATCH_REASONS[route],
+        "dispatched_at": time.time(),
+        "founder_turn_count": sum(1 for m in (state.get("founder_messages") or []) if m.get("role") == "founder"),
+    }
+    emit_decision_span("understanding_dispatch", {
+        "parallel_understanding": True,
+        "dispatch_mode": mode,
+        "dispatch_reason": dispatch["reason"],
+        "fallback_to_sequential": mode == "SEQUENTIAL",
+    }, tags=["node:dispatch_founder_turn", f"understanding:{mode.lower()}"])
+    logger.info("dispatch_founder_turn | mode=%s reason=%s", mode, dispatch["reason"])
+    return {"founder_turn_dispatch": dispatch, "understanding_branches": {"__reset__": True}}
+
+
+def _run_understanding_branch(branch: str, node_fn: Any, state: StartaryGraphState) -> dict:
+    """
+    Run an unchanged understanding node. On a PARALLEL turn its shared-key writes are moved into
+    understanding_branches[branch] (with a private copy of the telemetry summary, so the concurrent
+    branches never mutate the same object); every other write passes through untouched.
+    """
+    if (state.get("founder_turn_dispatch") or {}).get("mode") != "PARALLEL":
+        return node_fn(state)
+    original_summary = state.get("turn_telemetry")
+    base_records = len(getattr(original_summary, "records", None) or [])
+    base_traces = len(state.get("traces") or [])
+    branch_state = dict(state)
+    branch_state["turn_telemetry"] = _copy.deepcopy(original_summary) if original_summary is not None else None
+
+    started_at = time.time()
+    updates = dict(node_fn(branch_state) or {})
+    ended_at = time.time()
+
+    summary = updates.pop("turn_telemetry", None) or branch_state.get("turn_telemetry")
+    traces = updates.pop("traces", None)
+    last_trace = updates.pop("last_trace", None)
+    updates["understanding_branches"] = {branch: {
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "new_traces": list(traces[base_traces:]) if traces is not None else [],
+        "last_trace": last_trace,
+        "telemetry_records": list(getattr(summary, "records", None) or [])[base_records:],
+        "telemetry_execution_path": getattr(summary, "execution_path", None),
+    }}
+    return updates
+
+
+def parallel_interpret_founder_turn(state: StartaryGraphState) -> dict:
+    """interpret_founder_turn as registered in the parallel-understanding graph."""
+    return _run_understanding_branch("interpret", interpret_founder_turn, state)
+
+
+def parallel_extract_startup_state(state: StartaryGraphState) -> dict:
+    """extract_startup_state as registered in the parallel-understanding graph."""
+    return _run_understanding_branch("extract", extract_startup_state, state)
+
+
+def join_founder_turn(state: StartaryGraphState) -> dict:
+    """
+    Deterministic Node (M6.2.7): synchronization barrier of the parallel understanding region.
+    Runs only after BOTH branches completed (same LangGraph superstep). Merges their shared-key
+    outputs in sequential order (interpretation, then extraction), records the overlap metrics, and
+    fails loudly if a branch result is missing rather than continuing with partial state.
+    """
+    dispatch = state.get("founder_turn_dispatch") or {}
+    if dispatch.get("mode") != "PARALLEL":
+        return {}
+    joined_at = time.time()
+    branches = state.get("understanding_branches") or {}
+    interp, extract = branches.get("interpret"), branches.get("extract")
+    missing = [name for name, payload in (("interpret", interp), ("extract", extract)) if payload is None]
+    if missing:
+        raise RuntimeError(f"join_founder_turn: parallel understanding branch result missing: {missing}")
+
+    traces = list(state.get("traces") or []) + list(interp["new_traces"]) + list(extract["new_traces"])
+    summary = _copy.deepcopy(state.get("turn_telemetry"))
+    if summary is None:
+        summary = TurnTelemetrySummary(execution_path=interp.get("telemetry_execution_path") or extract.get("telemetry_execution_path") or "STRATEGIC_REASONING")
+    for record in list(interp["telemetry_records"]) + list(extract["telemetry_records"]):
+        summary.add_record(record)
+
+    repair_flagged = bool(state.get("is_conversational_repair")) or state.get("execution_path") == "CONVERSATIONAL_REPAIR"
+    next_route = "handle_conversational_repair" if repair_flagged else "merge_execution_state"
+    starts, ends = (interp["started_at"], extract["started_at"]), (interp["ended_at"], extract["ended_at"])
+
+    def _retries(records: list[Any]) -> int:
+        return sum(int(getattr(r, "retry_count", 0) or 0) for r in records)
+
+    def _status(records: list[Any], default: str) -> str:
+        return str(getattr(records[-1], "status", default)) if records else default
+
+    meta = {
+        "parallel_understanding": True,
+        "dispatch_mode": "PARALLEL",
+        "interpretation_ms": round((interp["ended_at"] - interp["started_at"]) * 1000, 1),
+        "extraction_ms": round((extract["ended_at"] - extract["started_at"]) * 1000, 1),
+        "sum_of_branches_ms": round(((interp["ended_at"] - interp["started_at"]) + (extract["ended_at"] - extract["started_at"])) * 1000, 1),
+        "branch_overlap_ms": round(max(0.0, min(ends) - max(starts)) * 1000, 1),
+        "parallel_region_ms": round((joined_at - float(dispatch.get("dispatched_at") or joined_at)) * 1000, 1),
+        "sync_wait_ms": round((max(ends) - min(ends)) * 1000, 1),
+        "interpretation_status": _status(interp["telemetry_records"], "SKIPPED"),
+        "extraction_status": state.get("extraction_status"),
+        "interpretation_retry_count": _retries(interp["telemetry_records"]),
+        "extraction_retry_count": _retries(extract["telemetry_records"]),
+        "sync_status": "ROUTE_MISMATCH" if repair_flagged else "SUCCESS",
+        "next_route": next_route,
+        "fallback_to_sequential": False,
+    }
+    emit_decision_span("understanding_parallel_region", meta, tags=["node:join_founder_turn", "understanding:parallel"])
+    turn_telem = record_telemetry_event(
+        state={**state, "turn_telemetry": summary}, node_name="join_founder_turn", model_name="deterministic",
+        skipped_by_fast_path=True, model_tier="none", details=meta,
+    )
+    updates: dict[str, Any] = {
+        "traces": traces,
+        "turn_telemetry": turn_telem,
+        "understanding_branches": {"__reset__": True},
+    }
+    last_trace = extract.get("last_trace") or interp.get("last_trace")
+    if last_trace is not None:
+        updates["last_trace"] = last_trace
+    if repair_flagged:
+        # Cannot happen when dispatch and interpretation see the same state (same deterministic
+        # predicate); if it ever does, the extraction result is discarded, never merged.
+        logger.error("join_founder_turn | dispatch/interpretation route mismatch; discarding extraction delta")
+        updates["startup_state_delta"] = {}
+    logger.info("join_founder_turn | overlap_ms=%.0f region_ms=%.0f route=%s", meta["branch_overlap_ms"], meta["parallel_region_ms"], next_route)
     return updates
 
 
@@ -5543,8 +6403,11 @@ def handle_conversational_repair(state: StartaryGraphState) -> dict:
         project_id, rephrased_text[:60], latency_ms,
     )
 
+    advisor_resp_dict = advisor_resp.model_dump()
     return {
-        "latest_advisor_response": advisor_resp.model_dump(),
+        "latest_advisor_response": advisor_resp_dict,
+        # Milestone 6.2.3: persist the exact re-asked prompt before ask_and_wait_for_founder interrupts
+        "pending_founder_prompt": _build_founder_prompt(_resolve_active_question(state), advisor_resp_dict, "conversational_repair"),
         "pending_question": pending_q,
         "execution_path": "CONVERSATIONAL_REPAIR",
         "is_conversational_repair": False,
@@ -5682,11 +6545,33 @@ def compose_advisor_response(state: StartaryGraphState) -> dict:
     last_error: Exception | None = None
     advisor_output: dict[str, Any] | None = None
     t_start = time.monotonic()
+    llm_calls = 0
+
+    def _invoke_composer(msgs: list[dict[str, str]]) -> AdvisorResponseLLMOutput:
+        nonlocal llm_calls
+        llm_calls += 1
+        run_config = {
+            "run_name": f"compose_advisor_response:call_{llm_calls}",
+            "metadata": {
+                "node_name": "compose_advisor_response",
+                "logical_stage": logical_stage_for("compose_advisor_response"),
+                "attempt": llm_calls,
+                "model_tier": "fast",
+                "question_id": question_id,
+            },
+            "tags": ["node:compose_advisor_response", "tier:fast", f"attempt:{llm_calls}"],
+        }
+        try:
+            return structured_llm.invoke(msgs, config=run_config)
+        except TypeError as te:
+            if "config" in str(te):
+                return structured_llm.invoke(msgs)
+            raise
 
     while attempt < 2:
         attempt += 1
         try:
-            res: AdvisorResponseLLMOutput = structured_llm.invoke(messages)
+            res: AdvisorResponseLLMOutput = _invoke_composer(messages)
             res_dict = res.model_dump()
 
             # Target & Token Validation (Milestone 3.2.1 Section 4 & 7)
@@ -5713,7 +6598,7 @@ def compose_advisor_response(state: StartaryGraphState) -> dict:
                     },
                 ]
                 try:
-                    retry_res: AdvisorResponseLLMOutput = structured_llm.invoke(retry_messages)
+                    retry_res: AdvisorResponseLLMOutput = _invoke_composer(retry_messages)
                     retry_dict = retry_res.model_dump()
                     if retry_dict.get("next_question_target") == information_target and retry_dict.get("question_id") == question_id:
                         res_dict = retry_dict
@@ -5737,6 +6622,7 @@ def compose_advisor_response(state: StartaryGraphState) -> dict:
             logger.warning("compose_advisor_response failed attempt %d: %s", attempt, exc)
 
     latency_ms = (time.monotonic() - t_start) * 1000
+    composer_status = "SUCCESS" if advisor_output is not None else "FALLBACK"
 
     # Deterministic Fallback (Milestone 3.2.1 Section 23)
     if advisor_output is None:
@@ -5803,7 +6689,12 @@ def compose_advisor_response(state: StartaryGraphState) -> dict:
     existing_traces.append(trace.model_dump(mode="json"))
 
     logger.info("compose_advisor_response | qid=%s target=%s response_text=%s", question_id, information_target, final_output.get("response_text")[:60])
+    turn_telem = _record_llm_node_telemetry(
+        state, "compose_advisor_response", llm, "fast", latency_ms, max(llm_calls, 1),
+        "AdvisorResponseLLMOutput", status=composer_status, messages=messages,
+    )
     return {
+        "turn_telemetry": turn_telem,
         "latest_advisor_response": final_output,
         "intro_summary_shown": True,
         "traces": existing_traces,
@@ -5886,6 +6777,10 @@ def compose_execution_handoff(state: StartaryGraphState) -> dict:
     )
     compact_text = render_execution_handoff_text(handoff, mode="compact")
     full_text = render_execution_handoff_text(handoff, mode="full")
+    notice = pending_authorization_notice(active_exp)  # M6.2.6: empty unless permissions are pending
+    if notice:
+        compact_text = f"{notice}\n\n{compact_text}"
+        full_text = f"{notice}\n\n{full_text}"
     handoff.response_text = compact_text
     handoff.full_response_text = full_text
 
@@ -7328,6 +8223,7 @@ def increment_iteration(state: StartaryGraphState) -> dict:
         "experiment_critic_output": None,
         "critic_revision_count": 0,
         "critic_revision_instructions": "",
+        "experiment_revision": None,
         # Milestone 4.0.7.1.1: Reset active execution artifacts from prior cycle
         "active_execution_handoff": None,
         "execution_handoff_text": None,
@@ -7577,15 +8473,16 @@ def assess_build_readiness(state: StartaryGraphState) -> dict:
     evidence_basis: list[str] = []
 
     # Milestone 4.1.2: Check if startup already has a live deployed product with active traction
-    has_live_product = any(
-        k in all_founder_raw
-        for k in [
+    # Milestone 6.2.3: negation-aware ("zero paying customers" / "no active users" are not traction)
+    has_live_product = contains_unnegated_keyword(
+        all_founder_raw,
+        [
             "deployed", "live product", "in production", "app is live",
             "recorded full matches", "weekly use", "active teams", "paying teams", "paying customers",
             "active users", "8 paying", "subscription", "20 teams tried", "14 recorded"
-        ]
+        ],
     )
-    if has_live_product and any(k in all_founder_raw for k in ["paying", "paid", "repeat payment", "repeat payments", "paying teams", "paying customers", "recorded full matches", "weekly use"]):
+    if has_live_product and contains_unnegated_keyword(all_founder_raw, ["paying", "paid", "repeat payment", "repeat payments", "paying teams", "paying customers", "recorded full matches", "weekly use"]):
         decision_action = BuildReadinessAction.CONTINUE_MANUAL
         reason = (
             "The startup already has a deployed product with active usage and paying customers. "
@@ -7874,8 +8771,8 @@ def decide_next_strategic_action(state: StartaryGraphState) -> dict:
     ]).lower()
 
     st_state = state.get("startup_state") or {}
-    prog = st_state.get("progress") or {}
-    exec_ctx = st_state.get("execution_context") or {}
+    prog = state.get("startup_progress") or st_state.get("progress") or {}
+    exec_ctx = state.get("execution_context") or st_state.get("execution_context") or {}
 
     paying_val = prog.get("paying_customers_count") or (prog.get("paying_customers") or {}).get("value")
     paying_count = 0
@@ -7886,22 +8783,36 @@ def decide_next_strategic_action(state: StartaryGraphState) -> dict:
     elif "8 paying" in all_founder_raw:
         paying_count = 8
 
-    mvp_val = (prog.get("mvp_exists") or {}).get("value")
-    dev_stage_val = str((prog.get("development_stage") or {}).get("value") or "").upper()
-    has_live_product = (mvp_val is True or dev_stage_val in ("LIVE_PRODUCT", "GROWTH", "SCALING"))
+    users_val = prog.get("active_users_count") or (prog.get("active_users") or {}).get("value") or (prog.get("users_count") or {}).get("value")
+    users_count = 0
+    if isinstance(users_val, (int, float)) and users_val > 0:
+        users_count = int(users_val)
+    elif isinstance(users_val, str) and users_val.isdigit() and int(users_val) > 0:
+        users_count = int(users_val)
 
-    has_paying = (paying_count > 0) or any(k in all_founder_raw for k in [
-        "paying", "paid", "repeat payment", "repeat payments", "paying teams", "paying customers",
-        "paid pilot", "subscription revenue", "mrr", "8 paying", "8 paying teams"
-    ])
-    has_repeat = any(k in all_founder_raw for k in [
+    revenue_val = (prog.get("revenue") or {}).get("value") if isinstance(prog.get("revenue"), dict) else prog.get("revenue")
+    has_revenue = bool(revenue_val and str(revenue_val).strip() not in ("0", "$0", "None", "none", "unknown", "UNKNOWN"))
+
+    mvp_val = (prog.get("mvp_exists") or {}).get("value") if isinstance(prog.get("mvp_exists"), dict) else prog.get("mvp_exists")
+    launched_val = (prog.get("launched") or {}).get("value") if isinstance(prog.get("launched"), dict) else prog.get("launched")
+    dev_stage_val = str(((prog.get("development_stage") or {}).get("value") if isinstance(prog.get("development_stage"), dict) else prog.get("development_stage")) or "").upper()
+
+    # Live product strictly requires deployed/live development stage or confirmed launched/active MVP
+    has_live_product = (
+        dev_stage_val in ("LIVE_PRODUCT", "GROWTH", "SCALING")
+        or launched_val is True
+        or (mvp_val is True and (users_count > 0 or paying_count > 0))
+    )
+
+    # Validated paying status requires positive customer count or confirmed revenue
+    has_paying = (paying_count > 0) or has_revenue or ("8 paying" in all_founder_raw)
+
+    # Validated repeat usage requires observed repeat usage on a live product or user count
+    has_repeat = (users_count >= 5 or paying_count >= 3) and any(k in all_founder_raw for k in [
         "repeat use", "weekly use", "recorded full matches", "weekly active", "using weekly",
         "repeat usage", "multiple matches", "weekly match recordings", "recurring usage"
     ])
-    has_live = has_live_product or any(k in all_founder_raw for k in [
-        "deployed", "live product", "in production", "app is live", "product is live",
-        "active users", "20 teams tried", "14 recorded", "working prototype"
-    ])
+    has_live = has_live_product
 
     # 1. Partial evidence continuation guard
     if state.get("is_partial_evidence"):
@@ -8010,7 +8921,7 @@ def decide_next_strategic_action(state: StartaryGraphState) -> dict:
     elif (has_paying or has_repeat) and has_live:
         # Live product with traction
         t_lower = target_area.lower()
-        if "retention" in t_lower or any(k in stmt_lower for k in ["retention", "repeat", "churn", "engagement", "drop off", "drop-off", "weekly", "stickiness"]):
+        if ("retention" in t_lower or any(k in stmt_lower for k in ["retention", "repeat", "churn", "engagement", "drop off", "drop-off", "weekly", "stickiness"])) and (paying_count > 0 or users_count > 0):
             action_type = NextStrategicActionType.RETENTION_TEST
             target_area = "Retention" if "retention" in t_lower else target_area
             rationale = "With live product and paying customers, the highest priority is determining repeat engagement, cohort survival, and churn drivers."

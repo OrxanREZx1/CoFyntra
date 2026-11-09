@@ -51,6 +51,7 @@ from startary.graph.nodes import (
     plan_baseline_question,
 )
 from startary.llm.provider import get_llm_client
+from tests.fixtures.scenarios import make_valid_experiment_generator_output_dict
 
 
 # ===========================================================================
@@ -525,7 +526,8 @@ def test_44_critique_experiment_slims_founder_evidence_summary():
     state = {
         "project_id": "test_slim_critique",
         "active_assumption": {"id": "ca1", "statement": "Test CA", "area": "Problem"},
-        "proposed_experiment_output": {"experiment_type": "INTERVIEWS", "objective": "Test obj"},
+        # M6.2.5: a complete draft; a partial one is now a deterministic REVISE before any LLM call.
+        "proposed_experiment_output": make_valid_experiment_generator_output_dict(),
         "founder_messages": [{"role": "founder", "content": f"Founder turn {i}"} for i in range(15)],
         "traces": [],
     }

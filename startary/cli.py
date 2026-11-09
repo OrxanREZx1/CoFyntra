@@ -39,6 +39,12 @@ from startary.domain.terminal_state import (
 from startary.graph.builder import build_graph
 from startary.graph.graph_state import StartaryGraphState
 from startary.llm.provider import is_token_budget_exhausted_error
+from startary.observability import (
+    build_trace_config,
+    flush_langsmith_traces,
+    is_tracing_enabled,
+    setup_langsmith_environment,
+)
 
 
 class ErrorCategory(str, Enum):
@@ -797,11 +803,21 @@ def main() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
 
+    if "--trace" in sys.argv or "--langsmith" in sys.argv:
+        settings.langsmith_tracing = True
+
+    ls_config = setup_langsmith_environment(settings)
+
     if "--check-models" in sys.argv:
         check_models_diagnostic(settings)
         sys.exit(0)
 
     print(_BANNER)
+
+    if ls_config.enabled:
+        print(f"[LangSmith] Latency observability ACTIVE (project: '{ls_config.project}', hide_inputs={ls_config.hide_inputs}, hide_outputs={ls_config.hide_outputs})\n")
+    elif is_tracing_enabled(settings) and not ls_config.api_key:
+        print("[LangSmith] Tracing requested, but LANGSMITH_API_KEY is not configured in .env. Tracing will be skipped.\n")
 
     from startary.llm.provider import is_valid_api_key, run_model_preflight
 
@@ -855,7 +871,15 @@ def main() -> None:
     print()
     from langgraph.checkpoint.memory import MemorySaver
     graph = build_graph(checkpointer=MemorySaver())
-    thread_config = {"configurable": {"thread_id": project.id}}
+    turn_number = 0
+    thread_config = build_trace_config(
+        project_id=project.id,
+        turn_number=turn_number,
+        phase=project.phase,
+        iteration=project.iteration,
+        run_type="initial_context",
+        settings=settings,
+    )
 
     initial_state: StartaryGraphState = {
         "project_id": project.id,
@@ -934,8 +958,17 @@ def main() -> None:
                     sys.exit(0)
 
                 print("\nIntegrating your answer and re-evaluating...")
+                turn_number += 1
+                resume_config = build_trace_config(
+                    project_id=project.id,
+                    turn_number=turn_number,
+                    phase=project.phase,
+                    iteration=project.iteration,
+                    run_type="founder_reply",
+                    settings=settings,
+                )
                 try:
-                    graph.invoke(Command(resume=founder_reply), thread_config)
+                    graph.invoke(Command(resume=founder_reply), resume_config)
                 except Exception as invoke_exc:
                     cur_state = None
                     try:
@@ -953,8 +986,16 @@ def main() -> None:
                                 sys.exit(1)
                             if retry_cmd.strip().lower() == "/retry":
                                 print("\nRetrying operation from current state...")
+                                retry_config = build_trace_config(
+                                    project_id=project.id,
+                                    turn_number=turn_number,
+                                    phase=project.phase,
+                                    iteration=project.iteration,
+                                    run_type="timeout_retry",
+                                    settings=settings,
+                                )
                                 try:
-                                    graph.invoke(None, thread_config)
+                                    graph.invoke(None, retry_config)
                                     break
                                 except Exception as retry_exc:
                                     r_cat, r_title, r_guidance = classify_cli_error(retry_exc, state=cur_state)
@@ -979,6 +1020,8 @@ def main() -> None:
         print(f"\n[{category}] {title}: {exc}")
         print(f"\n{guidance}\n")
         sys.exit(1)
+    finally:
+        flush_langsmith_traces()
 
     # ── Display results (Milestone 4.0.1 Centralized Rendering) ───────────
     terminal_output = render_terminal_state(final_state)

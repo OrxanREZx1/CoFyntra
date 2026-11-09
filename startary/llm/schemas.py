@@ -14,13 +14,14 @@ If validation fails, we retry once, then fail safely without touching state.
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from startary.domain.area_knowledge import AreaStatus
 from startary.domain.assessment import RiskFactorLevel
-from startary.domain.enums import ExperimentType
+from startary.domain.enums import CriticDimensionResult, CriticVerdict, ExperimentType
 from startary.domain.reality_check import EvidenceConclusion
 from startary.domain.sufficiency import GroundingQuality
 from startary.domain.taxonomy import StartupArea
@@ -860,29 +861,30 @@ class ExperimentCriticLLMOutput(BaseModel):
     """
     Structured critique evaluating experiment quality, alignment, feasibility, and falsifiability.
     """
-    verdict: str = Field(
+    # Milestone 6.2.5: strict enums (exact tokens; trimming/case are normalized, nothing else).
+    verdict: CriticVerdict = Field(
         description="ACCEPT or REVISE.",
     )
     issues: list[str] = Field(
         default_factory=list,
         description="Specific identified issues or weaknesses (empty if ACCEPT).",
     )
-    assumption_alignment: str = Field(
+    assumption_alignment: CriticDimensionResult = Field(
         description="PASS or FAIL — does it directly test the active critical assumption?",
     )
-    evidence_validity: str = Field(
+    evidence_validity: CriticDimensionResult = Field(
         description="PASS or FAIL — could the evidence legitimately support/contradict the claim?",
     )
-    feasibility: str = Field(
+    feasibility: CriticDimensionResult = Field(
         description="PASS or FAIL — can this founder realistically execute it with current resources?",
     )
-    cost_efficiency: str = Field(
+    cost_efficiency: CriticDimensionResult = Field(
         description="PASS or FAIL — is this the cheapest/fastest test of similar information value?",
     )
-    falsifiability: str = Field(
+    falsifiability: CriticDimensionResult = Field(
         description="PASS or FAIL — can the assumption meaningfully fail?",
     )
-    scope: str = Field(
+    scope: CriticDimensionResult = Field(
         description="PASS or FAIL — is the test small and stage-appropriate (not build-heavy)?",
     )
     revision_instructions: str = Field(
@@ -892,6 +894,75 @@ class ExperimentCriticLLMOutput(BaseModel):
     rationale: str = Field(
         description="Summary rationale for the critic decision.",
     )
+
+    @field_validator(
+        "verdict", "assumption_alignment", "evidence_validity", "feasibility",
+        "cost_efficiency", "falsifiability", "scope", mode="before",
+    )
+    @classmethod
+    def _normalize_token(cls, value: Any) -> Any:
+        return value.strip().upper() if isinstance(value, str) else value
+
+
+# ---------------------------------------------------------------------------
+# Milestone 6.2.6 (STARTARY_EXPERIMENT_REVISION_V2 only): revision architecture schemas
+# ---------------------------------------------------------------------------
+
+class RevisionScope(StrEnum):
+    NONE = "NONE"            # verdict is ACCEPT
+    TARGETED = "TARGETED"    # the defects can be fixed by editing specific fields of this draft
+    REDESIGN = "REDESIGN"    # a different method, population, or evidence source is needed
+
+
+class ExperimentCriticV2LLMOutput(ExperimentCriticLLMOutput):
+    """Full critique (V2): identical evaluation plus the critic's judgement of the revision scope."""
+    revision_scope: RevisionScope = Field(
+        description="NONE if ACCEPT. On REVISE: TARGETED if editing specific fields fixes the issues; REDESIGN if a new method, population, or evidence source is required.",
+    )
+
+    @field_validator("revision_scope", mode="before")
+    @classmethod
+    def _normalize_scope(cls, value: Any) -> Any:
+        return value.strip().upper() if isinstance(value, str) else value
+
+
+class ExperimentFocusedCriticLLMOutput(ExperimentCriticLLMOutput):
+    """
+    Focused re-critique of a targeted edit. All six dimensions are still re-evaluated; acceptance
+    additionally requires every original blocking issue resolved and no new blocking issue.
+    """
+    original_issues_resolved: bool = Field(
+        description="True only if EVERY blocking issue from the previous critique is resolved by the revision.",
+    )
+    new_blocking_issues: list[str] = Field(
+        default_factory=list,
+        description="Blocking problems introduced by the revision itself (empty if none).",
+    )
+
+
+class ExperimentRevisionPatchLLMOutput(BaseModel):
+    """
+    Targeted edit of a rejected experiment: ONLY the fields that must change are filled; every other
+    field stays null and is kept verbatim from the original draft. The merged draft must still satisfy
+    ExperimentGeneratorLLMOutput.
+    """
+    experiment_type: Optional[ExperimentType] = Field(default=None, description="Only if the critique requires a different experiment type.")
+    objective: Optional[str] = Field(default=None, description="Revised objective, or null to keep.")
+    method: Optional[str] = Field(default=None, description="Revised method, or null to keep.")
+    target_participants_or_scope: Optional[str] = Field(default=None, description="Revised participants/scope, or null to keep.")
+    target_sample_size: Optional[int] = Field(default=None, description="Revised sample size, or null to keep.")
+    founder_actions: Optional[list[str]] = Field(default=None, description="Full revised list of founder actions, or null to keep.")
+    evidence_to_collect: Optional[str] = Field(default=None, description="Revised evidence to collect, or null to keep.")
+    support_signal: Optional[str] = Field(default=None, description="Revised support signal, or null to keep.")
+    contradiction_signal: Optional[str] = Field(default=None, description="Revised contradiction signal, or null to keep.")
+    inconclusive_signal: Optional[str] = Field(default=None, description="Revised inconclusive signal, or null to keep.")
+    valid_inferences: Optional[list[str]] = Field(default=None, description="Full revised list, or null to keep.")
+    invalid_inferences: Optional[list[str]] = Field(default=None, description="Full revised list, or null to keep.")
+    estimated_time: Optional[str] = Field(default=None, description="Revised time estimate, or null to keep.")
+    estimated_cost: Optional[str] = Field(default=None, description="Revised cost estimate, or null to keep.")
+    required_capabilities: Optional[list[str]] = Field(default=None, description="Full revised list, or null to keep.")
+    required_access: Optional[list[str]] = Field(default=None, description="Full revised list, or null to keep.")
+    parameters: Optional[list[ExperimentParameterLLM]] = Field(default=None, description="Full revised list, or null to keep.")
 
 
 # ---------------------------------------------------------------------------

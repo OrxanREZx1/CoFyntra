@@ -15,6 +15,34 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+# Milestone 6.2.3: logical pipeline stage per node, so per-turn telemetry can be grouped
+# consistently (intake -> diagnosis -> gap planning -> risk -> weak link -> question).
+NODE_LOGICAL_STAGES: dict[str, str] = {
+    "interpret_founder_turn": "intake",
+    "dispatch_founder_turn": "intake",
+    "join_founder_turn": "intake",
+    "extract_startup_state": "intake",
+    "assess_baseline_state_sufficiency": "baseline_gate",
+    "plan_baseline_question": "question_planning",
+    "diagnose_startup": "diagnosis",
+    "plan_information_gap": "gap_planning",
+    "assess_startup_areas": "risk_assessment",
+    "assess_weak_link_discrimination": "weak_link_selection",
+    "select_weak_link_question": "question_planning",
+    "compose_advisor_response": "question_composition",
+    "handle_conversational_repair": "question_composition",
+    "generate_experiment": "experiment_design",
+    "revise_experiment": "experiment_design",
+    "validate_proposed_experiment": "experiment_validation",
+    "critique_experiment": "experiment_critique",
+}
+
+
+def logical_stage_for(node_name: str) -> str:
+    """Return the logical pipeline stage for a node (defaults to 'other')."""
+    return NODE_LOGICAL_STAGES.get(node_name, "other")
+
+
 @dataclass
 class NodeTelemetryRecord:
     """Telemetry record for a single LLM or reasoning node call."""
@@ -42,6 +70,13 @@ class NodeTelemetryRecord:
     skipped_by_fast_path: bool = False
     cached: bool = False
     skipped: bool = False
+    # Milestone 6.2.3 observability fields
+    logical_stage: Optional[str] = None
+    model_tier: Optional[str] = None
+    reasoning_effort: Optional[str] = None
+    status: str = "SUCCESS"
+    # Milestone 6.2.5: node-specific structured, non-sensitive metadata (e.g. critic decision codes)
+    details: Optional[dict[str, Any]] = None
 
     def __post_init__(self):
         now = datetime.now(timezone.utc)
@@ -58,7 +93,9 @@ class NodeTelemetryRecord:
         if self.configured_model is None:
             self.configured_model = self.resolved_model
 
-        for field_attr in ("model_name", "configured_model", "resolved_model", "fallback_reason"):
+        if self.logical_stage is None:
+            self.logical_stage = logical_stage_for(self.node_name)
+        for field_attr in ("model_name", "configured_model", "resolved_model", "fallback_reason", "model_tier", "reasoning_effort"):
             val = getattr(self, field_attr)
             if val is not None and not isinstance(val, str):
                 if hasattr(val, "_mock_name") or "Mock" in type(val).__name__:
@@ -73,9 +110,13 @@ class NodeTelemetryRecord:
     def log_record(self) -> None:
         """Emit structured log for this call."""
         logger.info(
-            "node=%s model=%s configured_model=%s resolved_model=%s fallback_used=%s fallback_reason=%s "
+            "node=%s stage=%s status=%s tier=%s reasoning_effort=%s model=%s configured_model=%s resolved_model=%s fallback_used=%s fallback_reason=%s "
             "latency_ms=%.0f prompt_tokens=%s completion_tokens=%s total_tokens=%s retry_count=%d timeout=%s schema=%s path=%s skipped=%s cached=%s",
             self.node_name,
+            self.logical_stage,
+            self.status,
+            self.model_tier or "N/A",
+            self.reasoning_effort or "default",
             self.model_name,
             self.configured_model,
             self.resolved_model,
@@ -119,6 +160,11 @@ class NodeTelemetryRecord:
             "skipped_by_fast_path": self.skipped_by_fast_path,
             "cached": self.cached,
             "skipped": self.skipped,
+            "logical_stage": self.logical_stage,
+            "model_tier": self.model_tier,
+            "reasoning_effort": self.reasoning_effort,
+            "status": self.status,
+            "details": dict(self.details) if self.details else None,
         }
 
 
@@ -244,6 +290,11 @@ def record_telemetry_event(
     resolved_model: Optional[str] = None,
     fallback_used: bool = False,
     fallback_reason: Optional[str] = None,
+    logical_stage: Optional[str] = None,
+    model_tier: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    status: Optional[str] = None,
+    details: Optional[dict[str, Any]] = None,
     **kwargs: Any,
 ) -> TurnTelemetrySummary:
     """Helper to construct, log, and register a NodeTelemetryRecord onto state['turn_telemetry']."""
@@ -284,6 +335,11 @@ def record_telemetry_event(
         skipped_by_fast_path=skipped or skipped_by_fast_path,
         cached=cached,
         skipped=skipped or skipped_by_fast_path,
+        logical_stage=logical_stage,
+        model_tier=model_tier,
+        reasoning_effort=reasoning_effort,
+        status=status or ("CACHED" if cached else "SKIPPED" if (skipped or skipped_by_fast_path) else "SUCCESS"),
+        details=details,
     )
     record.log_record()
 

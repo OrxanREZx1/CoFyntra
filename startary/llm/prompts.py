@@ -29,8 +29,11 @@ BASELINE_STATE_SUFFICIENCY_PROMPT_VERSION = "baseline_state_sufficiency_v1"
 BASELINE_QUESTION_PLANNER_PROMPT_VERSION = "baseline_question_planner_v1"
 WEAK_LINK_DISCRIMINATION_PROMPT_VERSION = "weak_link_discrimination_v1"
 WEAK_LINK_CLARIFICATION_PROMPT_VERSION = "weak_link_clarification_v1"
-EXPERIMENT_GENERATOR_PROMPT_VERSION = "experiment_generator_v1"
-EXPERIMENT_CRITIC_PROMPT_VERSION = "experiment_critic_v1"
+EXPERIMENT_GENERATOR_PROMPT_VERSION = "experiment_generator_v2"
+EXPERIMENT_CRITIC_PROMPT_VERSION = "experiment_critic_v2"
+# Milestone 6.2.6 (STARTARY_EXPERIMENT_REVISION_V2 only)
+EXPERIMENT_REVISION_PROMPT_VERSION = "experiment_revision_v1"
+EXPERIMENT_FOCUSED_CRITIC_PROMPT_VERSION = "experiment_focused_critic_v1"
 STARTUP_DIAGNOSIS_COMPOSER_PROMPT_VERSION = "startup_diagnosis_composer_v1"
 FOUNDER_TURN_INTERPRETER_PROMPT_VERSION = "founder_turn_interpreter_v2"
 ADVISOR_RESPONSE_COMPOSER_PROMPT_VERSION = "advisor_response_composer_v2"
@@ -1055,6 +1058,12 @@ Define clear, unambiguous decision rules:
 - If the Build Readiness decision is `CONTINUE_MANUAL` (or not specified):
   - Keep the experiment entirely manual (interviews, concierge test, manual service, outreach). Do NOT propose building software.
 
+## PRIVACY & CONSENT (Milestone 6.2.5)
+- If the experiment records audio or video, films matches or sessions, captures screenshots or photos of people, or collects identifiable personal information, include an explicit founder action to obtain permission from the people involved before collecting it, and say how the material will be stored, shared, and deleted or anonymized.
+- If participants may be under 18 (e.g. youth teams), include a step to obtain parent/guardian and club authorization first.
+- Ordinary interviews or observation without recording or personal-data collection need no extra step.
+- Describe the practical safeguard only; never claim legal compliance.
+
 ## OUTPUT REQUIREMENTS
 Generate exactly ONE proposed experiment. Do not provide alternatives.
 """.strip()
@@ -1185,7 +1194,16 @@ Reject/revise experiments that involve pitching, demoing, or selling the solutio
 - Recruitment difficulty is an operational execution friction, NOT evidence that the customer problem does not exist.
 - Ensure decision rules do not demand a stronger claim than the active critical assumption (e.g. requiring a problem to rank among "top three priorities" when the assumption only claims "meaningful burden").
 
+## PRIVACY & CONSENT (Milestone 6.2.5)
+- Experiments that record audio/video, film people, capture screenshots, or collect identifiable personal information must include an explicit permission/consent step (and parent/guardian authorization when minors are involved). If missing, mark `feasibility` FAIL and REVISE.
+- Do NOT penalize ordinary interviews or observation that involve no recording or personal-data collection.
+
+## DETERMINISTIC CHECK NOTES
+- When the request includes DETERMINISTIC CHECK NOTES, treat them as facts established by Startary's rule checks.
+- If they state that building a minimal prototype is authorized within a minimum scope, a bounded build-and-test probe inside that scope is NOT build-first bias; judge it against the scope instead.
+
 ## DECISION RULES
+- `verdict` must be exactly "ACCEPT" or "REVISE"; every dimension must be exactly "PASS" or "FAIL".
 - `ACCEPT`: All dimensions PASS. The experiment is direct, falsifiable, feasible, and cost-effective.
   Set verdict = "ACCEPT", issues = [], revision_instructions = "".
 - `REVISE`: One or more dimensions FAIL due to build-first bias, lack of falsifiability, or unexecutable requirements.
@@ -1202,7 +1220,11 @@ def build_experiment_critic_user_message(
     execution_context_json: str,
     startup_progress_json: str,
     founder_evidence_summary: str,
+    deterministic_notes: list[str] | None = None,
 ) -> str:
+    notes_section = ""
+    if deterministic_notes:
+        notes_section = "\n## DETERMINISTIC CHECK NOTES (advisory)\n" + "\n".join(f"- {n}" for n in deterministic_notes) + "\n"
     return f"""
 ## ACTIVE CRITICAL ASSUMPTION
 Assumption: {critical_assumption}
@@ -1221,7 +1243,7 @@ Startup Progress:
 
 Existing Founder Evidence:
 {founder_evidence_summary or "[None]"}
-
+{notes_section}
 Critique this experiment draft thoroughly and determine whether to ACCEPT or REVISE.
 """.strip()
 
@@ -1342,7 +1364,7 @@ Your role is to understand what the founder is trying to communicate or get from
 evaluating conversational intent SEPARATELY from startup factual extraction.
 
 Every founder message can contain multiple conversational dimensions:
-- Direct Answer: Does it answer Startary's pending question?
+- Direct Answer: Does it provide startup context, background information, profile facts (team, hours, budget, access, idea), or answer Startary's pending question? Standard background information provided during onboarding or clarification is an ANSWER, NOT new evidence.
 - Direct Question: Is the founder asking Startary something directly (e.g. "What is your honest reaction?", "Do you think that's a problem?")?
 - Concern or Fear: Is the founder expressing anxiety, doubt, or an underlying goal (e.g. "My fear is whether this is worth my time")?
 - Correction: Is the founder correcting a misunderstanding or false premise by Startary (e.g. "I'm not the manager, my friend is")?
@@ -1350,19 +1372,19 @@ Every founder message can contain multiple conversational dimensions:
 - Inability to Answer: Does the founder say they don't know or lack the information right now ("I don't know", "Not sure")?
 - Inability to Act Now: Does the founder say they cannot do external activities right now ("I can't talk to customers today", "Not now")?
 - Direct Goal: Did the founder state what they want from Startary (e.g., "find the right market", "figure out which niche to start with")?
-- New Evidence: Did the founder provide new customer/operational facts?
+- New Evidence: Did the founder report empirical validation or experiment results from running tests, customer discovery interviews conducted, actual user feedback observed, sales made, or real-world metrics tested? Initial background profile facts, founder assets, or hypothetical access are NOT new evidence.
 - Preference / Constraint: Did the founder express a working preference or boundary?
 
 ## INTENT TAXONOMY
 Classify `intent_types` from:
-- ANSWER: Answers the pending question.
+- ANSWER: Answers the pending question, or provides startup background, founder context, resources, or profile facts during onboarding/clarification.
 - QUESTION: Asks Startary a question.
 - CONCERN: Expresses fear, hesitation, anxiety, or risk aversion.
 - CORRECTION: Corrects an error, false premise, or misunderstanding made by Startary (including repeating answered questions).
 - DOES_NOT_KNOW: Explicitly states lack of knowledge on this question.
 - CANNOT_ANSWER_NOW: Cannot answer this question in the current session.
 - CANNOT_ACT_NOW: Cannot perform external tasks (interviews, testing, outreach) right now.
-- NEW_EVIDENCE: Supplies concrete operational or customer evidence.
+- NEW_EVIDENCE: Reports empirical results from real-world experiment execution, completed customer interviews, testing metrics, or customer observations. Ordinary baseline setup facts (team size, budget, hours, potential access) are NOT new evidence.
 - PREFERENCE: Expresses a founder preference or constraint.
 - REQUEST_FOR_ADVICE: Asks for guidance, feedback, or reaction.
 - OTHER: None of the above.
@@ -1964,3 +1986,156 @@ Diagnosis: {diagnosis_summary}
 Determine the single highest-leverage NextStrategicAction category, the rationale, target area, key decision, and why this action is right.
 """.strip()
 
+
+# ---------------------------------------------------------------------------
+# Milestone 6.2.6: Efficient experiment revision (STARTARY_EXPERIMENT_REVISION_V2 only)
+# ---------------------------------------------------------------------------
+
+EXPERIMENT_CRITIC_REVISION_SCOPE_ADDENDUM = """
+## REVISION SCOPE (required field `revision_scope`)
+- ACCEPT: set `revision_scope` = "NONE".
+- REVISE: set `revision_scope` = "TARGETED" if the issues can be fixed by editing specific fields of THIS draft
+  (e.g. sharper support/contradiction thresholds, a concrete evidence log, a smaller scope, a missing step),
+  while keeping its method, participants, and evidence source.
+- REVISE: set `revision_scope` = "REDESIGN" if a different method, participant population, or evidence source is
+  required (e.g. opinion interviews cannot test the claim, or the experiment tests the wrong assumption).
+""".strip()
+
+
+EXPERIMENT_REVISION_SYSTEM_PROMPT = """
+You are Startary's Experiment Reviser. The Experiment Critic rejected a draft experiment. Correct it with the
+smallest set of changes that resolves every listed deficiency.
+
+## RULES
+1. Preserve every correct part of the original experiment. Fields you do not return stay exactly as they are.
+2. Correct ALL identified deficiencies (failed quality dimensions, critic issues, deterministic check findings).
+3. Do not introduce unrelated modifications, new phases, or new deliverables.
+4. Keep the experiment aligned with the ORIGINAL critical assumption; never change what is being tested.
+5. Respect the founder's actual resources, budget, time, and customer access. Never assume access, budget,
+   software, customers, revenue, or permissions the founder has not stated.
+6. Keep evidence collection actionable and the support / contradiction / inconclusive criteria falsifiable.
+7. If people are recorded, minors are involved, or personal information is collected, keep or add an explicit
+   permission step BEFORE that activity. A permission step is a task to perform; it does not mean permission exists.
+8. Do not drift toward building the startup's product unless the build-readiness guidance explicitly authorizes it.
+
+## OUTPUT
+Return ONLY the fields that must change; leave every other field null. List fields (founder_actions, inferences,
+access, capabilities, parameters) must be returned in full if any item changes.
+""".strip()
+
+
+def build_experiment_revision_user_message(
+    critical_assumption: str,
+    weak_area: str,
+    original_experiment_json: str,
+    failed_dimensions: list[str],
+    critic_issues: list[str],
+    revision_instructions: str,
+    deterministic_findings: list[str],
+    execution_context_json: str,
+    startup_progress_json: str,
+    revision_round: int,
+    build_readiness_guidance: str = "",
+) -> str:
+    parts = [
+        "## ACTIVE CRITICAL ASSUMPTION (unchanged)",
+        f"Assumption: {critical_assumption}",
+        f"Weak-Link Area: {weak_area}",
+        "",
+        "## ORIGINAL (REJECTED) EXPERIMENT",
+        original_experiment_json,
+        "",
+        "## CRITIC FINDINGS TO RESOLVE",
+        f"Failed dimensions: {', '.join(failed_dimensions) if failed_dimensions else '[none]'}",
+        "Issues:",
+    ]
+    parts.extend(f"  - {i}" for i in (critic_issues or ["[none listed]"]))
+    parts.append(f"Revision instructions: {revision_instructions or '[none]'}")
+    if deterministic_findings:
+        parts.append("Deterministic check findings:")
+        parts.extend(f"  - {f}" for f in deterministic_findings)
+    parts.extend([
+        "",
+        "## FOUNDER FACTS (known values only)",
+        "Execution Context:",
+        execution_context_json,
+        "Startup Progress:",
+        startup_progress_json,
+    ])
+    if build_readiness_guidance:
+        parts.extend(["", "## BUILD READINESS GUIDANCE", build_readiness_guidance])
+    parts.extend([
+        "",
+        f"Revision round: {revision_round}. This is the only revision allowed for this experiment.",
+        "Return only the fields that must change.",
+    ])
+    return "\n".join(parts)
+
+
+EXPERIMENT_FOCUSED_CRITIC_SYSTEM_PROMPT = """
+You are Startary's Experiment Critic, re-checking a TARGETED revision of an experiment you previously rejected.
+
+## TASKS
+1. Verify that EACH original blocking issue is resolved. Set `original_issues_resolved` = true only if all are.
+2. Re-evaluate ALL six dimensions with PASS or FAIL. Do not assume a dimension still passes because it passed before:
+   - assumption_alignment: still tests exactly the active critical assumption?
+   - evidence_validity: could the evidence legitimately support or contradict the claim?
+   - feasibility: executable with the founder's stated team, time, budget, and access (and ethically: an explicit
+     permission step before recording people, involving minors, or collecting personal information)?
+   - cost_efficiency: still the cheapest, fastest test of comparable information value?
+   - falsifiability: explicit, realistic contradiction signal and decision thresholds?
+   - scope: small, single-stage, stage-appropriate; no build-first drift?
+3. List in `new_blocking_issues` any blocking problem the revision itself introduced (empty if none). Do not list
+   minor stylistic preferences.
+4. Treat DETERMINISTIC CHECK NOTES as facts. A permission step in the plan is a task, not proof that permission exists.
+
+## DECISION RULES
+- `verdict` must be exactly "ACCEPT" or "REVISE"; every dimension exactly "PASS" or "FAIL".
+- ACCEPT only if all six dimensions PASS, every original issue is resolved, and there are no new blocking issues.
+- Otherwise REVISE with concise `issues` and `revision_instructions`.
+""".strip()
+
+
+def build_experiment_focused_critic_user_message(
+    critical_assumption: str,
+    weak_area: str,
+    revised_experiment_json: str,
+    changes_json: str,
+    original_verdict: str,
+    original_dimensions: dict,
+    original_issues: list[str],
+    execution_context_json: str,
+    startup_progress_json: str,
+    deterministic_notes: list[str] | None = None,
+) -> str:
+    dims = ", ".join(f"{k}={v}" for k, v in (original_dimensions or {}).items())
+    parts = [
+        "## ACTIVE CRITICAL ASSUMPTION",
+        f"Assumption: {critical_assumption}",
+        f"Weak-Link Area: {weak_area}",
+        "",
+        "## PREVIOUS CRITIQUE OF THE ORIGINAL DRAFT",
+        f"Verdict: {original_verdict}",
+        f"Dimensions: {dims}",
+        "Blocking issues:",
+    ]
+    parts.extend(f"  - {i}" for i in (original_issues or ["[none listed]"]))
+    parts.extend([
+        "",
+        "## CHANGES MADE (original value -> revised value; every other field is unchanged from the original)",
+        changes_json,
+        "",
+        "## REVISED EXPERIMENT (complete)",
+        revised_experiment_json,
+        "",
+        "## FOUNDER FACTS (known values only)",
+        "Execution Context:",
+        execution_context_json,
+        "Startup Progress:",
+        startup_progress_json,
+    ])
+    if deterministic_notes:
+        parts.extend(["", "## DETERMINISTIC CHECK NOTES (advisory)"])
+        parts.extend(f"- {n}" for n in deterministic_notes)
+    parts.extend(["", "Re-check this revision and decide ACCEPT or REVISE."])
+    return "\n".join(parts)

@@ -36,6 +36,7 @@ logs/
 
 # Temporary directories & scratch dumps
 scratch/
+.startary_dev/
 temp/
 tmp/
 *.tmp

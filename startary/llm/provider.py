@@ -65,6 +65,65 @@ def is_valid_api_key(api_key: str | None) -> bool:
     return stripped not in PLACEHOLDER_KEYS
 
 
+class LLMFailureKind:
+    """Milestone 6.2.5: retry-relevant classification of a failed structured LLM call."""
+    TOKEN_BUDGET_EXHAUSTED = "TOKEN_BUDGET_EXHAUSTED"
+    INVALID_STRUCTURED_OUTPUT = "INVALID_STRUCTURED_OUTPUT"
+    TRANSIENT_API_ERROR = "TRANSIENT_API_ERROR"
+    PERMANENT_API_ERROR = "PERMANENT_API_ERROR"
+    UNKNOWN_ERROR = "UNKNOWN_ERROR"
+
+
+_INVALID_OUTPUT_TYPES = ("ValidationError", "OutputParserException", "JSONDecodeError")
+_TRANSIENT_TYPES = (
+    "APITimeoutError", "APIConnectionError", "RateLimitError", "InternalServerError",
+    "ServiceUnavailableError", "Timeout", "TimeoutError", "ConnectionError", "ReadTimeout",
+)
+
+
+def classify_llm_failure(exc: Exception) -> str:
+    """
+    Classify a failed structured LLM call so nodes can apply the right bounded recovery:
+    token exhaustion and permanent errors stop immediately (the token wrapper already spent its one
+    expansion); invalid structured output is retried once with schema feedback; transient API errors
+    are retried once unchanged.
+    """
+    if is_token_budget_exhausted_error(exc):
+        return LLMFailureKind.TOKEN_BUDGET_EXHAUSTED
+    if is_permanent_model_error(exc):
+        return LLMFailureKind.PERMANENT_API_ERROR
+    if type(exc).__name__ in _INVALID_OUTPUT_TYPES:
+        return LLMFailureKind.INVALID_STRUCTURED_OUTPUT
+    status_code = getattr(exc, "status_code", None)
+    if type(exc).__name__ in _TRANSIENT_TYPES or status_code in (408, 409, 429) or (isinstance(status_code, int) and status_code >= 500):
+        return LLMFailureKind.TRANSIENT_API_ERROR
+    if any(t in str(exc).lower() for t in ("timed out", "timeout", "connection error", "temporarily unavailable")):
+        return LLMFailureKind.TRANSIENT_API_ERROR
+    return LLMFailureKind.UNKNOWN_ERROR
+
+
+def schema_correction_message(exc: Exception) -> dict[str, str]:
+    """
+    Corrective follow-up for a retry after invalid structured output. Names only the failing schema
+    fields (never echoes model output or founder text).
+    """
+    fields: list[str] = []
+    errors = getattr(exc, "errors", None)
+    if callable(errors):
+        try:
+            fields = sorted({".".join(str(p) for p in e.get("loc", ())) for e in errors() if e.get("loc")})
+        except Exception:
+            fields = []
+    field_note = f" (failing fields: {', '.join(fields)})" if fields else ""
+    return {
+        "role": "user",
+        "content": (
+            f"Your previous response did not satisfy the required output schema{field_note}. "
+            "Return ONE complete object in which every required field is present and meets its constraints."
+        ),
+    }
+
+
 def is_permanent_model_error(exc: Exception) -> bool:
     """
     Determine if an exception represents a permanent configuration or access failure
@@ -419,11 +478,16 @@ def get_llm_client_resolution_info(client: Any) -> ModelResolutionInfo:
     res = getattr(client, "_startary_resolved_model", getattr(client, "model_name", "unknown"))
     fb = getattr(client, "_startary_fallback_used", False)
     reason = getattr(client, "_startary_fallback_reason", None)
+    effort = getattr(client, "_startary_reasoning_effort", None)
+    tier = getattr(client, "_startary_model_tier", None)
     return ModelResolutionInfo({
         "configured_model": str(conf) if conf is not None else None,
         "resolved_model": str(res) if res is not None else None,
         "fallback_used": bool(fb),
         "fallback_reason": str(reason) if reason else None,
+        # None means the provider/API default effort applies (reasoning tier today).
+        "reasoning_effort": effort if isinstance(effort, str) else None,
+        "model_tier": tier if isinstance(tier, str) else None,
     })
 
 
@@ -469,7 +533,12 @@ def get_llm_client(
 
     effective_max_tokens = max_completion_tokens or max_tokens
     if effective_max_tokens is None:
-        effective_max_tokens = 1500 if tier == "fast" else 3000
+        effective_max_tokens = 2500 if tier == "fast" else 3000
+
+    is_reasoning_model = (tier == "reasoning") or any(m in resolved_model.lower() for m in ("o1", "o3", "sol", "luna"))
+    effective_reasoning_effort = reasoning_effort
+    if effective_reasoning_effort is None and tier == "fast" and is_reasoning_model:
+        effective_reasoning_effort = "low"
 
     logger.debug(
         "LLM client | configured=%s resolved=%s fallback_used=%s tier=%s max_completion_tokens=%s reasoning_effort=%s",
@@ -478,7 +547,7 @@ def get_llm_client(
         fallback_used,
         tier,
         effective_max_tokens,
-        reasoning_effort,
+        effective_reasoning_effort,
     )
 
     client_kwargs: dict[str, Any] = {
@@ -488,9 +557,21 @@ def get_llm_client(
         "max_retries": 0,          # We manage retries ourselves in the node layer
         "timeout": 30.0 if tier == "fast" else 60.0,
         "max_completion_tokens": effective_max_tokens,
+        "metadata": {
+            "model_tier": tier,
+            "configured_model": configured_model,
+            "resolved_model": resolved_model,
+            "fallback_used": fallback_used,
+            "max_completion_tokens": effective_max_tokens,
+            "reasoning_effort": effective_reasoning_effort,
+        },
+        "tags": [
+            f"tier:{tier}",
+            f"model:{resolved_model}",
+        ],
     }
-    if reasoning_effort and tier == "reasoning":
-        client_kwargs["reasoning_effort"] = reasoning_effort
+    if effective_reasoning_effort and is_reasoning_model:
+        client_kwargs["reasoning_effort"] = effective_reasoning_effort
 
     client = ChatOpenAI(**client_kwargs)
 
@@ -500,7 +581,8 @@ def get_llm_client(
     client._startary_fallback_used = fallback_used
     client._startary_fallback_reason = fallback_reason
     client._startary_max_completion_tokens = effective_max_tokens
-    client._startary_reasoning_effort = reasoning_effort
+    client._startary_reasoning_effort = effective_reasoning_effort
+    client._startary_model_tier = tier
 
     return client
 

@@ -392,6 +392,13 @@ class TestStrategicNodesStructuralEquivalence:
             "project_id": fixture["project_id"],
             "phase": WorkflowPhase.UNDERSTAND,
             "weak_area": "Problem",
+            # M6.2.3: select_weak_link always provides the winner score and tie telemetry before
+            # discrimination runs; without it the node cannot see the lead and called a live LLM.
+            "weak_link_details": {
+                "area": "Problem",
+                "score": 81,
+                "saturation_telemetry": {"max_score_tie_count": 1, "tie_breaker_used": False, "saturated_area_count": 1},
+            },
             "area_assessments": area_assessments,
             "weak_link_clarification_turns": 0,
             "raw_context": fixture["raw_context"],
@@ -399,7 +406,8 @@ class TestStrategicNodesStructuralEquivalence:
         }
 
         # Decisive lead -> deterministic Python sets should_clarify=False without LLM call
-        res = assess_weak_link_discrimination(state)
+        with patch("startary.graph.nodes._safe_get_llm_client", side_effect=AssertionError("LLM must not be called")):
+            res = assess_weak_link_discrimination(state)
 
         assert res["selection_confidence"] == "HIGH"
         assert res["should_clarify"] is False

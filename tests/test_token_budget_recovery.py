@@ -81,6 +81,41 @@ def test_invoke_length_error_recovers_with_expanded_budget(mock_get_client):
 
 
 @patch("startary.graph.nodes._safe_get_llm_client")
+def test_invoke_length_error_recovers_with_expanded_budget_from_2500(mock_get_client):
+    # Attempt 1 fails with length error on 2500 token budget
+    mock_llm1 = MagicMock()
+    mock_llm1.invoke.side_effect = MockLengthError("length limit was reached")
+
+    # Attempt 2 (expanded to 4000) succeeds
+    mock_llm2 = MagicMock()
+    mock_structured2 = MagicMock()
+    mock_structured2.invoke.return_value = {"status": "recovered"}
+    mock_llm2.with_structured_output.return_value = mock_structured2
+    mock_get_client.return_value = mock_llm2
+
+    settings = Settings(fast_model_name="gpt-5.6-luna")
+    res, latency = _invoke_structured_with_token_retry(
+        structured_llm=mock_llm1,
+        messages=[{"role": "user", "content": "hi"}],
+        settings=settings,
+        tier="fast",
+        base_max_tokens=2500,
+        node_name="extract_startup_state",
+        schema_cls=dict,
+    )
+
+    assert res == {"status": "recovered"}
+    # Verify retry called with expanded budget: max(2500 * 1.6 = 4000, 2500 + 1500 = 4000) = 4000
+    mock_get_client.assert_called_once_with(
+        settings,
+        tier="fast",
+        max_completion_tokens=4000,
+        reasoning_effort="low",
+    )
+    assert mock_structured2.invoke.call_count == 1
+
+
+@patch("startary.graph.nodes._safe_get_llm_client")
 def test_invoke_length_error_retry_exhausted_aborts_without_loop(mock_get_client):
     # Attempt 1 fails with length error
     mock_llm1 = MagicMock()
