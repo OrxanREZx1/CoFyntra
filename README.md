@@ -43,11 +43,6 @@ The current version is a browser-based product preview. Open the Confyntra websi
 
 No account is needed to explore the preview. If you do not have a website link, ask the person who shared the project with you.
 
-## Current availability
-
-The experience described above is the product direction. In this preview, the workspace uses sample content and scripted responses: account creation, live AI conversations, and real-time collaboration between co-founders are not connected. Demo activity is stored in your current browser and is not shared with a team or sent to a live Confyntra service.
-
-Please do not enter real passwords, sensitive personal information, or confidential business details.
 
 ## Feedback
 
