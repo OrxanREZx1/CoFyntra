@@ -1,6 +1,24 @@
 import pytest
 
-from core.models import PrivateMessage, Project, SharedKnowledge
+from core.models import (
+    CommittedDecision,
+    CommittedState,
+    DecisionProposal,
+    PrivateMessage,
+    Project,
+    ProposalVersion,
+    SharedKnowledge,
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_paid_llm_calls(monkeypatch):
+    """Backend tests are offline: any accidental OpenAI client would get a dummy key and an unroutable URL."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-offline-test-dummy")
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("OPENAI_API_BASE", "http://127.0.0.1:9")
+    monkeypatch.setenv("LANGSMITH_TRACING", "false")
+    monkeypatch.setenv("LANGCHAIN_TRACING_V2", "false")
 
 
 @pytest.fixture
@@ -54,3 +72,19 @@ def make_knowledge():
         fields.update(kwargs)
         return SharedKnowledge.objects.create(project=project, author=author, **fields)
     return _make
+
+
+@pytest.fixture
+def commit_revision():
+    """Create committed revision N with its (committed) proposal, version and decision."""
+    def _commit(project, author, revision, title="Start B2B, not B2C", **state_fields):
+        proposal = DecisionProposal.objects.create(project=project, created_by=author, base_state_revision=revision - 1)
+        version = ProposalVersion.create_next(proposal=proposal, created_by=author, title=title, rationale="Agreed.",
+                                              trade_offs=["None noted."], next_action="Proceed.")
+        proposal.status = DecisionProposal.Status.COMMITTED
+        proposal.save()
+        state = CommittedState.objects.create(project=project, revision=revision, **state_fields)
+        return CommittedDecision.objects.create(project=project, source_proposal=proposal,
+                                                source_proposal_version=version, committed_state=state,
+                                                title=title, summary="We sell to providers.")
+    return _commit

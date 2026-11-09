@@ -31,6 +31,8 @@ services:
       DATABASE_URL: postgresql://cofytra:cofytra-dev-only@db:5432/cofytra
       DJANGO_DEBUG: "1"
       DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1
+      # Explicit demo choice: the cofytra_ai service functions are still contract stubs.
+      COFYTRA_AI_MODE: mock
       PYTHONPATH: /app
     volumes:
       - ..:/app

@@ -10,6 +10,8 @@ All configuration comes from environment variables, so the process working direc
   DATABASE_URL              postgresql://user:pass@host:5432/name (target); unset = local SQLite
   DJANGO_DB_CONN_MAX_AGE    persistent connection seconds (default: 60)
   DJANGO_LOG_LEVEL          default: INFO
+  COFYTRA_AI_MODE           "service" (default: real cofytra_ai) or "mock" (deterministic demo responses)
+  COFYTRA_AI_ALLOW_MOCK_WITHOUT_DEBUG  "1" to allow mock mode with debug off (explicit demo opt-in)
 
 PostgreSQL is the target database. SQLite is only for quick local checks and proves nothing
 about PostgreSQL locking or concurrency behaviour.
@@ -142,7 +144,17 @@ REST_FRAMEWORK = {
     "DEFAULT_PARSER_CLASSES": ["rest_framework.parsers.JSONParser"],
     "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"]
     + (["rest_framework.renderers.BrowsableAPIRenderer"] if DEBUG else []),
+    "EXCEPTION_HANDLER": "core.api.exceptions.exception_handler",
 }
+
+# AI integration (cofytra_ai, in-process). Mock mode is never implied: it must be selected explicitly,
+# and with debug off it additionally needs COFYTRA_AI_ALLOW_MOCK_WITHOUT_DEBUG.
+COFYTRA_AI_MODE = os.environ.get("COFYTRA_AI_MODE", "service").strip().lower() or "service"
+COFYTRA_AI_ALLOW_MOCK_WITHOUT_DEBUG = env_bool("COFYTRA_AI_ALLOW_MOCK_WITHOUT_DEBUG", False)
+if COFYTRA_AI_MODE not in {"service", "mock"}:
+    raise ImproperlyConfigured("COFYTRA_AI_MODE must be 'service' or 'mock'.")
+if COFYTRA_AI_MODE == "mock" and not (DEBUG or COFYTRA_AI_ALLOW_MOCK_WITHOUT_DEBUG):
+    raise ImproperlyConfigured("COFYTRA_AI_MODE=mock with debug off requires COFYTRA_AI_ALLOW_MOCK_WITHOUT_DEBUG=1.")
 
 SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SECURE = env_bool("DJANGO_SECURE_COOKIES", not DEBUG)

@@ -6,6 +6,8 @@ The database still comes from DATABASE_URL (PostgreSQL in compose.yaml); unset i
 import os
 
 os.environ.setdefault("DJANGO_SECRET_KEY", "test-only-not-a-secret")
+# Tests never rely on an implicit backend: they inject MockBackend or test ServiceBackend explicitly.
+os.environ["COFYTRA_AI_MODE"] = "service"
 
 from cofytra_backend.settings import *  # noqa: E402,F403
 
