@@ -1,0 +1,252 @@
+@import "tailwindcss";
+
+/* ============================================================
+   Confyntra Design System
+   ============================================================ */
+
+/* Class-free dark variant keyed off the theme attribute (set before paint). */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/* Font families come from next/font CSS variables set on <html>. */
+@theme inline {
+  --font-sans: var(--font-body), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-display: var(--font-heading), ui-serif, Georgia, serif;
+}
+
+/*
+ * Theme tokens. Components must use these variables — never raw colors.
+ * Foundation colors (fixed by brand):
+ *   light: #FFFFFF (background) · #DCE0D9 (secondary) · #EAD7C3 (warm accent)
+ *   dark:  #0B132B (background) · #1C2541 (secondary) · #3A506B (elevated accent)
+ * Light is the default for first-time visitors.
+ */
+:root,
+[data-theme="light"] {
+  color-scheme: light;
+
+  /* Surfaces */
+  --color-bg-base:           #FFFFFF;
+  --color-bg-elevated:       #FFFFFF;
+  --color-bg-raised:         #F3ECE2;
+  --color-bg-hover:          #ECE3D6;
+  --color-surface-secondary: #DCE0D9;
+  --color-surface-accent:    #EAD7C3;
+  --color-input-bg:          #FFFFFF;
+  --color-overlay:           rgba(36, 34, 31, 0.38);
+
+  /* Borders & focus */
+  --color-border:            rgba(43, 40, 36, 0.12);
+  --color-border-subtle:     rgba(43, 40, 36, 0.07);
+  --color-border-active:     rgba(61, 107, 96, 0.55);
+  --color-focus:             #3D6B60;
+
+  /* Text (contrast on #FBF6EF: primary 15:1, secondary 9:1, muted 5.3:1, disabled 3.9:1) */
+  --color-text-primary:      #24221F;
+  --color-text-secondary:    #4B4842;
+  --color-text-muted:        #6B675F;
+  --color-text-disabled:     #857F75;
+
+  /* Actions */
+  --color-primary:           #2F3E46;
+  --color-primary-hover:     #1E2A30;
+  --color-primary-muted:     rgba(47, 62, 70, 0.09);
+  --color-on-primary:        #FBF6EF;
+  --color-secondary:         #3D6B60;
+  --color-secondary-muted:   rgba(61, 107, 96, 0.12);
+  --color-on-secondary:      #FBF6EF;
+  --color-accent:            #9C5F3B;
+  --color-accent-muted:      rgba(156, 95, 59, 0.12);
+
+  /* Brand mark */
+  --gradient-brand:          linear-gradient(135deg, #2F3E46 0%, #3D6B60 100%);
+  --color-on-brand:          #FBF6EF;
+
+  /* Status */
+  --color-success:           #2E6B4B;
+  --color-success-muted:     rgba(46, 107, 75, 0.11);
+  --color-warning:           #8A5606;
+  --color-warning-muted:     rgba(176, 118, 20, 0.13);
+  --color-error:             #A63D33;
+  --color-error-muted:       rgba(166, 61, 51, 0.10);
+
+  /* Founder identity */
+  --color-founder-a:         #9C5F3B;
+  --color-founder-b:         #3D6B60;
+
+  /* Depth */
+  --shadow-card:             0 1px 2px rgba(43, 40, 36, 0.04), 0 10px 30px -18px rgba(43, 40, 36, 0.25);
+  --color-scrollbar:         rgba(43, 40, 36, 0.18);
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --color-bg-base:           #0B132B;
+  --color-bg-elevated:       #1C2541;
+  --color-bg-raised:         #232E4D;
+  --color-bg-hover:          #2A3758;
+  --color-surface-secondary: #1C2541;
+  --color-surface-accent:    #3A506B;
+  --color-input-bg:          #0F1833;
+  --color-overlay:           rgba(5, 9, 20, 0.62);
+
+  --color-border:            rgba(234, 215, 195, 0.11);
+  --color-border-subtle:     rgba(234, 215, 195, 0.06);
+  --color-border-active:     rgba(234, 215, 195, 0.40);
+  --color-focus:             #9CC9BC;
+
+  /* Contrast on #0B132B: primary 16:1, secondary 11:1, muted 7:1, disabled 4:1 */
+  --color-text-primary:      #F5EEE4;
+  --color-text-secondary:    #CFC7BA;
+  --color-text-muted:        #A1A6B4;
+  --color-text-disabled:     #737C93;
+
+  --color-primary:           #EAD7C3;
+  --color-primary-hover:     #F5E8D9;
+  --color-primary-muted:     rgba(234, 215, 195, 0.12);
+  --color-on-primary:        #0B132B;
+  --color-secondary:         #9CC9BC;
+  --color-secondary-muted:   rgba(156, 201, 188, 0.13);
+  --color-on-secondary:      #0B132B;
+  --color-accent:            #E0B08A;
+  --color-accent-muted:      rgba(224, 176, 138, 0.14);
+
+  --gradient-brand:          linear-gradient(135deg, #3A506B 0%, #2C3E58 100%);
+  --color-on-brand:          #F5EEE4;
+
+  --color-success:           #86D3A8;
+  --color-success-muted:     rgba(134, 211, 168, 0.13);
+  --color-warning:           #EBBF6A;
+  --color-warning-muted:     rgba(235, 191, 106, 0.14);
+  --color-error:             #F2958A;
+  --color-error-muted:       rgba(242, 149, 138, 0.14);
+
+  --color-founder-a:         #E0B08A;
+  --color-founder-b:         #9CC9BC;
+
+  --shadow-card:             0 1px 2px rgba(0, 0, 0, 0.25);
+  --color-scrollbar:         rgba(234, 215, 195, 0.16);
+}
+
+/* ============================================================
+   Base Reset & Global Styles
+   ============================================================ */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html {
+  height: 100%;
+  /* Paint the canvas itself, so no area can fall back to the browser default. */
+  background-color: var(--color-bg-base);
+  color: var(--color-text-primary);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  html {
+    scroll-behavior: smooth;
+  }
+}
+
+body {
+  min-height: 100%;
+  background-color: var(--color-bg-base);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Custom scrollbar ── */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-scrollbar);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-border-active);
+}
+
+/* ── Focus styles ── */
+:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ── Selection ── */
+::selection {
+  background: color-mix(in srgb, var(--color-secondary) 28%, transparent);
+  color: var(--color-text-primary);
+}
+
+/* ── Smooth transitions on interactive elements ── */
+button,
+a,
+[role="button"] {
+  transition: color 150ms ease, background-color 150ms ease,
+    border-color 150ms ease, opacity 150ms ease,
+    box-shadow 150ms ease;
+}
+
+/* ── Demo mode badge pulse ── */
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+.demo-pulse {
+  animation: pulse-soft 2.5s ease-in-out infinite;
+}
+
+/* ── Shimmer skeleton ── */
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--color-bg-raised) 25%,
+    var(--color-bg-hover) 50%,
+    var(--color-bg-raised) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+}
+
+/* Chat: assistant processing indicator */
+@keyframes chat-dot {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+  30% { transform: translateY(-4px); opacity: 1; }
+}
+
+/* Landing: gentle entrance, disabled for reduced motion */
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .animate-fade-up {
+    animation: fade-up 600ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  }
+}
+
+/* Onboarding: step transition */
+@keyframes step-in {
+  from { opacity: 0; transform: translateX(12px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .animate-step-in {
+    animation: step-in 280ms ease-out both;
+  }
+}
