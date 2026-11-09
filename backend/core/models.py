@@ -20,7 +20,7 @@ Integrity strategy:
     bulk operations that bypass save().
   - History tables are append-only (``AppendOnlyModel``): updating a saved row raises.
 
-Not implemented here (later steps): approval/commit business logic, AI adapter, REST endpoints.
+Not implemented here (later steps): proposal approval/commit business logic and catch-up/conflict APIs.
 """
 
 from __future__ import annotations
@@ -262,6 +262,8 @@ class PrivateMessage(AppendOnlyModel):
     role = models.CharField(max_length=16, choices=Role.choices)
     # Assistant replies may be up to MAX_REPLY_CHARS; founder messages are limited to MAX_MESSAGE_CHARS in clean().
     content = models.CharField(max_length=MAX_REPLY_CHARS)
+    ai_response = models.JSONField(null=True, blank=True,
+                                   help_text="Complete validated AI response for assistant messages; never shared.")
     client_message_id = models.CharField(max_length=MAX_ID_CHARS, null=True, blank=True,
                                          help_text="Client-supplied idempotency key for founder messages.")
     reply_to = models.ForeignKey("self", on_delete=models.RESTRICT, null=True, blank=True,
@@ -285,6 +287,11 @@ class PrivateMessage(AppendOnlyModel):
                            | Q(role=MessageRole.ASSISTANT.value, client_message_id__isnull=True)),
                 name="pm_role_specific_fields",
             ),
+            models.CheckConstraint(
+                condition=(Q(role=MessageRole.FOUNDER.value, ai_response__isnull=True)
+                           | Q(role=MessageRole.ASSISTANT.value)),
+                name="pm_ai_response_role",
+            ),
         ]
 
     @property
@@ -299,6 +306,8 @@ class PrivateMessage(AppendOnlyModel):
                 raise ValidationError({"content": f"Founder messages are limited to {MAX_MESSAGE_CHARS} characters."})
             if self.reply_to_id is not None:
                 raise ValidationError({"reply_to": "Only assistant messages can reply to a message."})
+            if self.ai_response is not None:
+                raise ValidationError({"ai_response": "Only assistant messages can store an AI response."})
         elif self.role == MessageRole.ASSISTANT.value and self.client_message_id is not None:
             raise ValidationError({"client_message_id": "Only founder messages carry a client message ID."})
         _require_membership(self.project_id, self.owner_id, "owner")
@@ -346,6 +355,8 @@ class SharedKnowledge(AppendOnlyModel):
     external_reference = models.CharField(max_length=MAX_EXTERNAL_REFERENCE_CHARS, null=True, blank=True)
     extraction_confidence = models.CharField(max_length=16, choices=_choices(Confidence), null=True, blank=True,
                                              help_text="AI confidence that the extraction is faithful, not that it is true.")
+    extraction_key = models.CharField(max_length=64, null=True, blank=True, editable=False,
+                                      help_text="Internal idempotency key for one extracted candidate.")
     origin = models.CharField(max_length=16, choices=Origin.choices)
     duplicate_of = models.ForeignKey("self", on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
                                      help_text="AI hint that this restates an existing item. Both are kept.")
@@ -359,6 +370,8 @@ class SharedKnowledge(AppendOnlyModel):
             models.Index(fields=["project", "author", "shared_at"], name="kn_project_author_shared_idx"),
         ]
         constraints = [
+            models.UniqueConstraint(fields=["extraction_key"], condition=Q(extraction_key__isnull=False),
+                                    name="kn_unique_extraction_key"),
             models.CheckConstraint(condition=_category_status_condition(), name="kn_category_status_allowed"),
             models.CheckConstraint(
                 condition=(Q(epistemic_status=_EXTERNAL, external_reference__isnull=False)
@@ -434,6 +447,59 @@ class KnowledgeSourceMessage(AppendOnlyModel):
             raise ValidationError({"message": "Must be a founder-authored message from the knowledge author's own chat."})
         if KnowledgeSourceMessage.objects.filter(knowledge_id=self.knowledge_id).count() >= MAX_SOURCES_PER_CANDIDATE:
             raise ValidationError(f"A knowledge item can cite at most {MAX_SOURCES_PER_CANDIDATE} source messages.")
+
+
+class ExtractionJobStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    PROCESSING = "processing", "Processing"
+    AWAITING_SAFETY_VALIDATION = "awaiting_safety_validation", "Awaiting safety validation"
+    COMPLETED = "completed", "Completed"
+    FAILED = "failed", "Failed"
+
+
+class ExtractionJob(ValidatedModel):
+    """Durable extraction state for one founder message; candidate output is internal until safe publication."""
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="extraction_jobs")
+    founder = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="extraction_jobs")
+    source_message = models.OneToOneField(PrivateMessage, on_delete=models.CASCADE,
+                                          related_name="extraction_job")
+    status = models.CharField(max_length=32, choices=ExtractionJobStatus.choices,
+                              default=ExtractionJobStatus.PENDING)
+    attempt_count = models.PositiveSmallIntegerField(default=0)
+    created_at = models.DateTimeField(default=timezone.now, editable=False)
+    updated_at = models.DateTimeField(auto_now=True)
+    claimed_at = models.DateTimeField(null=True, blank=True)
+    claim_token = models.UUIDField(null=True, blank=True)
+    retry_after = models.DateTimeField(null=True, blank=True)
+    last_error_code = models.CharField(max_length=64, blank=True, default="")
+    extraction_result = models.JSONField(null=True, blank=True,
+                                         help_text="Validated candidate payloads retained for safe resumable publication.")
+    extracted_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        indexes = [
+            models.Index(fields=["status", "created_at"], name="extract_status_created_idx"),
+            models.Index(fields=["status", "claimed_at"], name="extract_status_claimed_idx"),
+        ]
+        constraints = [
+            models.CheckConstraint(condition=Q(status__in=[choice for choice, _ in ExtractionJobStatus.choices]),
+                                   name="extract_status_valid"),
+            models.CheckConstraint(condition=Q(attempt_count__gte=0), name="extract_attempt_nonnegative"),
+            models.CheckConstraint(condition=~Q(status=ExtractionJobStatus.PROCESSING)
+                                   | Q(claimed_at__isnull=False), name="extract_processing_has_lease"),
+            models.CheckConstraint(condition=~Q(status=ExtractionJobStatus.PROCESSING)
+                                   | Q(claim_token__isnull=False), name="extract_processing_has_token"),
+        ]
+
+    def clean(self) -> None:
+        if self.source_message_id is None:
+            return
+        message = self.source_message
+        if (message.project_id != self.project_id or message.owner_id != self.founder_id
+                or message.role != PrivateMessageRole.FOUNDER):
+            raise ValidationError({"source_message": "Must be a founder-authored message owned by this founder and project."})
 
 
 # ---------------------------------------------------------------------------
