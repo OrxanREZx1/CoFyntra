@@ -20,7 +20,7 @@ Integrity strategy:
     bulk operations that bypass save().
   - History tables are append-only (``AppendOnlyModel``): updating a saved row raises.
 
-Not implemented here (later steps): proposal approval/commit business logic and catch-up/conflict APIs.
+Not implemented here (later steps): proposal approval/commit business logic.
 """
 
 from __future__ import annotations
@@ -808,6 +808,11 @@ class CatchupCursor(ValidatedModel):
     viewer = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="catchup_cursors")
     other_founder = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+")
     last_caught_up_at = models.DateTimeField(help_text="Time of the last successful catch-up; sent as 'since'.")
+    last_knowledge_id = models.UUIDField(
+        null=True,
+        blank=True,
+        help_text="Stable tie-breaker for knowledge sharing timestamps; null preserves legacy timestamp cursors.",
+    )
     created_at = models.DateTimeField(default=timezone.now, editable=False)
     updated_at = models.DateTimeField(auto_now=True)
 

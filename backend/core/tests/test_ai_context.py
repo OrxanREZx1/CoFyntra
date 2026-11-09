@@ -206,23 +206,47 @@ def test_catchup_pages_oldest_first_from_the_cursor(project, ana, ben, make_know
     assert first.report.catch_up_complete is False and first.report.catch_up_covered_until == items[59].shared_at
 
     CatchupCursor.objects.create(project=project, viewer=ana, other_founder=ben,
-                                 last_caught_up_at=first.report.catch_up_covered_until)
+                                 last_caught_up_at=first.report.catch_up_covered_until,
+                                 last_knowledge_id=first.report.catch_up_covered_knowledge_id)
     second = ctx.build_catchup_request(project=project, viewer=ana)
     assert second.request.since == items[59].shared_at
     assert [k.id for k in second.request.knowledge] == [str(k.pk) for k in items[60:]]
     assert second.report.catch_up_complete is True
 
 
-def test_catchup_defers_items_tied_at_the_page_boundary(project, ana, ben, make_knowledge):
+def test_catchup_composite_cursor_pages_items_tied_at_the_page_boundary(project, ana, ben, make_knowledge):
     for i in range(59):
         make_knowledge(project, ben, statement=f"ben {i}", shared_at=at(i))
     tied = [make_knowledge(project, ben, statement=f"tied {i}", shared_at=at(100)) for i in range(2)]
     first = ctx.build_catchup_request(project=project, viewer=ana)
-    assert len(first.request.knowledge) == 59 and first.report.catch_up_covered_until == at(58)
+    assert len(first.request.knowledge) == 60 and first.report.catch_up_covered_until == at(100)
+    first_tied_id = first.report.catch_up_covered_knowledge_id
+    assert first_tied_id in {str(k.pk) for k in tied}
     CatchupCursor.objects.create(project=project, viewer=ana, other_founder=ben,
-                                 last_caught_up_at=first.report.catch_up_covered_until)
+                                 last_caught_up_at=first.report.catch_up_covered_until,
+                                 last_knowledge_id=first.report.catch_up_covered_knowledge_id)
     second = ctx.build_catchup_request(project=project, viewer=ana)
-    assert {k.id for k in second.request.knowledge} == {str(k.pk) for k in tied}
+    assert len(second.request.knowledge) == 1
+    assert second.request.knowledge[0].id in {str(k.pk) for k in tied}
+    assert second.request.knowledge[0].id != first_tied_id
+
+
+def test_legacy_timestamp_only_cursor_replays_ties_instead_of_skipping(project, ana, ben, make_knowledge):
+    timestamp = at(100)
+    tied = [
+        make_knowledge(project, ben, statement=f"legacy tied {i}", shared_at=timestamp)
+        for i in range(2)
+    ]
+    CatchupCursor.objects.create(
+        project=project,
+        viewer=ana,
+        other_founder=ben,
+        last_caught_up_at=timestamp,
+    )
+
+    built = ctx.build_catchup_request(project=project, viewer=ana)
+
+    assert {item.id for item in built.request.knowledge} == {str(item.pk) for item in tied}
 
 
 def test_catchup_needs_exactly_one_other_founder(ana):

@@ -78,6 +78,7 @@ class ContextReport:
     shortened_message_ids: tuple[str, ...] = ()
     catch_up_complete: Optional[bool] = None
     catch_up_covered_until: Optional[datetime] = None
+    catch_up_covered_knowledge_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -296,9 +297,9 @@ def build_catchup_request(*, project: Project, viewer) -> BuiltContext[CatchupRe
     """
     The other founder's SHARED knowledge since the viewer's cursor. No private message is ever read.
 
-    Paging: items after the cursor are taken oldest-first. If more than the limit exist, items sharing the
-    first left-out item's timestamp are also deferred, so ``catch_up_covered_until`` can be stored as the
-    new cursor without skipping anything. The cursor itself is not updated here.
+    Paging: items after the composite (shared_at, knowledge_id) cursor are taken oldest-first. The contract
+    still receives the timestamp as ``since``; the ID is Django-only and disambiguates timestamp ties.
+    The cursor itself is not updated here.
     """
     require_active_founder(project, viewer)
     other = other_active_founder(project, viewer)
@@ -307,14 +308,18 @@ def build_catchup_request(*, project: Project, viewer) -> BuiltContext[CatchupRe
 
     pending = project.knowledge.filter(author=other)
     if since is not None:
-        pending = pending.filter(shared_at__gt=since)
+        if cursor.last_knowledge_id is None:
+            pending = pending.filter(Q(shared_at__gt=since) | Q(shared_at=since, id__gte=uuid.UUID(int=0)))
+        else:
+            pending = pending.filter(
+                Q(shared_at__gt=since) | Q(shared_at=since, id__gt=cursor.last_knowledge_id)
+            )
     total = pending.count()
     page = list(pending.order_by("shared_at", "id")[: MAX_KNOWLEDGE_ITEMS + 1])
     complete = len(page) <= MAX_KNOWLEDGE_ITEMS
-    if not complete:
-        boundary = page[MAX_KNOWLEDGE_ITEMS].shared_at
-        page = [k for k in page[:MAX_KNOWLEDGE_ITEMS] if k.shared_at < boundary] or page[:MAX_KNOWLEDGE_ITEMS]
+    page = page[:MAX_KNOWLEDGE_ITEMS]
     covered_until = page[-1].shared_at if page else since
+    covered_knowledge_id = str(page[-1].pk) if page else None
 
     proposals, omitted_proposals = _pending_proposals(project)
     committed, omitted_decisions = committed_state_dict(project)
@@ -330,7 +335,8 @@ def build_catchup_request(*, project: Project, viewer) -> BuiltContext[CatchupRe
     }
     report = ContextReport(omitted={"knowledge": total - len(page), "pending_proposals": omitted_proposals,
                                     "decisions": omitted_decisions},
-                           catch_up_complete=complete, catch_up_covered_until=covered_until)
+                           catch_up_complete=complete, catch_up_covered_until=covered_until,
+                           catch_up_covered_knowledge_id=covered_knowledge_id)
     return BuiltContext(_build(CatchupRequest, data, "catch_up"), report)
 
 

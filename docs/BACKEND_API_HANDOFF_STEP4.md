@@ -2,7 +2,8 @@
 
 This is the proposed frontend contract for private chat and shared knowledge. The AI package contract in
 [`COFYTRA_AI_BACKEND_CONTRACT_V1.md`](./COFYTRA_AI_BACKEND_CONTRACT_V1.md) remains separate. These routes do
-not change the AI contract or implement catch-up, conflict detection, or proposal approval.
+not change the AI contract. Catch-up and conflict detection are documented in
+[`BACKEND_API_HANDOFF_STEP5.md`](./BACKEND_API_HANDOFF_STEP5.md); proposal approval is not implemented.
 
 All routes require an authenticated user with active membership in the project. Project IDs are UUIDs.
 List routes use stable ascending `(created_at, id)` ordering and accept `page` (default `1`) and
