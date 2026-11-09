@@ -1,210 +1,54 @@
-# Startary AI System
+# Confyntra
 
-**Milestone 0 — Local Development Foundation**
+**Think independently. Build in sync.**
 
-> **Core rule**: The LLM is not memory. LangGraph is orchestration. Durable persistence will belong to the database (Milestone 2+).
+Confyntra brings a startup team's conversations, discoveries, and decisions into one shared workspace—while giving each founder room to think privately.
 
----
+## A clearer way to build together
 
-## What Milestone 0 Establishes
+Building a company means making sense of a constant stream of ideas, questions, and decisions. Confyntra is designed to help co-founders connect the useful context without turning every private conversation into shared information.
 
-| Capability | Status |
-|---|---|
-| Canonical startup taxonomy (10 areas) | ✅ |
-| Core domain schemas (Pydantic v2) | ✅ |
-| Assumption as first-class object | ✅ |
-| Experiment explicitly references an assumption | ✅ |
-| Evidence as first-class object | ✅ |
-| Central LangGraph state contract | ✅ |
-| Minimal deterministic LangGraph graph | ✅ |
-| Configuration (no required env vars) | ✅ |
-| Automated test suite | ✅ |
-| Terminal development entry point | ✅ |
+### Your AI Workspace
 
----
+Explore ideas and work through startup questions in a founder-specific conversation space. Private conversations are kept separate from shared team knowledge.
 
-## Architecture Overview
+### Startup Map
 
-```
-startary/
-├── config.py               # Pydantic-settings; no required keys in M0
-├── domain/
-│   ├── taxonomy.py         # StartupArea — canonical single definition
-│   ├── enums.py            # WorkflowPhase, AssumptionStatus, ExperimentStatus, …
-│   ├── project.py          # StartupProject
-│   ├── state.py            # StartupState (area-keyed dict)
-│   ├── assessment.py       # StartupAreaAssessment
-│   ├── diagnosis.py        # Diagnosis
-│   ├── assumption.py       # Assumption (first-class)
-│   ├── experiment.py       # Experiment (always references assumption)
-│   ├── evidence.py         # Evidence (founder vs. externally retrieved)
-│   └── trace.py            # AITrace (for future debuggability)
-├── graph/
-│   ├── graph_state.py      # StartaryGraphState (TypedDict for LangGraph)
-│   ├── nodes.py            # initialize_state, verify_state (deterministic)
-│   └── builder.py          # build_graph() → compiled LangGraph
-└── cli.py                  # Terminal development entry point
-tests/
-├── test_taxonomy.py
-├── test_domain.py
-├── test_graph_state.py
-├── test_graph.py
-└── test_config.py
-```
+See the startup's key context and areas of focus in one organized view. Use it as a starting point for understanding what the team knows and what it still needs to learn.
 
-### Two distinct state layers
+### Shared Knowledge
 
-| Layer | Type | Purpose |
-|---|---|---|
-| **Domain objects** | Pydantic `BaseModel` | Validated, immutable domain records |
-| **Graph state** | `TypedDict` | Compact orchestration context for LangGraph nodes |
+Bring selected insights into a team space, where they can be revisited and used as a foundation for collaboration.
 
-These layers are kept separate intentionally. Domain objects are the source of truth; graph state carries only what is needed for the current reasoning step.
+### Team Sync
 
----
+Get oriented with the shared context, recent discoveries, and open questions that matter to the team.
 
-## Prerequisites
+### Decisions
 
-- Python 3.11+
-- pip
+Turn discussion into clear proposals, review them together, and keep the team's direction visible.
 
-No API keys. No database. No Docker.
+## How it fits together
 
----
+1. **Set up your startup** by sharing a little about your role and what you are building.
+2. **Explore your thinking space** to develop ideas and capture useful context.
+3. **Bring relevant knowledge together** in the shared workspace.
+4. **Review and decide as a team** with a common view of your startup's direction.
 
-## Installation
+The goal is simple: keep individual thinking private, make intentional knowledge-sharing easier, and help co-founders move forward with a shared understanding.
 
-```bash
-# From the project root:
-pip install -e ".[dev]"
-```
+## Try the interactive preview
 
-This installs the `startary` package in editable mode along with `langgraph`, `pydantic`, `pydantic-settings`, `python-dotenv`, `pytest`, and `pytest-asyncio`.
+The current version is a browser-based product preview. Open the Confyntra website provided by your project team and select **Explore the demo without an account**. You can complete the short onboarding flow and explore the workspace, including the Startup Map, Shared Knowledge, Team Sync, and Decisions areas.
 
-**Optional**: copy the environment template (no values are required yet):
+No account is needed to explore the preview. If you do not have a website link, ask the person who shared the project with you.
 
-```bash
-copy .env.example .env   # Windows
-# cp .env.example .env   # macOS/Linux
-```
+## Current availability
 
----
+The experience described above is the product direction. In this preview, the workspace uses sample content and scripted responses: account creation, live AI conversations, and real-time collaboration between co-founders are not connected. Demo activity is stored in your current browser and is not shared with a team or sent to a live Confyntra service.
 
-## Running the Terminal Prototype
+Please do not enter real passwords, sensitive personal information, or confidential business details.
 
-```bash
-python -m startary.cli
-# or, after pip install:
-startary-dev
-```
+## Feedback
 
-Expected output (abbreviated):
-
-```
-╔══════════════════════════════════════════════════════╗
-║        STARTARY AI SYSTEM — DEVELOPMENT MODE         ║
-║                   Milestone 0                        ║
-╚══════════════════════════════════════════════════════╝
-
-Enter your startup name (or press Enter for 'My Startup'):
-> Startary
-
-Project created.
-  Project ID : 3fa85f64-…
-  Phase      : UNDERSTAND
-  Iteration  : 1
-
-Enter a brief description of your startup
-…
-Running LangGraph skeleton…
-
-──────────────────────────────────────────────────────
-Graph executed successfully.
-
-  Project ID : 3fa85f64-…
-  Title      : Startary
-  Phase      : UNDERSTAND
-  Iteration  : 1
-  Areas set  : 1 / 10
-
-  Startup context captured:
-    [Problem] AI learning system for first-time founders…
-──────────────────────────────────────────────────────
-
-Milestone 0 foundation is operational.
-No AI API key was used or required.
-```
-
----
-
-## Running Tests
-
-```bash
-pytest tests/ -v
-```
-
-The test suite verifies architecture-critical contracts, not trivial implementation details:
-
-- Taxonomy: 10 canonical areas, no duplicates, StrEnum behaviour
-- Domain: all schemas reject invalid data (bad status, bad area, missing assumption reference, scale violations)
-- Graph state: valid state passes `verify_state`; missing fields produce descriptive errors
-- Graph: compiles and runs without an API key; output conforms to state contract
-- Config: loads with zero environment variables
-
----
-
-## Current Architecture Boundaries
-
-| Component | Milestone 0 |
-|---|---|
-| `StartupArea` taxonomy | ✅ Defined centrally |
-| Domain schemas | ✅ All 8 schemas defined and validated |
-| `StartaryGraphState` | ✅ TypedDict contract established |
-| LangGraph skeleton | ✅ `initialize_state → verify_state → END` |
-| Persistence | In-memory only |
-| AI / LLM calls | None |
-| Diagnosis logic | None |
-| Experiment generation | None |
-| Evidence analysis | None |
-
----
-
-## What Is NOT Implemented (by design)
-
-- Startup diagnosis or scoring
-- Weak-link selection
-- Critical-assumption generation
-- Experiment design or critic
-- Evidence interpretation or re-diagnosis
-- Pivot logic or support routing
-- RAG, embeddings, or web search
-- LLM provider calls of any kind
-- Frontend, API, or authentication
-- PostgreSQL or any database
-- Docker or deployment configuration
-
-These belong to future milestones.
-
----
-
-## Workflow Phases
-
-| Phase | Meaning |
-|---|---|
-| `UNDERSTAND` | Founder is describing their startup; system builds initial state |
-| `DIAGNOSE` | System evaluates startup areas (Milestone 1+) |
-| `TEST` | An assumption is being tested via an experiment (Milestone 2+) |
-| `WAITING_FOR_EVIDENCE` | Experiment is live; system waits for real-world data (Milestone 3+) |
-| `LEARN` | Evidence returned; system re-evaluates and updates state (Milestone 3+) |
-
----
-
-## Notes for Milestone 1
-
-Before starting Milestone 1:
-
-1. LangGraph node for **diagnosis** should be added in `startary/graph/nodes.py` and wired in `builder.py` after `verify_state`.
-2. The `OPENAI_API_KEY` variable in `.env` will become required.
-3. The `Diagnosis`, `StartupAreaAssessment`, and `weak_area` fields in `StartaryGraphState` are already prepared.
-4. Domain schemas are frozen — avoid changing field names in `Assumption`, `Experiment`, or `Evidence` as they are referenced by tests.
-
+We welcome feedback on the experience. Please share comments or issues with the person or team who provided your preview link.
